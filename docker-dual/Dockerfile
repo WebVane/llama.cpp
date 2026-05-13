@@ -16,7 +16,13 @@ ARG BASE_CUDA_RUN_CONTAINER=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_V
 # -----------------------------------------------------------------------------
 FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 
-ARG CUDA_ARCH=all-major
+# "default" (recommended): let ggml/src/ggml-cuda/CMakeLists.txt pick a
+# sensible list for the installed CUDA toolkit -- this is the only path
+# that includes the "accelerated" 120a-real/121a-real variants needed by
+# the MXFP4 kernels on Blackwell.  Override with a semicolon-separated
+# list (e.g. "75;86;89") to slim the image for a known GPU set; avoid
+# plain "120" / "all-major" on CUDA 12.8+ as ptxas will reject MXFP4.
+ARG CUDA_ARCH=default
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -34,11 +40,14 @@ ENV CC=gcc-14 CXX=g++-14 CUDAHOSTCXX=g++-14
 WORKDIR /src
 COPY . /src
 
-RUN cmake -B build \
+RUN if [ "${CUDA_ARCH}" != "default" ]; then \
+        EXTRA_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"; \
+    fi && \
+    cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_NATIVE=OFF \
         -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+        ${EXTRA_CMAKE_ARGS} \
         -DLLAMA_CURL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined && \

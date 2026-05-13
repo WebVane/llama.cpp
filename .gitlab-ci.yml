@@ -11,10 +11,25 @@ variables:
   # Nexus registry — same as the existing build_service uses.
   REGISTRY: "nexus.scan-dev.com:6001"
 
-  # CUDA architectures baked into the build.  "all-major" is a safe default
-  # (50;60;70;80;90); override in the GitLab UI / CI variables with a
-  # semicolon-separated list (e.g. "86;89") to slim the image.
-  CUDA_ARCH: "all-major"
+  # CUDA architectures baked into the build.
+  #
+  #   61-real    Pascal      GTX 10-series, incl. GTX 1080 Ti  <-- required SKU
+  #   75-virtual Turing      RTX 20-series, T4, Quadro RTX
+  #   80-virtual Ampere DC   A100, A30
+  #   86-real    Ampere      RTX 30-series, A40, A10
+  #   89-real    Ada         RTX 40-series, L4, L40
+  #   120a-real  Blackwell   RTX 50-series; the "a" suffix is mandatory
+  #                          because MXFP4 tensor-core ops aren't forwards-
+  #                          compatible (sm_120 ptxas would reject them).
+  #   121a-real  Blackwell   B100/B200; needs CUDA 12.9+ to compile, ptxas
+  #                          on 12.8 would error -- KEEP DROPPED until the
+  #                          base image bumps to 12.9.
+  #
+  # Override in CI variables with a semicolon-separated list to slim the
+  # image for a known GPU set (e.g. CUDA_ARCH="61-real;86-real" if you only
+  # deploy on 1080 Ti and 30-series).  Do NOT use plain "120" or
+  # "all-major": MXFP4 requires the 120a/121a variants.
+  CUDA_ARCH: "61-real;75-virtual;80-virtual;86-real;89-real;120a-real"
 
   # Registry image tag (branch/sha/latest suffix is appended per-job below).
   RELEASE_IMG: "${REGISTRY}/llama_dual"
