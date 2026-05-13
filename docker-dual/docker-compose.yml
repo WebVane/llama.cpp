@@ -25,7 +25,7 @@ services:
     container_name: llama-dual
     restart: unless-stopped
     ports:
-      - "${PORT:-8080}:8080"
+      - "${PORT:-8096}:8080"
     environment:
       PORT: "8080"
       # 1 = swap models between requests (~+1-5 s on switch, half VRAM)
@@ -36,15 +36,15 @@ services:
       GGML_LOG_LEVEL: "${GGML_LOG_LEVEL:-INFO}"
     volumes:
       # GGUF files live on the host; ro because the server never writes here.
-      - ../models:/models:ro
+      - ./models:/models:ro
       # Override the baked-in preset without rebuilding the image:
-      # - ./models.ini:/config/models.ini:ro
+      - ./models.ini:/config/models.ini:ro
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ["1"]
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]

@@ -64,16 +64,21 @@ RUN if [ "${CUDA_ARCH}" != "default" ]; then \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_NATIVE=OFF \
         -DGGML_CUDA=ON \
+        -DGGML_BACKEND_DL=ON \
+        -DGGML_CPU_ALL_VARIANTS=ON \
         ${EXTRA_CMAKE_ARGS} \
         -DLLAMA_CURL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined && \
-    cmake --build build --config Release --target llama-server -j"$(nproc)"
+    cmake --build build --config Release -j"$(nproc)"
 
-# Collect runtime artifacts (binary + any produced shared libs from ggml/cuda).
+# Collect runtime artifacts.  With GGML_BACKEND_DL=ON the CPU backend is
+# emitted as several .so files (one per microarch: sse4.2, avx, avx2,
+# avx512, ...) and ggml picks the right one at startup -- so the image
+# runs on any x86_64 host from Sandy Bridge upward without recompiling.
 RUN mkdir -p /out/bin /out/lib && \
     cp build/bin/llama-server /out/bin/ && \
-    find build -name "*.so*" -exec cp -P {} /out/lib/ \; || true
+    find build -name "*.so*" -exec cp -P {} /out/lib/ \;
 
 # -----------------------------------------------------------------------------
 # runtime stage
