@@ -1,0 +1,75 @@
+variables:
+  # Runner is configured with the host's /var/run/docker.sock mounted into
+  # job containers — so dind services are NOT needed and would fail (the
+  # bound socket conflicts with dind's own socket bind).  Use the host
+  # docker daemon directly via the mounted socket.
+  DOCKER_BUILDKIT: "1"
+  WORK_DIR: ${CI_PROJECT_NAME}
+  BRANCH: ${CI_COMMIT_REF_NAME}
+  IMG_NAME: "llama_dual"
+
+  # Nexus registry — same as the existing build_service uses.
+  REGISTRY: "nexus.scan-dev.com:6001"
+
+  # CUDA architectures baked into the build.  "all-major" is a safe default
+  # (50;60;70;80;90); override in the GitLab UI / CI variables with a
+  # semicolon-separated list (e.g. "86;89") to slim the image.
+  CUDA_ARCH: "all-major"
+
+  # Registry image tag (branch/sha/latest suffix is appended per-job below).
+  RELEASE_IMG: "${REGISTRY}/llama_dual"
+
+stages:
+  - build
+
+# =========================================================================
+# Build llama-dual image on master OR dev.  Builds llama-server with CUDA
+# support and bakes docker-dual/models.ini into /config/models.ini.  The
+# resulting image expects GGUF files to be mounted into /models at runtime
+# (see docker-dual/README.md).
+#
+# Tag policy (CI_COMMIT_REF_SLUG = "master" or "dev"):
+#   :<short-sha>          — every build (immutable pointer)
+#   :<branch-slug>        — :master or :dev (rolling pointer for the branch)
+#   :latest               — master only (production rollout target)
+# =========================================================================
+build_llama_dual:
+  stage: build
+  image: docker:24.0.9
+  timeout: 2h
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+  before_script:
+  - echo "REGISTRY=[$REGISTRY] RELEASE_IMG=[$RELEASE_IMG] CUDA_ARCH=[$CUDA_ARCH]"
+  - docker login -u admin -p $NEXUS_PASS nexus.scan-dev.com:6001
+  script:
+  # 1. Pull previous build of this branch as a cache donor for an
+  #    incremental rebuild.  Ignored if absent (first build on a branch).
+  - docker pull $RELEASE_IMG:$CI_COMMIT_REF_SLUG || true
+  # 2. Build from the repository root using the dual-model Dockerfile.
+  - |
+    docker build -f docker-dual/Dockerfile \
+      --cache-from $RELEASE_IMG:$CI_COMMIT_REF_SLUG \
+      --build-arg BUILDKIT_INLINE_CACHE=1 \
+      --build-arg CUDA_ARCH="$CUDA_ARCH" \
+      -t $RELEASE_IMG:$CI_COMMIT_SHORT_SHA \
+      -t $RELEASE_IMG:$CI_COMMIT_REF_SLUG \
+      .
+  # 3. Push :<sha> and :<branch-slug> always; :latest only on master so
+  #    a dev push doesn't accidentally overwrite the production-rollout tag.
+  - docker push $RELEASE_IMG:$CI_COMMIT_SHORT_SHA
+  - docker push $RELEASE_IMG:$CI_COMMIT_REF_SLUG
+  - |
+    if [ "$CI_COMMIT_BRANCH" = "master" ]; then
+      docker tag  $RELEASE_IMG:$CI_COMMIT_SHORT_SHA $RELEASE_IMG:latest
+      docker push $RELEASE_IMG:latest
+    fi
+  after_script:
+  - echo "=== llama-dual pushed ==="
+  - echo "  $RELEASE_IMG:$CI_COMMIT_SHORT_SHA"
+  - echo "  $RELEASE_IMG:$CI_COMMIT_REF_SLUG"
+  - |
+    if [ "$CI_COMMIT_BRANCH" = "master" ]; then
+      echo "  $RELEASE_IMG:latest"
+    fi
+  - docker images $RELEASE_IMG --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | head -n 5

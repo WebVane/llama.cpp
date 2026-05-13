@@ -1,0 +1,190 @@
+# llama.cpp dual-model image (chat + embeddings)
+
+A small Dockerfile + docker-compose that builds `llama-server` from this
+checkout and runs it in **router mode**, serving two models on a single
+endpoint:
+
+| Model id (used as `"model": ...` in requests) | Purpose    | Default GGUF                                    |
+|-----------------------------------------------|------------|-------------------------------------------------|
+| `qwen2.5-chat`                                | chat       | `Qwen2.5-7B-Instruct-Q4_K_M.gguf` (~4.7 GB)     |
+| `gte-qwen2-embed`                             | embeddings | `gte-Qwen2-1.5B-instruct.Q8_0.gguf` (~1.7 GB)   |
+
+Models are **not** baked into the image &mdash; the runtime expects them in
+`/models/` (volume mount). The router uses
+[`--models-preset`](../tools/server/README.md#using-multiple-models) plus the
+`models.ini` shipped in this directory.
+
+## Files
+
+```
+docker-dual/
+├── Dockerfile          # multi-stage CUDA build, target: llama-server
+├── entrypoint.sh       # launches llama-server in router mode
+├── models.ini          # router preset (chat + embeddings)
+├── docker-compose.yml  # one-shot up
+└── README.md
+```
+
+## 1. Requirements
+
+- NVIDIA GPU (recent drivers)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- Docker 24+ with `compose` plugin
+- VRAM:
+  - `MODELS_MAX=1` (default) &mdash; ≈ 8 GB; models are swapped between
+    requests, the first request after a switch is 1&ndash;5 s slower while
+    the new model loads.
+  - `MODELS_MAX=2` &mdash; ≈ 12 GB; both stay resident.
+
+## 2. Download the models
+
+From the repo root (so the files land in `./models/` next to `docker-dual/`):
+
+```bash
+mkdir -p models
+
+# chat
+huggingface-cli download bartowski/Qwen2.5-7B-Instruct-GGUF \
+    Qwen2.5-7B-Instruct-Q4_K_M.gguf --local-dir ./models
+
+# embeddings
+huggingface-cli download Qwen/gte-Qwen2-1.5B-instruct-GGUF \
+    gte-Qwen2-1.5B-instruct.Q8_0.gguf --local-dir ./models
+```
+
+If you prefer different files, update the `model = ...` paths in `models.ini`
+before building.
+
+## 3. Build
+
+The build context is the **repository root** (we need `COPY . /src`). The
+`Dockerfile` lives in this subdirectory.
+
+### a) docker compose (recommended)
+
+```bash
+cd docker-dual
+docker compose build
+docker compose up -d
+```
+
+### b) plain docker
+
+```bash
+# from the repository root
+docker build -f docker-dual/Dockerfile -t llama-dual .
+docker run -d --name llama-dual --gpus all \
+    -p 8080:8080 \
+    -v "$(pwd)/models:/models:ro" \
+    llama-dual
+```
+
+To target specific GPU compute capabilities instead of `all-major`:
+
+```bash
+docker build -f docker-dual/Dockerfile \
+    --build-arg CUDA_ARCH="86;89" \
+    -t llama-dual .
+```
+
+## 4. Try it
+
+```bash
+# chat
+curl -sS http://localhost:8080/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "model": "qwen2.5-chat",
+        "messages": [
+            {"role": "user", "content": "Say hi in one word."}
+        ]
+    }' | jq .
+
+# embeddings
+curl -sS http://localhost:8080/v1/embeddings \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "model": "gte-qwen2-embed",
+        "input": "the quick brown fox"
+    }' | jq '.data[0].embedding | length'
+
+# list loaded / available models
+curl -sS http://localhost:8080/v1/models | jq .
+```
+
+## 5. Knobs
+
+All are environment variables on the container (override via
+`docker run -e` or the `environment:` block in `docker-compose.yml`).
+
+| Env             | Default              | Effect                                            |
+|-----------------|----------------------|---------------------------------------------------|
+| `PORT`          | `8080`               | HTTP port (inside the container)                  |
+| `MODELS_MAX`    | `1`                  | Max simultaneously-loaded models. `2` keeps both. |
+| `MODELS_CONFIG` | `/config/models.ini` | Path to the router preset file                    |
+| `CUDA_ARCH`     | `all-major` *(build-arg)* | `CMAKE_CUDA_ARCHITECTURES`                   |
+
+Switching from `--models-max 1` to `2` keeps both the chat and the embedding
+model resident, eliminating swap latency on the first request after a model
+change at the cost of extra VRAM (~12 GB total here):
+
+```bash
+# compose
+MODELS_MAX=2 docker compose up -d
+
+# plain docker
+docker run -d --name llama-dual --gpus all \
+    -p 8080:8080 \
+    -v "$(pwd)/models:/models:ro" \
+    -e MODELS_MAX=2 \
+    llama-dual
+```
+
+You can also mount a custom `models.ini` over the baked-in one without
+rebuilding the image:
+
+```bash
+docker run -d --name llama-dual --gpus all \
+    -p 8080:8080 \
+    -v "$(pwd)/models:/models:ro" \
+    -v "$(pwd)/my-models.ini:/config/models.ini:ro" \
+    llama-dual
+```
+
+## 6. Anatomy of `models.ini`
+
+```ini
+version = 1
+
+[*]                       ; defaults inherited by every model
+ctx-size     = 8192
+n-gpu-layers = 99
+
+[qwen2.5-chat]            ; section name == value of "model" in requests
+model    = /models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+jinja    = true
+
+[gte-qwen2-embed]
+model      = /models/gte-Qwen2-1.5B-instruct.Q8_0.gguf
+embeddings = true
+pooling    = last
+```
+
+Keys are long CLI argument names without `--` (short forms like `c` /
+`ngl` and `LLAMA_ARG_*` env-var names also work). See
+[`tools/server/README.md`](../tools/server/README.md#model-presets) for the
+full preset reference, including the preset-only `load-on-startup` and
+`stop-timeout` keys.
+
+## 7. Troubleshooting
+
+- **`models preset not found at /config/models.ini`** &mdash; the file was not
+  baked in or the bind mount points at a missing path. Rebuild or check the
+  `-v` you passed.
+- **`HEALTHCHECK` keeps failing for several minutes** &mdash; that's expected
+  on the first launch with `MODELS_MAX=2`; both models are being loaded.
+  Either wait, or check progress with `docker logs -f llama-dual`.
+- **`CUDA error: no kernel image is available...`** &mdash; the image was
+  built for archs your GPU doesn't match. Rebuild with
+  `--build-arg CUDA_ARCH="<your sm>"` (e.g. `86` for RTX 30xx, `89` for
+  40xx, `90` for H100).

@@ -1,0 +1,42 @@
+# Run:   docker compose up -d --build
+# Stop:  docker compose down
+#
+# Reads ./models.ini at build time and bakes it into /config/models.ini.
+# The host directory ../models (relative to this file) is mounted at /models;
+# put your .gguf files there before starting.
+
+services:
+  llama-dual:
+    build:
+      context: ..
+      dockerfile: docker-dual/Dockerfile
+      args:
+        # Override on the host with: CUDA_ARCH="86;89" docker compose build
+        CUDA_ARCH: ${CUDA_ARCH:-all-major}
+    image: llama-dual:latest
+    container_name: llama-dual
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      MODELS_MAX: "${MODELS_MAX:-1}"
+      MODELS_CONFIG: "/config/models.ini"
+      # Pull from the host if you want a stable cache for HF downloads
+      # LLAMA_CACHE: "/cache"
+    volumes:
+      - ../models:/models:ro
+      # - ./llama-cache:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
