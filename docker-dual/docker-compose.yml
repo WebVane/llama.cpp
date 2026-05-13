@@ -1,32 +1,44 @@
-# Run:   docker compose up -d --build
-# Stop:  docker compose down
+# Production compose for llama-dual.  Pulls a prebuilt image from the
+# Nexus registry (built by .gitlab-ci.yml on master/dev pushes) and runs
+# it with two GGUF files mounted from the host.
 #
-# Reads ./models.ini at build time and bakes it into /config/models.ini.
-# The host directory ../models (relative to this file) is mounted at /models;
-# put your .gguf files there before starting.
+# Quick start
+# -----------
+#   1. docker login nexus.scan-dev.com:6001          # once per host
+#   2. mkdir -p ../models                            # next to this file
+#      # then drop Qwen2.5-7B-Instruct-Q4_K_M.gguf and
+#      # gte-Qwen2-1.5B-instruct.Q8_0.gguf into ../models
+#   3. docker compose pull                           # fetch latest image
+#   4. docker compose up -d
+#   5. curl -fsS http://localhost:8080/v1/models | jq .
+#
+# Override at the shell to retag/repoint without editing this file:
+#   LLAMA_DUAL_IMAGE=nexus.scan-dev.com:6001/llama_dual:dev \
+#       docker compose up -d
+#
+# Local dev build (skip Nexus, build from this checkout):
+#   Uncomment the `build:` block below and run `docker compose up -d --build`.
 
 services:
   llama-dual:
-    build:
-      context: ..
-      dockerfile: docker-dual/Dockerfile
-      args:
-        # Override on the host with: CUDA_ARCH="86;89" docker compose build
-        CUDA_ARCH: ${CUDA_ARCH:-all-major}
-    image: llama-dual:latest
+    image: ${LLAMA_DUAL_IMAGE:-nexus.scan-dev.com:6001/llama_dual:latest}
     container_name: llama-dual
     restart: unless-stopped
     ports:
       - "${PORT:-8080}:8080"
     environment:
       PORT: "8080"
-      MODELS_MAX: "${MODELS_MAX:-1}"
+      # 1 = swap models between requests (~+1-5 s on switch, half VRAM)
+      # 2 = keep both resident (fits on a single 11 GB GTX 1080 Ti)
+      MODELS_MAX: "${MODELS_MAX:-2}"
       MODELS_CONFIG: "/config/models.ini"
-      # Pull from the host if you want a stable cache for HF downloads
-      # LLAMA_CACHE: "/cache"
+      # Surface CUDA OOMs etc. in logs instead of cryptic crashes.
+      GGML_LOG_LEVEL: "${GGML_LOG_LEVEL:-INFO}"
     volumes:
+      # GGUF files live on the host; ro because the server never writes here.
       - ../models:/models:ro
-      # - ./llama-cache:/cache
+      # Override the baked-in preset without rebuilding the image:
+      # - ./models.ini:/config/models.ini:ro
     deploy:
       resources:
         reservations:
@@ -38,5 +50,14 @@ services:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
-      start_period: 60s
+      # First model load on a fresh container can take ~30 s on Pascal,
+      # plus 5-15 s of JIT for virtual arches -> grace 90 s.
+      start_period: 90s
       retries: 3
+    # journald keeps logs out of /var/lib/docker on long-running deploys;
+    # swap for json-file if you don't run systemd-journald on the host.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

@@ -6,8 +6,22 @@
 # or  cd docker-dual && docker compose build
 #
 
-ARG UBUNTU_VERSION=24.04
-ARG CUDA_VERSION=12.8.1
+# CUDA 12.2.2 is pinned to match the 535-series NVIDIA driver baseline
+# on the target host.  Drivers are backward-compatible, so this image
+# also runs fine on hosts with newer drivers (R550 / R570 / ...);
+# downgrading the runtime only loses Blackwell-specific compile-time
+# kernels (MXFP4 / FP4 tensor cores), which need CUDA 12.8 sources.
+# Hosts with newer GPUs will JIT the 75/80-virtual PTX to their native
+# arch at first run (Ampere code path, not Blackwell-optimized).
+#
+# Host driver minimums (raising CUDA_VERSION also raises this floor):
+#   12.2.x -> >=535.54  (current pin)
+#   12.4.x -> >=550.54
+#   12.6.x -> >=560.28
+#   12.8.x -> >=570.86  (also unlocks Blackwell sm_120a / MXFP4)
+# Ubuntu 22.04 is the highest LTS that nvidia/cuda publishes for 12.2.2.
+ARG UBUNTU_VERSION=22.04
+ARG CUDA_VERSION=12.2.2
 ARG BASE_CUDA_DEV_CONTAINER=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 ARG BASE_CUDA_RUN_CONTAINER=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
@@ -16,17 +30,20 @@ ARG BASE_CUDA_RUN_CONTAINER=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_V
 # -----------------------------------------------------------------------------
 FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 
-# "default" (recommended): let ggml/src/ggml-cuda/CMakeLists.txt pick a
-# sensible list for the installed CUDA toolkit -- this is the only path
-# that includes the "accelerated" 120a-real/121a-real variants needed by
-# the MXFP4 kernels on Blackwell.  Override with a semicolon-separated
-# list (e.g. "75;86;89") to slim the image for a known GPU set; avoid
-# plain "120" / "all-major" on CUDA 12.8+ as ptxas will reject MXFP4.
+# "default" lets ggml/src/ggml-cuda/CMakeLists.txt pick the arch list
+# for the installed toolkit.  Override with a semicolon-separated list
+# (e.g. "61-real;86-real") to slim the image for a known GPU set.
+# Note: Blackwell sm_120a / MXFP4 kernels require CUDA >= 12.8 and are
+# NOT available in this 12.2.2-based image; trying to add 120a-real here
+# will fail at ptxas time.
 ARG CUDA_ARCH=default
 
+# CUDA 12.2 supports gcc up to 12; Ubuntu 22.04 ships gcc-11 by default
+# but we install gcc-12 explicitly for slightly better C++20 coverage in
+# common/.  Skip gcc-14: not in jammy archives and incompatible with 12.2.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        gcc-14 g++-14 \
+        gcc-12 g++-12 \
         build-essential \
         cmake \
         git \
@@ -35,7 +52,7 @@ RUN apt-get update && \
         libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
-ENV CC=gcc-14 CXX=g++-14 CUDAHOSTCXX=g++-14
+ENV CC=gcc-12 CXX=g++-12 CUDAHOSTCXX=g++-12
 
 WORKDIR /src
 COPY . /src
