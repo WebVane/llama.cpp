@@ -96,8 +96,12 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Place llama-server and any shipped .so into /app, expose them on the loader path.
-COPY --from=build /out/lib/ /app/lib/
+# With GGML_BACKEND_DL=ON, ggml-backend-reg.cpp dlopens backend .so files
+# from the *executable's directory* (not LD_LIBRARY_PATH).  Child processes
+# spawned by the router via execv inherit cwd / argv[0] but lose any
+# LD_LIBRARY_PATH-based discovery, so the .so MUST sit next to llama-server.
+# This mirrors .devops/cuda.Dockerfile which copies /app/lib/ -> /app.
+COPY --from=build /out/lib/ /app/
 COPY --from=build /out/bin/ /app/
 
 # Router preset + entrypoint baked from the build context.
@@ -105,7 +109,7 @@ COPY docker-dual/models.ini    /config/models.ini
 COPY docker-dual/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-ENV LD_LIBRARY_PATH=/app/lib:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}
 ENV LLAMA_ARG_HOST=0.0.0.0
 ENV PORT=8080
 ENV MODELS_MAX=1
