@@ -174,7 +174,49 @@
 		<Sidebar.Header class="gap-4 bg-sidebar/50 p-3 backdrop-blur-lg md:pt-4 md:pb-2">
 			<div class="flex items-center justify-between">
 				<a href={ROUTES.START} onclick={handleMobileSidebarItemClick}>
-					<h1 class="inline-flex items-center gap-1 px-2 text-xl font-semibold">{APP_NAME}</h1>
+					<h1 class="inline-flex items-center gap-2 px-2 text-xl font-semibold">
+						<svg
+							class="h-6 w-6 shrink-0"
+							viewBox="0 0 38 38"
+							fill="none"
+							xmlns="http://www.w3.org/2000/svg"
+							aria-hidden="true"
+						>
+							<defs>
+								<linearGradient id="pvGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+									<stop offset="0%" stop-color="#00d4b4" />
+									<stop offset="100%" stop-color="#1a6cf6" />
+								</linearGradient>
+							</defs>
+							<polygon
+								points="19,2 34,10.5 34,27.5 19,36 4,27.5 4,10.5"
+								fill="none"
+								stroke="url(#pvGrad)"
+								stroke-width="1.8"
+							/>
+							<polygon
+								points="19,7 29,12.5 29,25.5 19,31 9,25.5 9,12.5"
+								fill="url(#pvGrad)"
+								opacity="0.12"
+							/>
+							<circle cx="19" cy="2" r="2" fill="#00d4b4" />
+							<circle cx="34" cy="10.5" r="2" fill="#1a6cf6" />
+							<circle cx="34" cy="27.5" r="2" fill="#1a6cf6" />
+							<circle cx="19" cy="36" r="2" fill="#00d4b4" />
+							<circle cx="4" cy="27.5" r="2" fill="#00d4b4" opacity="0.7" />
+							<circle cx="4" cy="10.5" r="2" fill="#00d4b4" opacity="0.7" />
+							<text
+								x="19"
+								y="25"
+								font-family="'Syne',sans-serif"
+								font-size="16"
+								font-weight="800"
+								fill="url(#pvGrad)"
+								text-anchor="middle">P</text
+							>
+						</svg>
+						{APP_NAME}
+					</h1>
 				</a>
 
 				<Button

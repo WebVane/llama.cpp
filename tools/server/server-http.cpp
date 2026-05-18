@@ -16,6 +16,11 @@
 #include "bundle.js.hpp"
 #include "bundle.css.hpp"
 #include "loading.html.hpp"
+#include "favicon.svg.hpp"
+#include "swagger.html.hpp"
+#include "swagger-ui.css.hpp"
+#include "swagger-ui-bundle.js.hpp"
+#include "openapi.json.hpp"
 #endif
 
 //
@@ -332,6 +337,29 @@ bool server_http_context::init(const common_params & params) {
             });
             srv->Get(params.api_prefix + "/bundle.css", [](const httplib::Request & /*req*/, httplib::Response & res) {
                 res.set_content(reinterpret_cast<const char*>(bundle_css), bundle_css_len, "text/css; charset=utf-8");
+                return false;
+            });
+            srv->Get(params.api_prefix + "/favicon.svg", [](const httplib::Request & /*req*/, httplib::Response & res) {
+                res.set_content(reinterpret_cast<const char*>(favicon_svg), favicon_svg_len, "image/svg+xml");
+                return false;
+            });
+            // Swagger UI: served by the server itself so "Try it out" is
+            // same-origin (no CORS setup needed). Assets are vendored and
+            // embedded offline, like the rest of the web UI.
+            srv->Get(params.api_prefix + "/swagger", [](const httplib::Request & /*req*/, httplib::Response & res) {
+                res.set_content(reinterpret_cast<const char*>(swagger_html), swagger_html_len, "text/html; charset=utf-8");
+                return false;
+            });
+            srv->Get(params.api_prefix + "/swagger-ui.css", [](const httplib::Request & /*req*/, httplib::Response & res) {
+                res.set_content(reinterpret_cast<const char*>(swagger_ui_css), swagger_ui_css_len, "text/css; charset=utf-8");
+                return false;
+            });
+            srv->Get(params.api_prefix + "/swagger-ui-bundle.js", [](const httplib::Request & /*req*/, httplib::Response & res) {
+                res.set_content(reinterpret_cast<const char*>(swagger_ui_bundle_js), swagger_ui_bundle_js_len, "application/javascript; charset=utf-8");
+                return false;
+            });
+            srv->Get(params.api_prefix + "/openapi.json", [](const httplib::Request & /*req*/, httplib::Response & res) {
+                res.set_content(reinterpret_cast<const char*>(openapi_json), openapi_json_len, "application/json; charset=utf-8");
                 return false;
             });
 #endif

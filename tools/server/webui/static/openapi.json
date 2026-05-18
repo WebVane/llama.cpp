@@ -1,0 +1,260 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Provision LLM Engine API",
+    "version": "1.0.0",
+    "description": "OpenAI-compatible + native endpoints exposed by llama-server. Served by the server itself, so \"Try it out\" runs same-origin (no CORS setup needed). In router mode, send a known model id in the `model` field (e.g. `qwen2.5-chat`, `gte-qwen2-embed`)."
+  },
+  "servers": [
+    { "url": "/", "description": "This server" }
+  ],
+  "tags": [
+    { "name": "OpenAI", "description": "OpenAI-compatible routes" },
+    { "name": "Server", "description": "Native llama-server / router routes" }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Server"],
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "Server is ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "status": { "type": "string", "example": "ok" } }
+                }
+              }
+            }
+          },
+          "503": { "description": "Model is still loading" }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": ["OpenAI"],
+        "summary": "List available models",
+        "responses": {
+          "200": {
+            "description": "Model list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "object": { "type": "string", "example": "list" },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": { "type": "string", "example": "qwen2.5-chat" },
+                          "object": { "type": "string", "example": "model" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Chat completion",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" },
+              "example": {
+                "model": "qwen2.5-chat",
+                "messages": [
+                  { "role": "system", "content": "You are concise." },
+                  { "role": "user", "content": "What is the capital of France?" }
+                ],
+                "temperature": 0.7,
+                "max_tokens": 64,
+                "stream": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Completion",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChatCompletionResponse" }
+              }
+            }
+          },
+          "500": { "description": "Model failed to load or generation error" }
+        }
+      }
+    },
+    "/v1/embeddings": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Create embeddings",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EmbeddingRequest" },
+              "example": {
+                "model": "gte-qwen2-embed",
+                "input": ["the quick brown fox", "Paris is the capital of France"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Embeddings",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EmbeddingResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/props": {
+      "get": {
+        "tags": ["Server"],
+        "summary": "Server / model properties",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Router mode: which model instance to query"
+          }
+        ],
+        "responses": { "200": { "description": "Properties object" } }
+      }
+    },
+    "/models/load": {
+      "post": {
+        "tags": ["Server"],
+        "summary": "Router: load a model instance",
+        "description": "Router mode only. Loads the named model so the next request is fast.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": { "model": { "type": "string", "example": "qwen2.5-chat" } },
+                "required": ["model"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Load started / accepted" },
+          "400": { "description": "Missing or unknown model" }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ChatMessage": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": { "type": "string", "enum": ["system", "user", "assistant"] },
+          "content": { "type": "string" }
+        }
+      },
+      "ChatCompletionRequest": {
+        "type": "object",
+        "required": ["model", "messages"],
+        "properties": {
+          "model": { "type": "string", "enum": ["qwen2.5-chat", "gte-qwen2-embed"], "example": "qwen2.5-chat" },
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/ChatMessage" } },
+          "temperature": { "type": "number", "default": 0.8 },
+          "top_p": { "type": "number", "default": 0.95 },
+          "max_tokens": { "type": "integer", "description": "Max tokens to generate" },
+          "stream": { "type": "boolean", "default": false }
+        }
+      },
+      "ChatCompletionResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "object": { "type": "string", "example": "chat.completion" },
+          "model": { "type": "string" },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer" },
+                "message": { "$ref": "#/components/schemas/ChatMessage" },
+                "finish_reason": { "type": "string", "example": "stop" }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "prompt_tokens": { "type": "integer" },
+              "completion_tokens": { "type": "integer" },
+              "total_tokens": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "EmbeddingRequest": {
+        "type": "object",
+        "required": ["model", "input"],
+        "properties": {
+          "model": { "type": "string", "enum": ["gte-qwen2-embed", "qwen2.5-chat"], "example": "gte-qwen2-embed" },
+          "input": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ],
+            "description": "A string or array of strings to embed"
+          }
+        }
+      },
+      "EmbeddingResponse": {
+        "type": "object",
+        "properties": {
+          "object": { "type": "string", "example": "list" },
+          "model": { "type": "string" },
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "object": { "type": "string", "example": "embedding" },
+                "index": { "type": "integer" },
+                "embedding": { "type": "array", "items": { "type": "number" } }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "prompt_tokens": { "type": "integer" },
+              "total_tokens": { "type": "integer" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

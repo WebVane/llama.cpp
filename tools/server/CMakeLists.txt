@@ -48,6 +48,11 @@ if (LLAMA_BUILD_WEBUI)
         bundle.js
         bundle.css
         loading.html
+        favicon.svg
+        swagger.html
+        swagger-ui.css
+        swagger-ui-bundle.js
+        openapi.json
     )
 
     foreach(asset ${PUBLIC_ASSETS})
