@@ -22,6 +22,12 @@
 	import { getPreviewText } from '$lib/utils';
 	import { APP_NAME } from '$lib/constants';
 
+	// Brand wordmark: keep the last word on its own line so multi-word
+	// names (e.g. "Provision LLM Engine") don't overflow the sidebar.
+	const _brandWords = APP_NAME.trim().split(/\s+/);
+	const brandTail = _brandWords.length > 1 ? _brandWords[_brandWords.length - 1] : '';
+	const brandHead = _brandWords.length > 1 ? _brandWords.slice(0, -1).join(' ') : APP_NAME;
+
 	const sidebar = Sidebar.useSidebar();
 
 	let currentChatId = $derived(page.params.id);
@@ -176,7 +182,7 @@
 				<a href={ROUTES.START} onclick={handleMobileSidebarItemClick}>
 					<h1 class="inline-flex items-center gap-2 px-2 text-xl font-semibold">
 						<svg
-							class="h-6 w-6 shrink-0"
+							class="h-9 w-9 shrink-0"
 							viewBox="0 0 38 38"
 							fill="none"
 							xmlns="http://www.w3.org/2000/svg"
@@ -215,7 +221,10 @@
 								text-anchor="middle">P</text
 							>
 						</svg>
-						{APP_NAME}
+						<span class="flex flex-col leading-tight">
+							<span>{brandHead}</span>
+							{#if brandTail}<span>{brandTail}</span>{/if}
+						</span>
 					</h1>
 				</a>
 
