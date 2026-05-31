@@ -4,15 +4,28 @@
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" llama-dual.iss
 ; Requires the payload\ folder produced by build-payload.ps1.
 
-#define MyAppName        "Provision LLM Engine"
+; Define "Trial" on the ISCC command line to brand a request-limited build:
+;   ISCC.exe /DTrial llama-dual.iss
+; The payload must have been produced by:  build-payload.ps1 -Trial
+#ifdef Trial
+  #define MyAppName      "Provision LLM Engine (Trial)"
+  #define OutBaseName    "ProvisionLLMEngine-Trial-Setup"
+  ; Distinct AppId so a trial installs side-by-side with / independently of
+  ; the full version instead of silently "upgrading" it.
+  #define AppGuid        "{9A1B7C42-5E3D-4F18-A2C6-7B9D0E4A1F35}"
+#else
+  #define MyAppName      "Provision LLM Engine"
+  #define OutBaseName    "ProvisionLLMEngine-Setup"
+  #define AppGuid        "{8F3C6A21-7B4D-4E92-9C1A-2D5E7A9B0C13}"
+#endif
 #define MyAppVersion     "1.0.0"
 #define MyAppPublisher   "Provision"
-#define MyAppExeName     "launcher.bat"
+#define MyAppExeName     "ProvisionLLM_launcher.bat"
 
 [Setup]
 ; A fresh GUID identifies this app for upgrades/uninstall. Keep it stable
 ; across versions so installs upgrade in place instead of stacking.
-AppId={{8F3C6A21-7B4D-4E92-9C1A-2D5E7A9B0C13}
+AppId={{#AppGuid}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
@@ -23,7 +36,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputBaseFilename=ProvisionLLMEngine-Setup
+OutputBaseFilename={#OutBaseName}
 SetupIconFile=favicon.ico
 ; The bundled models push the total well past the ~4.2 GB hard limit for a
 ; single Setup.exe, so split into a Setup.exe + Setup-N.bin slices. All

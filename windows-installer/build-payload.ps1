@@ -44,7 +44,16 @@ param(
     [string] $Config   = "Release",
 
     # Wipe the build dir first (use after changing CUDA toolkit / flags).
-    [switch] $Clean
+    [switch] $Clean,
+
+    # Build a request-limited TRIAL of provision-server. The server then
+    # serves at most -TrialLimit inference requests (web UI and API alike);
+    # health checks and metadata endpoints are exempt. State is signed and
+    # stored under %PROGRAMDATA%\ProvisionOCR\trial.dat.
+    [switch] $Trial,
+
+    # Number of inference requests the trial allows before locking out.
+    [int] $TrialLimit = 50
 )
 
 $ErrorActionPreference = "Stop"
@@ -113,6 +122,19 @@ if ($Clean -and (Test-Path $BuildDir)) {
     Remove-Item -Recurse -Force $BuildDir
 }
 
+# Trial build: enable the request limiter, and bundle BoringSSL so the
+# HMAC-SHA256 libcrypto the limiter needs is always present (statically
+# linked -- no extra DLL to ship) even on machines without OpenSSL.
+$TrialArgs = @()
+if ($Trial) {
+    Write-Host "  TRIAL build: request limit = $TrialLimit" -ForegroundColor Yellow
+    $TrialArgs = @(
+        "-DLLAMA_SERVER_TRIAL=ON",
+        "-DLLAMA_SERVER_TRIAL_LIMIT=$TrialLimit",
+        "-DLLAMA_BUILD_BORINGSSL=ON"
+    )
+}
+
 Write-Step "Configuring (CMake)"
 & $CMake -B "$BuildDir" -S "$RepoRoot" `
     -DCMAKE_BUILD_TYPE="$Config" `
@@ -124,7 +146,8 @@ Write-Step "Configuring (CMake)"
     -DCMAKE_CUDA_ARCHITECTURES="$CudaArch" `
     -DLLAMA_CURL=OFF `
     -DLLAMA_BUILD_TESTS=OFF `
-    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_EXAMPLES=OFF `
+    @TrialArgs
 if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed." }
 
 # Full build (not --target llama-server): GGML_BACKEND_DL needs every
@@ -136,9 +159,9 @@ if ($LASTEXITCODE -ne 0) { Fail "Build failed." }
 # --- locate build output ---------------------------------------------------
 # VS multi-config -> build\bin\Release ; Ninja -> build\bin
 Write-Step "Collecting payload"
-$exe = Get-ChildItem -Path $BuildDir -Recurse -Filter "llama-server.exe" |
+$exe = Get-ChildItem -Path $BuildDir -Recurse -Filter "provision-server.exe" |
        Select-Object -First 1
-if (-not $exe) { Fail "llama-server.exe not found under $BuildDir after build." }
+if (-not $exe) { Fail "provision-server.exe not found under $BuildDir after build." }
 $binDir = $exe.DirectoryName
 Write-Host "  build output: $binDir"
 
@@ -146,7 +169,7 @@ if (Test-Path $PayloadDir) { Remove-Item -Recurse -Force $PayloadDir }
 New-Item -ItemType Directory -Path $PayloadDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $PayloadDir "models") | Out-Null
 
-# 1. llama-server.exe + everything ggml/llama built next to it (*.dll)
+# 1. provision-server.exe + everything ggml/provision built next to it (*.dll)
 Copy-Item $exe.FullName $PayloadDir
 Get-ChildItem -Path $binDir -Filter *.dll | ForEach-Object {
     Copy-Item $_.FullName $PayloadDir
@@ -163,7 +186,7 @@ foreach ($pat in $cudaDlls) {
 
 # 3. config + launcher + webui shortcut + brand icon (shortcut icon)
 Copy-Item (Join-Path $ScriptDir "models.ini")    $PayloadDir
-Copy-Item (Join-Path $ScriptDir "launcher.bat")  $PayloadDir
+Copy-Item (Join-Path $ScriptDir "ProvisionLLM_launcher.bat")  $PayloadDir
 Copy-Item (Join-Path $ScriptDir "Open-WebUI.url") $PayloadDir
 $icoSrc = Join-Path $ScriptDir "favicon.ico"
 if (Test-Path $icoSrc) {

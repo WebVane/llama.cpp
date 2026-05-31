@@ -119,6 +119,7 @@ add_library(${TARGET}
     )
 
 set_target_properties(${TARGET} PROPERTIES
+    OUTPUT_NAME provision-common
     VERSION ${LLAMA_INSTALL_VERSION}
     SOVERSION 0
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number

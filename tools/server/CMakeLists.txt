@@ -71,6 +71,7 @@ else()
 endif()
 
 add_executable(${TARGET} ${TARGET_SRCS})
+set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME provision-server)
 install(TARGETS ${TARGET} RUNTIME)
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
@@ -78,3 +79,37 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE server-context PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# Trial / evaluation build: limit the number of inference requests served
+# (web UI and API alike). Health checks and metadata endpoints are exempt.
+# OFF by default so a normal build is unrestricted.
+option(LLAMA_SERVER_TRIAL "Build provision-server as a request-limited trial" OFF)
+set(LLAMA_SERVER_TRIAL_LIMIT 50 CACHE STRING "Trial request limit")
+set(LLAMA_SERVER_TRIAL_KEY "" CACHE STRING "Override the HMAC key used to sign trial state")
+
+if (LLAMA_SERVER_TRIAL)
+    target_sources(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src/license/Trial.cpp)
+    target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(${TARGET} PRIVATE
+        VISIO_TRIAL=1
+        VISIO_TRIAL_LIMIT=${LLAMA_SERVER_TRIAL_LIMIT})
+    if (NOT LLAMA_SERVER_TRIAL_KEY STREQUAL "")
+        target_compile_definitions(${TARGET} PRIVATE VISIO_TRIAL_KEY="${LLAMA_SERVER_TRIAL_KEY}")
+    endif()
+
+    # The trial counter signs its state with HMAC-SHA256, which needs libcrypto.
+    # Reuse whatever crypto provider the build already has: the system OpenSSL
+    # (OpenSSL::Crypto), or the bundled BoringSSL/LibreSSL pulled in by
+    # cpp-httplib (the `crypto` target). Only fall back to a hard requirement
+    # if neither is present.
+    if (TARGET OpenSSL::Crypto)
+        target_link_libraries(${TARGET} PRIVATE OpenSSL::Crypto)
+    elseif (TARGET crypto)
+        target_link_libraries(${TARGET} PRIVATE crypto)
+    else()
+        find_package(OpenSSL REQUIRED)
+        target_link_libraries(${TARGET} PRIVATE OpenSSL::Crypto)
+    endif()
+
+    message(STATUS "provision-server: TRIAL build enabled, request limit = ${LLAMA_SERVER_TRIAL_LIMIT}")
+endif()

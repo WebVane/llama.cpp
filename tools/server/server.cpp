@@ -11,6 +11,10 @@
 #include "llama.h"
 #include "log.h"
 
+#ifdef VISIO_TRIAL
+#include "license/Trial.h"
+#endif
+
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -71,6 +75,45 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+#ifdef VISIO_TRIAL
+// wrapper that gates a handler behind the trial request counter. Each allowed
+// request consumes one unit; once the limit is reached the handler is no longer
+// invoked and a 403 is returned instead. Only inference endpoints are wrapped
+// (see route registration below) — health, metrics, props, models, tokenize
+// and static web UI assets are intentionally left ungated.
+static server_http_context::handler_t trial_gate(server_http_context::handler_t func) {
+    // In router mode the parent process proxies every user request to a child
+    // instance; both run this same binary and share one state file. Count only
+    // in the router / standalone process so each request is charged exactly
+    // once — child instances (spawned with LLAMA_SERVER_ROUTER_PORT set) pass
+    // through unmodified.
+    if (server_models::is_child_server()) {
+        return func;
+    }
+    return [func = std::move(func)](const server_http_req & req) -> server_http_res_ptr {
+        if (!visio::license::Trial::instance().consume()) {
+            const auto st = visio::license::Trial::instance().status();
+            auto res = std::make_unique<server_http_res>();
+            json error_data = format_error_response(
+                "Trial limit reached: this evaluation build is limited to a fixed number of "
+                "requests. Please obtain a licensed build to continue.",
+                ERROR_TYPE_PERMISSION);
+            res->status = json_value(error_data, "code", 403);
+            res->data   = safe_json_to_str({{ "error", error_data }});
+            res->headers["X-Trial-Limit"] = std::to_string(st.limit);
+            res->headers["X-Trial-Used"]  = std::to_string(st.used);
+            return res;
+        }
+        return func(req);
+    };
+}
+#else
+// no-op pass-through when the trial is not compiled in
+static inline server_http_context::handler_t trial_gate(server_http_context::handler_t func) {
+    return func;
+}
+#endif
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -112,6 +155,23 @@ int main(int argc, char ** argv) {
 
     LOG_INF("build_info: %s\n", llama_build_info());
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+
+#ifdef VISIO_TRIAL
+    if (!server_models::is_child_server()) {
+        auto & trial = visio::license::Trial::instance();
+        trial.init();
+        const auto st = trial.status();
+        LOG_WRN("=========================================================\n");
+        LOG_WRN("TRIAL build: limited to %d inference request(s); %d used so far\n", st.limit, st.used);
+        LOG_WRN("trial state file: %s\n", st.state_path.c_str());
+        if (st.tampered) {
+            LOG_WRN("trial state failed integrity/clock check — requests will be denied\n");
+        } else if (st.exhausted) {
+            LOG_WRN("trial limit already reached — inference requests will be denied\n");
+        }
+        LOG_WRN("=========================================================\n");
+    }
+#endif
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
@@ -176,25 +236,26 @@ int main(int argc, char ** argv) {
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models)); // public endpoint (no API key check)
-    ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
-    ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
-    ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
-    ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
-    ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
-    ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
-    ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));
-    ctx_http.post("/v1/embeddings",            ex_wrapper(routes.post_embeddings_oai));
-    ctx_http.post("/rerank",                   ex_wrapper(routes.post_rerank));
-    ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
+    // inference endpoints are gated by the trial counter (no-op in non-trial builds)
+    ctx_http.post("/completion",               trial_gate(ex_wrapper(routes.post_completions))); // legacy
+    ctx_http.post("/completions",              trial_gate(ex_wrapper(routes.post_completions)));
+    ctx_http.post("/v1/completions",           trial_gate(ex_wrapper(routes.post_completions_oai)));
+    ctx_http.post("/chat/completions",         trial_gate(ex_wrapper(routes.post_chat_completions)));
+    ctx_http.post("/v1/chat/completions",      trial_gate(ex_wrapper(routes.post_chat_completions)));
+    ctx_http.post("/v1/responses",             trial_gate(ex_wrapper(routes.post_responses_oai)));
+    ctx_http.post("/responses",                trial_gate(ex_wrapper(routes.post_responses_oai)));
+    ctx_http.post("/v1/audio/transcriptions",  trial_gate(ex_wrapper(routes.post_transcriptions_oai)));
+    ctx_http.post("/audio/transcriptions",     trial_gate(ex_wrapper(routes.post_transcriptions_oai)));
+    ctx_http.post("/v1/messages",              trial_gate(ex_wrapper(routes.post_anthropic_messages))); // anthropic messages API
+    ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting (not gated)
+    ctx_http.post("/infill",                   trial_gate(ex_wrapper(routes.post_infill)));
+    ctx_http.post("/embedding",                trial_gate(ex_wrapper(routes.post_embeddings))); // legacy
+    ctx_http.post("/embeddings",               trial_gate(ex_wrapper(routes.post_embeddings)));
+    ctx_http.post("/v1/embeddings",            trial_gate(ex_wrapper(routes.post_embeddings_oai)));
+    ctx_http.post("/rerank",                   trial_gate(ex_wrapper(routes.post_rerank)));
+    ctx_http.post("/reranking",                trial_gate(ex_wrapper(routes.post_rerank)));
+    ctx_http.post("/v1/rerank",                trial_gate(ex_wrapper(routes.post_rerank)));
+    ctx_http.post("/v1/reranking",             trial_gate(ex_wrapper(routes.post_rerank)));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

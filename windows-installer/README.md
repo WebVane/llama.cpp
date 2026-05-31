@@ -39,7 +39,7 @@ Assets are vendored and embedded in the binary (offline, like the WebUI).
 |---|---|
 | `build-payload.ps1` | builds `llama-server` + collects all DLLs/models into `payload\` |
 | `models.ini` | router preset (chat + embeddings), relative paths |
-| `launcher.bat` | starts the server in router mode (Windows analog of `entrypoint.sh`) |
+| `ProvisionLLM_launcher.bat` | starts the server in router mode (Windows analog of `entrypoint.sh`) |
 | `Open-WebUI.url` | Start-menu shortcut target for the browser UI |
 | `llama-dual.iss` | Inno Setup script — turns `payload\` into `ProvisionLLMEngine-Setup.exe` |
 | `models\` | **you create this** — drop the two GGUF files here before building |
@@ -101,7 +101,7 @@ What it does (mirrors the working `docker-dual` build flags):
 - Full build (every backend DLL, required by `GGML_BACKEND_DL`)
 - Collects into `payload\`: `llama-server.exe`, all `ggml*/llama*.dll`,
   CUDA runtime DLLs (`cudart64_*`, `cublas64_*`, `cublasLt64_*`),
-  `models.ini`, `launcher.bat`, `Open-WebUI.url`, and `models\*.gguf`
+  `models.ini`, `ProvisionLLM_launcher.bat`, `Open-WebUI.url`, and `models\*.gguf`
 
 `sm_61` is in the arch list so the **GTX 1080 Ti** gets native code, and
 `GGML_CPU_ALL_VARIANTS` ships sse42/avx/avx2/... CPU backends so the install
@@ -113,6 +113,35 @@ Override the GPU set if you want a slimmer build:
 ```powershell
 .\build-payload.ps1 -CudaArch "61-real;86-real" -Clean
 ```
+
+### Trial build (request-limited)
+
+Pass `-Trial` to produce an evaluation build of `provision-server` that serves
+a fixed number of **inference** requests and then refuses with HTTP 403:
+
+```powershell
+.\build-payload.ps1 -Trial                 # default limit: 50 requests
+.\build-payload.ps1 -Trial -TrialLimit 100 # custom limit
+```
+
+- The limit applies to both the web UI and the API — they hit the same
+  endpoints (`/chat/completions`, `/completions`, `/v1/responses`,
+  `/v1/messages`, `/embeddings`, `/rerank`, transcriptions, `/infill`).
+- Health checks (`/health`, `/v1/health`) and metadata endpoints (`/props`,
+  `/models`, `/metrics`, `/tokenize`, `/detokenize`, web UI assets) are **not**
+  counted.
+- The counter persists across restarts in a tamper-resistant,
+  HMAC-SHA256-signed file at `%PROGRAMDATA%\ProvisionOCR\trial.dat`. Editing
+  the file or rolling the system clock back locks the trial out.
+- In router mode (the default for this installer), the request is counted once
+  in the router process; spawned child instances do not double-count.
+- `-Trial` also turns on `LLAMA_BUILD_BORINGSSL` so the libcrypto the limiter
+  needs is statically bundled — no extra DLL to ship and no system OpenSSL
+  required.
+
+The limiter is compiled in via `-DLLAMA_SERVER_TRIAL=ON`
+(`-DLLAMA_SERVER_TRIAL_LIMIT=N`, optional `-DLLAMA_SERVER_TRIAL_KEY="..."`).
+A normal build (no `-Trial`) is unrestricted.
 
 ## Step 3 — compile the installer
 
@@ -167,7 +196,7 @@ curl -s http://localhost:8080/v1/embeddings `
   -d '{ \"model\": \"gte-qwen2-embed\", \"input\": \"the quick brown fox\" }'
 ```
 
-## Knobs (edit `launcher.bat`, then restart)
+## Knobs (edit `ProvisionLLM_launcher.bat`, then restart)
 
 | var | default | effect |
 |---|---|---|
@@ -175,8 +204,8 @@ curl -s http://localhost:8080/v1/embeddings `
 | `HOST` | `127.0.0.1` | `0.0.0.0` exposes on LAN (also open Windows Firewall for `llama-server.exe`) |
 | `MODELS_MAX` | `2` | `2` = both models resident (~9 GB VRAM, fits 1080 Ti); `1` = swap between requests |
 
-After install `launcher.bat` lives in the install folder
-(`%ProgramFiles%\Provision LLM Engine\launcher.bat`); edit it there.
+After install `ProvisionLLM_launcher.bat` lives in the install folder
+(`%ProgramFiles%\Provision LLM Engine\ProvisionLLM_launcher.bat`); edit it there.
 
 ## Notes / gotchas
 
