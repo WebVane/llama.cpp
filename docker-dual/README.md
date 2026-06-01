@@ -87,6 +87,43 @@ docker build -f docker-dual/Dockerfile \
     -t llama-dual .
 ```
 
+### c) trial build (request-limited)
+
+Pass `--build-arg TRIAL=1` to compile a request-limited evaluation image:
+the server then serves at most `TRIAL_LIMIT` **inference** requests (web UI
+and API alike) and afterwards refuses with HTTP 403.
+
+```bash
+docker build -f docker-dual/Dockerfile \
+    --build-arg TRIAL=1 \
+    --build-arg TRIAL_LIMIT=50 \
+    -t llama-dual:trial .
+```
+
+- Counted: `/chat/completions`, `/completions`, `/v1/responses`,
+  `/v1/messages`, `/embeddings`, `/rerank`, transcriptions, `/infill`.
+- **Not** counted: `/health`, `/props`, `/models`, `/metrics`,
+  `/tokenize`, `/detokenize`, web UI assets. The Docker `HEALTHCHECK`
+  therefore never consumes the trial.
+- The signed counter (HMAC-SHA256, tamper- and clock-rollback-resistant)
+  lives at `/var/lib/provision-ocr/trial.dat` inside the container. To make
+  it survive container recreation, mount a volume there:
+
+  ```bash
+  docker run -d --name llama-dual-trial --gpus all \
+      -p 8080:8080 \
+      -v "$(pwd)/models:/models:ro" \
+      -v llama-trial-state:/var/lib/provision-ocr \
+      llama-dual:trial
+  ```
+
+- In router mode (the default) the request is counted once in the router
+  process; the spawned child instances do not double-count.
+
+In CI the trial image is built by the `build_llama_dual_trial` job and
+pushed as a single rolling `:trial` tag (only the latest version is kept;
+the previous `:trial` image is reused as the build cache).
+
 ## 4. Try it
 
 ```bash

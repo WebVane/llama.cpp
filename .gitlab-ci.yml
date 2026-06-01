@@ -30,6 +30,10 @@ variables:
   # Registry image tag (branch/sha/latest suffix is appended per-job below).
   RELEASE_IMG: "${REGISTRY}/llama_dual"
 
+  # Number of inference requests the trial image serves before locking out
+  # (see build_llama_dual_trial below and docker-dual/Dockerfile).
+  TRIAL_LIMIT: "50"
+
 stages:
   - build
 
@@ -83,4 +87,46 @@ build_llama_dual:
     if [ "$CI_COMMIT_BRANCH" = "master" ]; then
       echo "  $RELEASE_IMG:latest"
     fi
+  - docker images $RELEASE_IMG --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | head -n 5
+
+# =========================================================================
+# Build the TRIAL llama-dual image: same as build_llama_dual but the server
+# is compiled with -DLLAMA_SERVER_TRIAL=ON (TRIAL_LIMIT inference requests,
+# then HTTP 403; health checks exempt — see docker-dual/Dockerfile and
+# src/license/Trial.cpp).
+#
+# Single rolling image only: one tag, :trial, overwritten every build (we
+# keep only the latest trial version — no per-commit / per-branch tags).
+# The previous :trial is pulled as the BuildKit cache donor for incremental
+# rebuilds.
+#
+# The signed counter lives at /var/lib/provision-ocr/trial.dat in the
+# container; mount a volume there to persist it across container recreation.
+# =========================================================================
+build_llama_dual_trial:
+  stage: build
+  image: docker:24.0.9
+  timeout: 2h
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev"
+  before_script:
+  - echo "REGISTRY=[$REGISTRY] RELEASE_IMG=[$RELEASE_IMG] CUDA_ARCH=[$CUDA_ARCH] TRIAL_LIMIT=[$TRIAL_LIMIT]"
+  - docker login -u admin -p $NEXUS_PASS nexus.scan-dev.com:6001
+  script:
+  # 1. Pull the previous :trial image as a cache donor (ignored if absent).
+  - docker pull $RELEASE_IMG:trial || true
+  # 2. Build the trial variant (TRIAL=1) and tag it :trial only.
+  - |
+    docker build -f docker-dual/Dockerfile \
+      --cache-from $RELEASE_IMG:trial \
+      --build-arg BUILDKIT_INLINE_CACHE=1 \
+      --build-arg CUDA_ARCH="$CUDA_ARCH" \
+      --build-arg TRIAL=1 \
+      --build-arg TRIAL_LIMIT="$TRIAL_LIMIT" \
+      -t $RELEASE_IMG:trial \
+      .
+  # 3. Push the single rolling tag, overwriting the previous trial image.
+  - docker push $RELEASE_IMG:trial
+  after_script:
+  - echo "=== llama-dual (TRIAL) pushed: $RELEASE_IMG:trial ==="
   - docker images $RELEASE_IMG --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | head -n 5

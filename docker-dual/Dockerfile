@@ -38,9 +38,20 @@ FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 # will fail at ptxas time.
 ARG CUDA_ARCH=default
 
+# Trial / evaluation build.  TRIAL=1 compiles the server as a request-limited
+# trial (see tools/server/CMakeLists.txt and src/license/Trial.cpp): it serves
+# at most TRIAL_LIMIT inference requests (web UI and API alike) and then
+# refuses with HTTP 403.  Health checks and metadata endpoints are exempt.
+# The signed counter lives at /var/lib/provision-ocr/trial.dat inside the
+# container (mount a volume there to persist it across container recreation).
+ARG TRIAL=0
+ARG TRIAL_LIMIT=50
+
 # CUDA 12.2 supports gcc up to 12; Ubuntu 22.04 ships gcc-11 by default
 # but we install gcc-12 explicitly for slightly better C++20 coverage in
 # common/.  Skip gcc-14: not in jammy archives and incompatible with 12.2.
+# libssl-dev provides libcrypto for the trial counter's HMAC-SHA256 (the
+# CMake trial block reuses the OpenSSL::Crypto target that cpp-httplib finds).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         gcc-12 g++-12 \
@@ -49,6 +60,7 @@ RUN apt-get update && \
         git \
         ca-certificates \
         libcurl4-openssl-dev \
+        libssl-dev \
         libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -57,8 +69,13 @@ ENV CC=gcc-12 CXX=g++-12 CUDAHOSTCXX=g++-12
 WORKDIR /src
 COPY . /src
 
-RUN if [ "${CUDA_ARCH}" != "default" ]; then \
-        EXTRA_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"; \
+RUN EXTRA_CMAKE_ARGS="" && \
+    if [ "${CUDA_ARCH}" != "default" ]; then \
+        EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"; \
+    fi && \
+    if [ "${TRIAL}" = "1" ]; then \
+        echo "*** TRIAL build: request limit = ${TRIAL_LIMIT} ***"; \
+        EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS} -DLLAMA_SERVER_TRIAL=ON -DLLAMA_SERVER_TRIAL_LIMIT=${TRIAL_LIMIT}"; \
     fi && \
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
@@ -77,7 +94,11 @@ RUN if [ "${CUDA_ARCH}" != "default" ]; then \
 # avx512, ...) and ggml picks the right one at startup -- so the image
 # runs on any x86_64 host from Sandy Bridge upward without recompiling.
 RUN mkdir -p /out/bin /out/lib && \
-    cp build/bin/llama-server /out/bin/ && \
+    # The server target may be named provision-server (rebrand) or
+    # llama-server depending on tools/server/CMakeLists.txt; normalize to
+    # llama-server so the entrypoint path stays stable either way.
+    { cp build/bin/provision-server /out/bin/llama-server 2>/dev/null || \
+      cp build/bin/llama-server     /out/bin/llama-server; } && \
     find build -name "*.so*" -exec cp -P {} /out/lib/ \;
 
 # -----------------------------------------------------------------------------
