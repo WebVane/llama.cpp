@@ -346,10 +346,15 @@ bool server_http_context::init(const common_params & params) {
             // Swagger UI: served by the server itself so "Try it out" is
             // same-origin (no CORS setup needed). Assets are vendored and
             // embedded offline, like the rest of the web UI.
-            srv->Get(params.api_prefix + "/swagger", [](const httplib::Request & /*req*/, httplib::Response & res) {
+            // /swagger and /docs are aliases for the same Swagger UI page.
+            // Relative asset refs (swagger-ui.css, openapi.json, ...) resolve
+            // against the root either way, so both paths work identically.
+            const auto serve_swagger = [](const httplib::Request & /*req*/, httplib::Response & res) {
                 res.set_content(reinterpret_cast<const char*>(swagger_html), swagger_html_len, "text/html; charset=utf-8");
                 return false;
-            });
+            };
+            srv->Get(params.api_prefix + "/swagger", serve_swagger);
+            srv->Get(params.api_prefix + "/docs",    serve_swagger);
             srv->Get(params.api_prefix + "/swagger-ui.css", [](const httplib::Request & /*req*/, httplib::Response & res) {
                 res.set_content(reinterpret_cast<const char*>(swagger_ui_css), swagger_ui_css_len, "text/css; charset=utf-8");
                 return false;
