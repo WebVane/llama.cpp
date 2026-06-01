@@ -128,5 +128,5 @@ build_llama_dual_trial:
   # 3. Push the single rolling tag, overwriting the previous trial image.
   - docker push $RELEASE_IMG:trial
   after_script:
-  - echo "=== llama-dual (TRIAL) pushed: $RELEASE_IMG:trial ==="
+  - echo "=== llama-dual TRIAL pushed - $RELEASE_IMG:trial ==="
   - docker images $RELEASE_IMG --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | head -n 5
