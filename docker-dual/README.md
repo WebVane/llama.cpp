@@ -87,17 +87,27 @@ docker build -f docker-dual/Dockerfile \
     -t llama-dual .
 ```
 
-### c) trial build (request-limited)
+### c) trial build (request-limited, self-contained)
 
 Pass `--build-arg TRIAL=1` to compile a request-limited evaluation image:
 the server then serves at most `TRIAL_LIMIT` **inference** requests (web UI
 and API alike) and afterwards refuses with HTTP 403.
+
+The trial image is **self-contained** — the two GGUF weights are downloaded
+from HuggingFace at build time and baked into `/models`, so no model mount
+is needed:
 
 ```bash
 docker build -f docker-dual/Dockerfile \
     --build-arg TRIAL=1 \
     --build-arg TRIAL_LIMIT=50 \
     -t llama-dual:trial .
+
+# Run it — note: do NOT mount /models, the weights are already inside.
+docker run -d --name llama-dual-trial --gpus all \
+    -p 8080:8080 \
+    -v llama-trial-state:/var/lib/provision-ocr \
+    llama-dual:trial
 ```
 
 - Counted: `/chat/completions`, `/completions`, `/v1/responses`,
@@ -106,23 +116,21 @@ docker build -f docker-dual/Dockerfile \
   `/tokenize`, `/detokenize`, web UI assets. The Docker `HEALTHCHECK`
   therefore never consumes the trial.
 - The signed counter (HMAC-SHA256, tamper- and clock-rollback-resistant)
-  lives at `/var/lib/provision-ocr/trial.dat` inside the container. To make
-  it survive container recreation, mount a volume there:
-
-  ```bash
-  docker run -d --name llama-dual-trial --gpus all \
-      -p 8080:8080 \
-      -v "$(pwd)/models:/models:ro" \
-      -v llama-trial-state:/var/lib/provision-ocr \
-      llama-dual:trial
-  ```
-
+  lives at `/var/lib/provision-ocr/trial.dat`; the `-v llama-trial-state:...`
+  mount above persists it across container recreation (drop it if you want
+  the counter to reset on every fresh container).
 - In router mode (the default) the request is counted once in the router
   process; the spawned child instances do not double-count.
+- The weights come from `bartowski/Qwen2.5-7B-Instruct-GGUF` and
+  `second-state/gte-Qwen2-1.5B-instruct-GGUF`. Override
+  `--build-arg TRIAL_CHAT_MODEL_URL=...` / `TRIAL_EMBED_MODEL_URL=...` to pull
+  from an internal mirror instead (the build needs network access to the
+  source). The baked weights add ~7 GB to the image.
 
 In CI the trial image is built by the `build_llama_dual_trial` job and
 pushed as a single rolling `:trial` tag (only the latest version is kept;
-the previous `:trial` image is reused as the build cache).
+the previous `:trial` image is reused as the build cache). The runner needs
+network egress to the weight source.
 
 ## 4. Try it
 

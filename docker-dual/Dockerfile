@@ -106,6 +106,14 @@ RUN mkdir -p /out/bin /out/lib && \
 # -----------------------------------------------------------------------------
 FROM ${BASE_CUDA_RUN_CONTAINER} AS runtime
 
+# Re-declared here: build ARGs do not cross stage boundaries.  When TRIAL=1
+# the two GGUF weights are downloaded and baked into /models so the trial
+# image is fully self-contained (no volume mount required).  Override the
+# URLs to pull from an internal mirror instead of HuggingFace.
+ARG TRIAL=0
+ARG TRIAL_CHAT_MODEL_URL=https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q5_K_M.gguf
+ARG TRIAL_EMBED_MODEL_URL=https://huggingface.co/second-state/gte-Qwen2-1.5B-instruct-GGUF/resolve/main/gte-Qwen2-1.5B-instruct-Q8_0.gguf
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgomp1 \
@@ -130,6 +138,21 @@ COPY docker-dual/models.ini    /config/models.ini
 COPY docker-dual/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# TRIAL only: bake the GGUF weights into /models so the image is fully
+# self-contained (the production image keeps /models empty and expects a
+# volume mount).  Filenames must match the paths in models.ini.  This is a
+# large (~7 GB) layer; with --cache-from it is reused across rebuilds as
+# long as the URLs are unchanged.
+RUN mkdir -p /models && \
+    if [ "${TRIAL}" = "1" ]; then \
+        echo "*** TRIAL: baking weights into /models ***" && \
+        curl -fSL --retry 3 --retry-delay 5 \
+            -o /models/Qwen2.5-7B-Instruct-Q5_K_M.gguf "${TRIAL_CHAT_MODEL_URL}" && \
+        curl -fSL --retry 3 --retry-delay 5 \
+            -o /models/gte-Qwen2-1.5B-instruct-Q8_0.gguf "${TRIAL_EMBED_MODEL_URL}" && \
+        ls -lh /models; \
+    fi
+
 ENV LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}
 ENV LLAMA_ARG_HOST=0.0.0.0
 ENV PORT=8080
@@ -139,7 +162,10 @@ ENV MODELS_CONFIG=/config/models.ini
 WORKDIR /app
 
 EXPOSE 8080
-VOLUME ["/models"]
+# No VOLUME ["/models"] on purpose: the production image expects an explicit
+# bind mount (-v ./models:/models, see docker-compose.yml), and the trial
+# image already has the weights baked into /models -- declaring a volume
+# would make every `docker run` copy the ~7 GB into a throwaway anon volume.
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
