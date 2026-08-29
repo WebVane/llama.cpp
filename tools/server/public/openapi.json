@@ -3,71 +3,22 @@
   "info": {
     "title": "Provision LLM Engine API",
     "version": "1.0.0",
-    "description": "OpenAI-compatible + native endpoints exposed by llama-server. Served by the server itself, so \"Try it out\" runs same-origin (no CORS setup needed). In router mode, send a known model id in the `model` field (e.g. `qwen2.5-chat`, `gte-qwen2-embed`)."
+    "description": "OpenAI-compatible + native endpoints exposed by the Provision LLM Engine (llama-server). Served by the server itself, so \"Try it out\" runs same-origin (no CORS setup needed). In router mode, send a known model id in the `model` field (e.g. `qwen2.5-chat`, `gte-qwen2-embed`).\n\n**Trial builds:** endpoints tagged _counted_ consume one unit of the trial request budget; once it is exhausted they return HTTP 403 with `X-Trial-Limit` / `X-Trial-Used` headers. Endpoints tagged _exempt_ (health, metadata, tokenize, models, slots) never consume the budget. Non-trial builds ignore the counter entirely.\n\nMany routes have aliases (legacy / non-`v1` forms); the canonical path is documented and its aliases are listed in the route description."
   },
   "servers": [
     { "url": "/", "description": "This server" }
   ],
   "tags": [
     { "name": "OpenAI", "description": "OpenAI-compatible routes" },
+    { "name": "Anthropic", "description": "Anthropic Messages-compatible routes" },
     { "name": "Server", "description": "Native llama-server / router routes" }
   ],
   "paths": {
-    "/health": {
-      "get": {
-        "tags": ["Server"],
-        "summary": "Health check",
-        "responses": {
-          "200": {
-            "description": "Server is ready",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": { "status": { "type": "string", "example": "ok" } }
-                }
-              }
-            }
-          },
-          "503": { "description": "Model is still loading" }
-        }
-      }
-    },
-    "/v1/models": {
-      "get": {
-        "tags": ["OpenAI"],
-        "summary": "List available models",
-        "responses": {
-          "200": {
-            "description": "Model list",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "object": { "type": "string", "example": "list" },
-                    "data": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "id": { "type": "string", "example": "qwen2.5-chat" },
-                          "object": { "type": "string", "example": "model" }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/chat/completions": {
       "post": {
         "tags": ["OpenAI"],
-        "summary": "Chat completion",
+        "summary": "Chat completion (counted)",
+        "description": "Alias: `/chat/completions`. **Counted** against the trial budget.",
         "requestBody": {
           "required": true,
           "content": {
@@ -95,14 +46,109 @@
               }
             }
           },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" },
           "500": { "description": "Model failed to load or generation error" }
+        }
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Text completion (counted)",
+        "description": "OpenAI-style text completion. Aliases: `/completions`, `/completion` (legacy, llama.cpp-native response shape). **Counted** against the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CompletionRequest" },
+              "example": {
+                "model": "qwen2.5-chat",
+                "prompt": "Once upon a time",
+                "max_tokens": 64,
+                "temperature": 0.8,
+                "stream": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Completion",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CompletionResponse" }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" }
+        }
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Responses API (counted)",
+        "description": "OpenAI Responses API. Alias: `/responses`. **Counted** against the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ResponsesRequest" },
+              "example": {
+                "model": "qwen2.5-chat",
+                "input": "Write a haiku about the sea."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Response object" },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" }
+        }
+      }
+    },
+    "/v1/audio/transcriptions": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Audio transcription (counted)",
+        "description": "OpenAI Whisper-compatible transcription. Alias: `/audio/transcriptions`. Requires an audio-capable model. **Counted** against the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                  "file": { "type": "string", "format": "binary", "description": "Audio file (wav, mp3, ...)" },
+                  "model": { "type": "string", "example": "whisper" },
+                  "response_format": { "type": "string", "enum": ["json", "text", "verbose_json"], "default": "json" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transcript",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "text": { "type": "string" } }
+                }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" }
         }
       }
     },
     "/v1/embeddings": {
       "post": {
         "tags": ["OpenAI"],
-        "summary": "Create embeddings",
+        "summary": "Create embeddings (counted)",
+        "description": "Aliases: `/embeddings`, `/embedding` (legacy). **Counted** against the trial budget.",
         "requestBody": {
           "required": true,
           "content": {
@@ -123,6 +169,190 @@
                 "schema": { "$ref": "#/components/schemas/EmbeddingResponse" }
               }
             }
+          },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" }
+        }
+      }
+    },
+    "/v1/rerank": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Rerank documents (counted)",
+        "description": "Scores documents by relevance to a query. Requires a reranker model. Aliases: `/rerank`, `/reranking`, `/v1/reranking`. **Counted** against the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RerankRequest" },
+              "example": {
+                "model": "reranker",
+                "query": "What is the capital of France?",
+                "documents": ["Paris is the capital of France.", "Berlin is in Germany.", "The Eiffel Tower is tall."],
+                "top_n": 2
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ranked results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RerankResponse" }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" }
+        }
+      }
+    },
+    "/infill": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Code infill (counted)",
+        "description": "Fill-in-the-middle code completion using a prefix and suffix. Requires a model trained for infill. **Counted** against the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InfillRequest" },
+              "example": {
+                "input_prefix": "def add(a, b):\n    return ",
+                "input_suffix": "\n\nprint(add(2, 3))",
+                "n_predict": 16
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Infill completion",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CompletionResponse" }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" }
+        }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": ["Anthropic"],
+        "summary": "Anthropic Messages (counted)",
+        "description": "Anthropic Messages API-compatible chat endpoint. **Counted** against the trial budget. Token counting via `/v1/messages/count_tokens` is exempt.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AnthropicMessagesRequest" },
+              "example": {
+                "model": "qwen2.5-chat",
+                "max_tokens": 64,
+                "messages": [
+                  { "role": "user", "content": "What is the capital of France?" }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Anthropic-style message response" },
+          "403": { "$ref": "#/components/responses/TrialLimitReached" }
+        }
+      }
+    },
+    "/v1/messages/count_tokens": {
+      "post": {
+        "tags": ["Anthropic"],
+        "summary": "Count tokens (exempt)",
+        "description": "Counts the tokens a Messages request would use. **Exempt** from the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AnthropicMessagesRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token count",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "input_tokens": { "type": "integer" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": ["OpenAI"],
+        "summary": "List available models (exempt)",
+        "description": "Alias: `/models`. Public endpoint (no API key). **Exempt** from the trial budget.",
+        "responses": {
+          "200": {
+            "description": "Model list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "object": { "type": "string", "example": "list" },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": { "type": "string", "example": "qwen2.5-chat" },
+                          "object": { "type": "string", "example": "model" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": ["Server"],
+        "summary": "Health check (exempt)",
+        "description": "Alias: `/v1/health`. Public endpoint (no API key). **Exempt** from the trial budget &mdash; container HEALTHCHECK never consumes it.",
+        "responses": {
+          "200": {
+            "description": "Server is ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "status": { "type": "string", "example": "ok" } }
+                }
+              }
+            }
+          },
+          "503": { "description": "Model is still loading" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["Server"],
+        "summary": "Prometheus metrics (exempt)",
+        "description": "Prometheus text-format metrics (enabled with `--metrics`). **Exempt** from the trial budget.",
+        "responses": {
+          "200": {
+            "description": "Metrics in Prometheus exposition format",
+            "content": { "text/plain": { "schema": { "type": "string" } } }
           }
         }
       }
@@ -130,7 +360,8 @@
     "/props": {
       "get": {
         "tags": ["Server"],
-        "summary": "Server / model properties",
+        "summary": "Server / model properties (exempt)",
+        "description": "**Exempt** from the trial budget.",
         "parameters": [
           {
             "name": "model",
@@ -141,21 +372,31 @@
           }
         ],
         "responses": { "200": { "description": "Properties object" } }
+      },
+      "post": {
+        "tags": ["Server"],
+        "summary": "Update server properties (exempt)",
+        "description": "Updates mutable server properties at runtime (when enabled). **Exempt** from the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": { "200": { "description": "Updated" } }
       }
     },
     "/models/load": {
       "post": {
         "tags": ["Server"],
-        "summary": "Router: load a model instance",
-        "description": "Router mode only. Loads the named model so the next request is fast.",
+        "summary": "Router: load a model instance (exempt)",
+        "description": "Router mode only. Loads the named model so the next request is fast. **Exempt** from the trial budget.",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "type": "object",
-                "properties": { "model": { "type": "string", "example": "qwen2.5-chat" } },
-                "required": ["model"]
+                "required": ["model"],
+                "properties": { "model": { "type": "string", "example": "qwen2.5-chat" } }
               }
             }
           }
@@ -165,10 +406,157 @@
           "400": { "description": "Missing or unknown model" }
         }
       }
+    },
+    "/models/unload": {
+      "post": {
+        "tags": ["Server"],
+        "summary": "Router: unload a model instance (exempt)",
+        "description": "Router mode only. Frees the named model from memory. **Exempt** from the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["model"],
+                "properties": { "model": { "type": "string", "example": "qwen2.5-chat" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Unloaded" },
+          "400": { "description": "Missing or unknown model" }
+        }
+      }
+    },
+    "/tokenize": {
+      "post": {
+        "tags": ["Server"],
+        "summary": "Tokenize text (exempt)",
+        "description": "**Exempt** from the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TokenizeRequest" },
+              "example": { "content": "Hello, world!", "add_special": false }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token ids",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenizeResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/detokenize": {
+      "post": {
+        "tags": ["Server"],
+        "summary": "Detokenize ids (exempt)",
+        "description": "**Exempt** from the trial budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["tokens"],
+                "properties": {
+                  "tokens": { "type": "array", "items": { "type": "integer" }, "example": [9707, 11, 1879, 0] }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reconstructed text",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "content": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/slots": {
+      "get": {
+        "tags": ["Server"],
+        "summary": "Inspect inference slots (exempt)",
+        "description": "Returns the state of the parallel inference slots (requires `--slots`). **Exempt** from the trial budget.",
+        "responses": { "200": { "description": "Slot state array" } }
+      }
+    },
+    "/slots/{id_slot}": {
+      "post": {
+        "tags": ["Server"],
+        "summary": "Slot action: save / restore / erase (exempt)",
+        "description": "Performs an action on a slot's KV cache. **Exempt** from the trial budget.",
+        "parameters": [
+          {
+            "name": "id_slot",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer" },
+            "description": "Slot index"
+          },
+          {
+            "name": "action",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "enum": ["save", "restore", "erase"] }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Action result" },
+          "400": { "description": "Invalid slot or action" }
+        }
+      }
     }
   },
   "components": {
+    "responses": {
+      "TrialLimitReached": {
+        "description": "Trial request budget exhausted. Returned by counted endpoints once the limit is reached.",
+        "headers": {
+          "X-Trial-Limit": { "schema": { "type": "integer" }, "description": "Configured request limit" },
+          "X-Trial-Used": { "schema": { "type": "integer" }, "description": "Requests already consumed" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": {
+              "error": { "code": 403, "message": "Trial limit reached", "type": "permission_error" }
+            }
+          }
+        }
+      }
+    },
     "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer" },
+              "message": { "type": "string" },
+              "type": { "type": "string" }
+            }
+          }
+        }
+      },
       "ChatMessage": {
         "type": "object",
         "required": ["role", "content"],
@@ -216,6 +604,44 @@
           }
         }
       },
+      "CompletionRequest": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+          "model": { "type": "string", "example": "qwen2.5-chat" },
+          "prompt": { "type": "string", "example": "Once upon a time" },
+          "max_tokens": { "type": "integer", "description": "OpenAI name; native alias is n_predict" },
+          "n_predict": { "type": "integer", "description": "Native llama.cpp name for max_tokens" },
+          "temperature": { "type": "number", "default": 0.8 },
+          "top_p": { "type": "number", "default": 0.95 },
+          "stream": { "type": "boolean", "default": false }
+        }
+      },
+      "CompletionResponse": {
+        "type": "object",
+        "properties": {
+          "content": { "type": "string", "description": "Generated text (native shape)" },
+          "tokens_predicted": { "type": "integer" },
+          "tokens_evaluated": { "type": "integer" },
+          "stop": { "type": "boolean" },
+          "model": { "type": "string" }
+        }
+      },
+      "ResponsesRequest": {
+        "type": "object",
+        "required": ["model", "input"],
+        "properties": {
+          "model": { "type": "string", "example": "qwen2.5-chat" },
+          "input": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "object" } }
+            ],
+            "description": "A string, or a list of input items"
+          },
+          "stream": { "type": "boolean", "default": false }
+        }
+      },
       "EmbeddingRequest": {
         "type": "object",
         "required": ["model", "input"],
@@ -252,6 +678,86 @@
               "prompt_tokens": { "type": "integer" },
               "total_tokens": { "type": "integer" }
             }
+          }
+        }
+      },
+      "RerankRequest": {
+        "type": "object",
+        "required": ["query", "documents"],
+        "properties": {
+          "model": { "type": "string", "example": "reranker" },
+          "query": { "type": "string", "example": "What is the capital of France?" },
+          "documents": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Candidate documents to score against the query"
+          },
+          "top_n": { "type": "integer", "description": "Return only the top N results" }
+        }
+      },
+      "RerankResponse": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer", "description": "Index into the input documents array" },
+                "relevance_score": { "type": "number" }
+              }
+            }
+          }
+        }
+      },
+      "AnthropicMessagesRequest": {
+        "type": "object",
+        "required": ["model", "max_tokens", "messages"],
+        "properties": {
+          "model": { "type": "string", "example": "qwen2.5-chat" },
+          "max_tokens": { "type": "integer", "example": 64 },
+          "system": { "type": "string", "description": "Optional system prompt" },
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["role", "content"],
+              "properties": {
+                "role": { "type": "string", "enum": ["user", "assistant"] },
+                "content": { "type": "string" }
+              }
+            }
+          },
+          "stream": { "type": "boolean", "default": false }
+        }
+      },
+      "InfillRequest": {
+        "type": "object",
+        "properties": {
+          "input_prefix": { "type": "string", "description": "Code before the cursor" },
+          "input_suffix": { "type": "string", "description": "Code after the cursor" },
+          "prompt": { "type": "string", "description": "Optional extra prompt inserted between prefix and suffix" },
+          "n_predict": { "type": "integer", "default": 128 },
+          "stream": { "type": "boolean", "default": false }
+        }
+      },
+      "TokenizeRequest": {
+        "type": "object",
+        "required": ["content"],
+        "properties": {
+          "content": { "type": "string", "example": "Hello, world!" },
+          "add_special": { "type": "boolean", "default": false, "description": "Add model special/BOS tokens" },
+          "with_pieces": { "type": "boolean", "default": false, "description": "Return token pieces alongside ids" }
+        }
+      },
+      "TokenizeResponse": {
+        "type": "object",
+        "properties": {
+          "tokens": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "example": [9707, 11, 1879, 0]
           }
         }
       }

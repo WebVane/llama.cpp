@@ -6,8 +6,8 @@ endpoint:
 
 | Model id (used as `"model": ...` in requests) | Purpose    | Default GGUF                                    |
 |-----------------------------------------------|------------|-------------------------------------------------|
-| `qwen2.5-chat`                                | chat       | `Qwen2.5-7B-Instruct-Q4_K_M.gguf` (~4.7 GB)     |
-| `gte-qwen2-embed`                             | embeddings | `gte-Qwen2-1.5B-instruct.Q8_0.gguf` (~1.7 GB)   |
+| `qwen2.5-chat`                                | chat       | `Qwen2.5-7B-Instruct-Q5_K_M.gguf` (~5.4 GB)     |
+| `gte-qwen2-embed`                             | embeddings | `gte-Qwen2-1.5B-instruct-Q8_0.gguf` (~1.7 GB)   |
 
 Models are **not** baked into the image &mdash; the runtime expects them in
 `/models/` (volume mount). The router uses
@@ -20,14 +20,15 @@ Models are **not** baked into the image &mdash; the runtime expects them in
 docker-dual/
 ├── Dockerfile          # multi-stage CUDA build, target: llama-server
 ├── entrypoint.sh       # launches llama-server in router mode
-├── models.ini          # router preset (chat + embeddings)
+├── models.ini          # router preset (chat + embeddings, per-model GPU)
 ├── docker-compose.yml  # one-shot up
 └── README.md
 ```
 
 ## 1. Requirements
 
-- NVIDIA GPU (recent drivers)
+- NVIDIA GPU (recent drivers). The shipped `models.ini` assumes **two** GPUs
+  (chat on `CUDA1`, embeddings on `CUDA0`); see section 6 for single-GPU hosts.
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - Docker 24+ with `compose` plugin
 - VRAM:
@@ -35,6 +36,8 @@ docker-dual/
     requests, the first request after a switch is 1&ndash;5 s slower while
     the new model loads.
   - `MODELS_MAX=2` &mdash; ≈ 12 GB; both stay resident.
+  - two GPUs &mdash; put each model on its own card with `device = CUDAn`
+    (see section 6); then only the per-model size matters.
 
 ## 2. Download the models
 
@@ -45,11 +48,11 @@ mkdir -p models
 
 # chat
 huggingface-cli download bartowski/Qwen2.5-7B-Instruct-GGUF \
-    Qwen2.5-7B-Instruct-Q4_K_M.gguf --local-dir ./models
+    Qwen2.5-7B-Instruct-Q5_K_M.gguf --local-dir ./models
 
 # embeddings
-huggingface-cli download Qwen/gte-Qwen2-1.5B-instruct-GGUF \
-    gte-Qwen2-1.5B-instruct.Q8_0.gguf --local-dir ./models
+huggingface-cli download second-state/gte-Qwen2-1.5B-instruct-GGUF \
+    gte-Qwen2-1.5B-instruct-Q8_0.gguf --local-dir ./models
 ```
 
 If you prefer different files, update the `model = ...` paths in `models.ini`
@@ -167,6 +170,8 @@ All are environment variables on the container (override via
 | `PORT`          | `8080`               | HTTP port (inside the container)                  |
 | `MODELS_MAX`    | `1`                  | Max simultaneously-loaded models. `2` keeps both. |
 | `MODELS_CONFIG` | `/config/models.ini` | Path to the router preset file                    |
+| `MODEL_DEVICES` | *(empty)*            | Per-model GPU override, `<section>=<dev>,...` (section 6) |
+| `CUDA_DEVICE_ORDER` | `PCI_BUS_ID`     | Makes `CUDAn` follow `nvidia-smi` order; leave as is |
 | `CUDA_ARCH`     | `all-major` *(build-arg)* | `CMAKE_CUDA_ARCHITECTURES`                   |
 
 Switching from `--models-max 1` to `2` keeps both the chat and the embedding
@@ -196,7 +201,73 @@ docker run -d --name llama-dual --gpus all \
     llama-dual
 ```
 
-## 6. Anatomy of `models.ini`
+## 6. Multi-GPU: which model runs on which GPU
+
+In router mode every model is a separate `llama-server` child process, so
+each one can be pinned to its own GPU. Placement is decided in two steps:
+
+1. **Which host GPUs the container sees** &mdash; `device_ids` in
+   `docker-compose.yml` (or `--gpus '"device=0,1"'` with plain `docker run`).
+   Inside the container the exposed GPUs are renumbered `CUDA0`, `CUDA1`, ...
+   in PCI-bus order (the image sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the
+   order matches `nvidia-smi -L` among the exposed GPUs). With
+   `device_ids: ["1"]` only host GPU 1 is visible and it becomes `CUDA0`.
+
+2. **Which of those each model uses** &mdash; either per section in
+   `models.ini`:
+
+   ```ini
+   [qwen2.5-chat]
+   model  = /models/Qwen2.5-7B-Instruct-Q5_K_M.gguf
+   device = CUDA1
+
+   [gte-qwen2-embed]
+   model  = /models/gte-Qwen2-1.5B-instruct-Q8_0.gguf
+   device = CUDA0
+   ```
+
+   or from `docker-compose.yml` / the shell via `MODEL_DEVICES`, which is
+   applied by `entrypoint.sh` on top of the preset and wins over the file:
+
+   ```bash
+   MODEL_DEVICES="qwen2.5-chat=CUDA1,gte-qwen2-embed=CUDA0" docker compose up -d
+   ```
+
+   Accepted values are whatever `--device` accepts: `CUDA0`, `CUDA1`,
+   `none` (CPU only), or several GPUs to split one model
+   (`CUDA0,CUDA1` in the ini; in `MODEL_DEVICES` use a semicolon inside the
+   value, `big=CUDA0;CUDA1`, because the comma separates entries).
+   `*=CUDA0` applies to every section (an entry naming a section still wins),
+   e.g. to run everything on one GPU.
+
+Notes:
+
+- `MODELS_MAX` must be `2` (the compose default) for both models to be
+  resident at the same time; with `1` they still swap even on two GPUs.
+- A child process only touches the GPUs listed in its `device`, so a GPU
+  that no model is assigned to stays untouched even if it is exposed.
+- List what the container actually sees:
+
+  ```bash
+  docker compose run --rm llama-dual --list-devices
+  ```
+
+- `--main-gpu` / `--split-mode` / `--tensor-split` (`main-gpu`, `split-mode`,
+  `tensor-split` keys) work per section as well for finer multi-GPU splits.
+- Single GPU: the shipped preset pins chat to `CUDA1`, which does not exist on a
+  one-GPU host (the child fails with `invalid device: CUDA1`). Start with
+  `MODEL_DEVICES="*=CUDA0"` or edit the `device` keys. The TRIAL image drops
+  the pins at build time, so it runs on any GPU count.
+- `MODEL_DEVICES` is applied once at startup by writing a patched copy to
+  `/tmp/models.ini`; the router reads that copy, so `GET /v1/models?reload=1`
+  will not see later edits to the mounted `models.ini` -- restart the container
+  (or leave `MODEL_DEVICES` empty and keep `device` in the file).
+- The Web UI pre-selects the model tagged `default` (`tags = chat, default`
+  here). If the server runs with `--no-models-autoload`, that model must also
+  have `load-on-startup = true`, otherwise the first message fails with
+  `model is not loaded`.
+
+## 7. Anatomy of `models.ini`
 
 ```ini
 version = 1
@@ -206,13 +277,17 @@ ctx-size     = 8192
 n-gpu-layers = 99
 
 [qwen2.5-chat]            ; section name == value of "model" in requests
-model    = /models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+model    = /models/Qwen2.5-7B-Instruct-Q5_K_M.gguf
 jinja    = true
+device   = CUDA1          ; GPU for this model (CUDA0, CUDA1, none, ...)
+load-on-startup = true    ; preload at startup (first request is instant)
+tags     = chat, default  ; "default" = pre-selected in the Web UI
 
 [gte-qwen2-embed]
-model      = /models/gte-Qwen2-1.5B-instruct.Q8_0.gguf
+model      = /models/gte-Qwen2-1.5B-instruct-Q8_0.gguf
 embeddings = true
 pooling    = last
+device     = CUDA0        ; embeddings live on the other GPU
 ```
 
 Keys are long CLI argument names without `--` (short forms like `c` /
@@ -221,7 +296,7 @@ Keys are long CLI argument names without `--` (short forms like `c` /
 full preset reference, including the preset-only `load-on-startup` and
 `stop-timeout` keys.
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 - **`models preset not found at /config/models.ini`** &mdash; the file was not
   baked in or the bind mount points at a missing path. Rebuild or check the
@@ -233,3 +308,13 @@ full preset reference, including the preset-only `load-on-startup` and
   built for archs your GPU doesn't match. Rebuild with
   `--build-arg CUDA_ARCH="<your sm>"` (e.g. `86` for RTX 30xx, `89` for
   40xx, `90` for H100).
+- **`invalid device: CUDA1`** when a model loads &mdash; the container sees
+  fewer GPUs than `models.ini` / `MODEL_DEVICES` refer to. Check
+  `device_ids` in `docker-compose.yml` (or `--gpus`) and compare with
+  `docker compose run --rm llama-dual --list-devices`; remember the
+  exposed GPUs are renumbered from `CUDA0` inside the container.
+  On a single-GPU host start with `MODEL_DEVICES="*=CUDA0"`.
+- **Both models end up on the same GPU** &mdash; `MODEL_DEVICES` overrides
+  `models.ini`; make sure the shell/compose variable is either unset or
+  lists both sections. Also `MODELS_MAX=1` swaps models regardless of
+  how many GPUs there are.

@@ -6,8 +6,8 @@
 # -----------
 #   1. docker login nexus.scan-dev.com:6001          # once per host
 #   2. mkdir -p ../models                            # next to this file
-#      # then drop Qwen2.5-7B-Instruct-Q4_K_M.gguf and
-#      # gte-Qwen2-1.5B-instruct.Q8_0.gguf into ../models
+#      # then drop Qwen2.5-7B-Instruct-Q5_K_M.gguf and
+#      # gte-Qwen2-1.5B-instruct-Q8_0.gguf into ../models
 #   3. docker compose pull                           # fetch latest image
 #   4. docker compose up -d
 #   5. curl -fsS http://localhost:8080/v1/models | jq .
@@ -15,6 +15,27 @@
 # Override at the shell to retag/repoint without editing this file:
 #   LLAMA_DUAL_IMAGE=nexus.scan-dev.com:6001/llama_dual:dev \
 #       docker compose up -d
+#
+# GPU placement
+# -------------
+# Each model is its own llama-server child process, so they can live on
+# different GPUs.  Two things decide where a model ends up:
+#
+#   1. Which host GPUs the container can see -> `device_ids` below.
+#      Inside the container they are renumbered CUDA0, CUDA1, ... in PCI
+#      bus order (matches `nvidia-smi -L` among the exposed GPUs).
+#   2. Which of those each model uses -> `device = CUDAn` per section in
+#      models.ini, or MODEL_DEVICES here (wins over models.ini):
+#
+#        MODEL_DEVICES="qwen2.5-chat=CUDA1,gte-qwen2-embed=CUDA0" \
+#            docker compose up -d
+#
+#      Values: CUDA0 / CUDA1 / "CUDA0;CUDA1" (split over both, semicolon
+#      inside a value) / none (CPU only).  "*=CUDA0" applies to every
+#      section (single-GPU host); a section-specific entry still wins.
+#
+#   Check what the container sees:
+#        docker compose run --rm llama-dual --list-devices
 #
 # Local dev build (skip Nexus, build from this checkout):
 #   Uncomment the `build:` block below and run `docker compose up -d --build`.
@@ -29,9 +50,16 @@ services:
     environment:
       PORT: "8080"
       # 1 = swap models between requests (~+1-5 s on switch, half VRAM)
-      # 2 = keep both resident (fits on a single 11 GB GTX 1080 Ti)
+      # 2 = keep both resident (required to actually use two GPUs at once)
       MODELS_MAX: "${MODELS_MAX:-2}"
       MODELS_CONFIG: "/config/models.ini"
+      # Per-model GPU override, see "GPU placement" above.  Empty = use the
+      # `device` keys from models.ini as-is.
+      MODEL_DEVICES: "${MODEL_DEVICES:-}"
+      # Number CUDA devices by PCI bus id (== nvidia-smi index) instead of
+      # the CUDA default "fastest first", so CUDA0/CUDA1 are stable on
+      # hosts with mixed GPU models.
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
       # Surface CUDA OOMs etc. in logs instead of cryptic crashes.
       GGML_LOG_LEVEL: "${GGML_LOG_LEVEL:-INFO}"
     volumes:
@@ -44,7 +72,12 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]
+              # Host GPU indices (nvidia-smi) exposed to the container.
+              # Inside they become CUDA0, CUDA1, ... in PCI order, so with
+              # ["0", "1"]: CUDA0 = host 0, CUDA1 = host 1; with ["1"] only
+              # host GPU 1 is visible and it is CUDA0.  Replace with
+              # `count: all` to expose every GPU.
+              device_ids: ["0", "1"]
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]

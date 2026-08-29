@@ -8,6 +8,7 @@ import { TTLCache } from '$lib/utils';
 import {
 	MODEL_PROPS_CACHE_TTL_MS,
 	MODEL_PROPS_CACHE_MAX_ENTRIES,
+	MODEL_DEFAULT_TAG,
 	FAVORITE_MODELS_LOCALSTORAGE_KEY
 } from '$lib/constants';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
@@ -339,13 +340,19 @@ class ModelsStore {
 		try {
 			const response = await ModelsService.listRouter();
 			this.routerModels = response.data;
+
+			// Pre-select the model the server marked as default (`tags = default`)
+			// before the first await: assigning routerModels schedules effects that
+			// would otherwise grab the first loaded model. Never override a choice
+			// the user has already made.
+			if (!this.selectedModelName) {
+				const defaultModel = this.findDefaultTaggedModel(this.visibleModels());
+				if (defaultModel) this.selectModelById(defaultModel.id);
+			}
+
 			await this.fetchModalitiesForLoadedModels();
 
-			const o = this.models.filter((option) => {
-				const modelProps = this.getModelProps(option.model);
-
-				return modelProps?.webui !== false;
-			});
+			const o = this.visibleModels();
 
 			if (o.length === 1 && this.isModelLoaded(o[0].model)) {
 				this.selectModelById(o[0].id);
@@ -354,6 +361,33 @@ class ModelsStore {
 			console.warn('Failed to fetch router models:', error);
 			this.routerModels = [];
 		}
+	}
+
+	/**
+	 * Models that are not hidden from the webui (`webui = false` in their props)
+	 */
+	private visibleModels(): ModelOption[] {
+		return this.models.filter((option) => this.getModelProps(option.model)?.webui !== false);
+	}
+
+	/**
+	 * Returns the first model tagged as default by the server (`--tags default`,
+	 * or `tags = default` in a router preset), if any.
+	 */
+	private findDefaultTaggedModel(options: ModelOption[]): ModelOption | undefined {
+		return options.find((option) => option.tags?.includes(MODEL_DEFAULT_TAG));
+	}
+
+	/**
+	 * Model to fall back to when nothing is selected (ROUTER mode): the model the
+	 * server tagged as default (loaded or not, the router loads it on demand),
+	 * else the first loaded one.
+	 */
+	getFallbackModel(options: ModelOption[] = this.models): ModelOption | undefined {
+		return (
+			this.findDefaultTaggedModel(options) ??
+			options.find((option) => this.isModelLoaded(option.model))
+		);
 	}
 
 	/**
@@ -480,8 +514,9 @@ class ModelsStore {
 	 * Prioritizes:
 	 * 1. Model from active conversation's last assistant response (if loaded)
 	 * 2. Model from active conversation's last assistant response (if not loaded)
-	 * 3. First loaded model (not from active conversation)
-	 * 4. First available model
+	 * 3. Model tagged as default by the server (`tags = default`, ROUTER mode)
+	 * 4. First loaded model (not from active conversation)
+	 * 5. First available model
 	 * This is used to ensure default values are populated in settings pages.
 	 */
 	async ensureFirstModelSelected(): Promise<void> {
@@ -506,6 +541,16 @@ class ModelsStore {
 				}
 				return;
 			}
+		}
+
+		// Then the model the server marked as default
+		const defaultModel = this.findDefaultTaggedModel(availableModels);
+		if (defaultModel) {
+			await this.selectModelById(defaultModel.id);
+			if (this.isModelLoaded(defaultModel.model)) {
+				await this.fetchModelProps(defaultModel.model);
+			}
+			return;
 		}
 
 		// Try to find a loaded model first

@@ -1606,6 +1606,7 @@ The precedence rule for preset options is as follows:
 We also offer additional options that are exclusive to presets (these aren't treated as command-line arguments):
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
+- `tags` (comma-separated strings) is a regular argument, but the Web UI gives one value a meaning: the model tagged `default` is pre-selected whenever nothing is selected yet in router mode (if none, the UI falls back to the first loaded model). Example: `tags = chat, default`. Pair it with `load-on-startup = true` when the server runs with `--no-models-autoload`, since the UI does not load it by itself.
 
 ### Routing requests
 

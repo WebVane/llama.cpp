@@ -46,10 +46,11 @@
 			modelsStore.selectModelByName(conversationModel);
 		} else if (isRouter && !modelsStore.selectedModelId && modelsStore.loadedModelIds.length > 0) {
 			lastSyncedConversationModel = null;
-			// auto-select the first loaded model only when nothing is selected yet
-			const first = modelOptions().find((m) => modelsStore.loadedModelIds.includes(m.model));
+			// auto-select the server-declared default model (else the first loaded one)
+			// only when nothing is selected yet
+			const fallback = modelsStore.getFallbackModel(modelOptions());
 
-			if (first) modelsStore.selectModelById(first.id);
+			if (fallback) modelsStore.selectModelById(fallback.id);
 		}
 	});
 

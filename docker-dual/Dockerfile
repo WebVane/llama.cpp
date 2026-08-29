@@ -140,12 +140,16 @@ RUN chmod +x /entrypoint.sh
 
 # TRIAL only: bake the GGUF weights into /models so the image is fully
 # self-contained (the production image keeps /models empty and expects a
-# volume mount).  Filenames must match the paths in models.ini.  This is a
+# volume mount).  Filenames must match the paths in models.ini.  The trial
+# also drops the per-model `device = CUDAn` pins from the baked preset: it
+# runs on unknown hardware, so both models use whatever GPU(s) are visible
+# (set MODEL_DEVICES at run time to pin them).  This is a
 # large (~7 GB) layer; with --cache-from it is reused across rebuilds as
 # long as the URLs are unchanged.
 RUN mkdir -p /models && \
     if [ "${TRIAL}" = "1" ]; then \
         echo "*** TRIAL: baking weights into /models ***" && \
+        sed -i "/^device[[:space:]]*=/d" /config/models.ini && \
         curl -fSL --retry 3 --retry-delay 5 \
             -o /models/Qwen2.5-7B-Instruct-Q5_K_M.gguf "${TRIAL_CHAT_MODEL_URL}" && \
         curl -fSL --retry 3 --retry-delay 5 \
@@ -158,6 +162,13 @@ ENV LLAMA_ARG_HOST=0.0.0.0
 ENV PORT=8080
 ENV MODELS_MAX=1
 ENV MODELS_CONFIG=/config/models.ini
+# Per-model GPU override ("<section>=<dev>,..."), applied by entrypoint.sh on
+# top of models.ini.  Empty = honour the `device` keys in the preset.
+ENV MODEL_DEVICES=""
+# Number CUDA devices by PCI bus id (== nvidia-smi order) instead of the
+# CUDA default "fastest first", so `device = CUDAn` in models.ini is stable
+# on hosts with mixed GPU models.
+ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 WORKDIR /app
 

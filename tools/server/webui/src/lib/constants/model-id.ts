@@ -37,3 +37,9 @@ export const MODEL_ACTIVATED_PARAMS_RE = /^[Aa]\d+(\.\d+)?[BbMmKkTt]$/;
  * Container format segments to exclude from tags (every model uses these).
  */
 export const MODEL_IGNORED_SEGMENTS = new Set(['GGUF', 'GGML']);
+
+/**
+ * Server-side tag (`--tags` / `tags = ...` in a router preset) that marks the
+ * model the UI should pre-select when nothing is selected yet (ROUTER mode).
+ */
+export const MODEL_DEFAULT_TAG = 'default';

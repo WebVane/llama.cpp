@@ -77,11 +77,15 @@
 			modelsStore.selectedModelName &&
 			!modelsStore.isModelLoaded(modelsStore.selectedModelName)
 		) {
-			modelsStore.clearSelection();
-
-			const first = modelOptions().find((m) => modelsStore.loadedModelIds.includes(m.model));
-			if (first) {
-				await modelsStore.selectModelById(first.id);
+			// Prefer a model that is ready: the server-declared default (kept even
+			// while it still has to load, the router loads it on demand) or the
+			// first loaded one.
+			const fallback = modelsStore.getFallbackModel(modelOptions());
+			if (fallback?.model !== modelsStore.selectedModelName) {
+				modelsStore.clearSelection();
+				if (fallback) {
+					await modelsStore.selectModelById(fallback.id);
+				}
 			}
 		}
 

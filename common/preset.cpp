@@ -356,6 +356,13 @@ common_presets common_preset_context::load_from_ini(const std::string & path, co
         if (preset.name == "*") {
             // handle global preset
             global = preset;
+        } else if (preset.name == COMMON_PRESET_DEFAULT_NAME && preset.options.empty() && !section.second.empty()) {
+            // keys placed before the first [section] (typically just "version = 1")
+            // land in an implicit section carrying the default name; when nothing
+            // but reserved keys was found there it describes no model, so it must
+            // not be exposed as one by the router
+            LOG_DBG("skipping preset '%s': no options besides reserved keys\n", preset.name.c_str());
+            continue;
         } else {
             out[preset.name] = preset;
         }
