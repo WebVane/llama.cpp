@@ -61,8 +61,19 @@ RUN apt-get update && \
         ca-certificates \
         libcurl4-openssl-dev \
         libssl-dev \
+        curl \
+        xz-utils \
         libgomp1 && \
     rm -rf /var/lib/apt/lists/*
+
+# The web UI (tools/ui) is built from source during CMake (LLAMA_BUILD_UI=ON):
+# the fork UI is customized (branding, default-model tag, Swagger), so the
+# upstream prebuilt HF bucket cannot be used.  Vite 7 needs Node >= 20; the
+# jammy apt nodejs is far too old, so install the official tarball.
+ARG NODE_VERSION=22.14.0
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+        | tar -xJ -C /usr/local --strip-components=1 && \
+    node --version && npm --version
 
 ENV CC=gcc-12 CXX=g++-12 CUDAHOSTCXX=g++-12
 
@@ -83,6 +94,8 @@ RUN EXTRA_CMAKE_ARGS="" && \
         -DGGML_CUDA=ON \
         -DGGML_BACKEND_DL=ON \
         -DGGML_CPU_ALL_VARIANTS=ON \
+        -DLLAMA_BUILD_UI=ON \
+        -DLLAMA_USE_PREBUILT_UI=OFF \
         ${EXTRA_CMAKE_ARGS} \
         -DLLAMA_CURL=ON \
         -DLLAMA_BUILD_TESTS=OFF \

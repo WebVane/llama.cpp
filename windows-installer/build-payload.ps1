@@ -90,6 +90,15 @@ if (-not $CMake) {
 }
 Write-Host "  cmake     = $CMake"
 
+# node/npm: the web UI (tools/ui) is built from source during CMake
+# (LLAMA_BUILD_UI=ON below) -- the fork UI is customized, so the upstream
+# prebuilt bucket cannot be used. Vite needs Node >= 20.
+$NodeCmd = Get-Command node -ErrorAction SilentlyContinue
+if (-not $NodeCmd) {
+    Fail "Node.js not found on PATH. Install Node.js 22 LTS (the web UI is built from source)."
+}
+Write-Host "  node      = $($NodeCmd.Source) ($(& node --version))"
+
 $cudaPath = $env:CUDA_PATH
 if ([string]::IsNullOrWhiteSpace($cudaPath) -or -not (Test-Path $cudaPath)) {
     Fail "CUDA Toolkit not found (CUDA_PATH unset). Install the NVIDIA CUDA Toolkit >= 12.4."
@@ -147,6 +156,8 @@ Write-Step "Configuring (CMake)"
     -DLLAMA_CURL=OFF `
     -DLLAMA_BUILD_TESTS=OFF `
     -DLLAMA_BUILD_EXAMPLES=OFF `
+    -DLLAMA_BUILD_UI=ON `
+    -DLLAMA_USE_PREBUILT_UI=OFF `
     @TrialArgs
 if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed." }
 

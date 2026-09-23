@@ -5,16 +5,22 @@ void llama_model_modern_bert::load_arch_hparams(llama_model_loader & ml) {
     if (found_swa && hparams.n_swa > 0) {
         hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;
         ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
-        uint32_t swa_period = 3;
-        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false);
-        hparams.set_swa_pattern(swa_period, true);
+        load_swa_pattern(ml, 3, true);
     } else {
         hparams.swa_type = LLAMA_SWA_TYPE_NONE;
     }
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
 
-    switch (hparams.n_layer) {
+    // Some ModernBert derivatives (e.g. IBM Granite Embedding 97m R2) use
+    // SiLU/SwiGLU in the FFN instead of the default GELU/GeGLU.
+    hparams.llm_ffn_op = LLM_FFN_GEGLU;
+    std::string hidden_act;
+    if (ml.get_key(LLM_KV_HIDDEN_ACT, hidden_act, false)) {
+        hparams.llm_ffn_op = llm_ffn_op_type_from_string(hidden_act, LLM_FFN_GEGLU);
+    }
+
+    switch (hparams.n_layer()) {
         case 12:
             type = LLM_TYPE_47M; break; // granite-embedding-small
         case 22:
@@ -144,7 +150,8 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
                 NULL,                      NULL, NULL,
                 model.layers[il].ffn_down, NULL, NULL,
                 NULL,
-                LLM_FFN_GEGLU, LLM_FFN_SEQ, il);
+                hparams.llm_ffn_op,
+                LLM_FFN_SEQ, il);
 
         // attentions bypass the intermediate layer
         cur = ggml_add(ctx0, cur, ffn_inp);
