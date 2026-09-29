@@ -379,3 +379,10 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# license subsystem (src/license) - only when it is built into the server
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN AND (LLAMA_SERVER_LICENSE OR LLAMA_SERVER_TRIAL))
+    llama_build_and_test(test-license.cpp)
+    target_link_libraries(test-license PRIVATE provision-license)
+    target_compile_definitions(test-license PRIVATE LICENSE_VECTORS_DIR="${PROJECT_SOURCE_DIR}/src/license/docs/vectors")
+endif()

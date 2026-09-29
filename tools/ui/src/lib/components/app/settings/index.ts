@@ -74,3 +74,10 @@ export { default as SettingsChatFields } from './SettingsChat/SettingsChatFields
  * server favicons and permission management controls.
  */
 export { default as SettingsChatToolsTab } from './SettingsChat/SettingsChatToolsTab.svelte';
+
+/**
+ * **SettingsChatLicenseTab** - License tab for chat settings
+ *
+ * Shows the server license status and the activation code form.
+ */
+export { default as SettingsChatLicenseTab } from './SettingsChat/SettingsChatLicenseTab.svelte';

@@ -4,6 +4,7 @@
 		SettingsChatDesktopSidebar,
 		SettingsChatFields,
 		SettingsChatImportExportTab,
+		SettingsChatLicenseTab,
 		SettingsChatMobileHeader,
 		SettingsChatToolsTab,
 		SettingsFooter
@@ -151,6 +152,8 @@
 						<SettingsChatToolsTab />
 					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.IMPORT_EXPORT}
 						<SettingsChatImportExportTab />
+					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.LICENSE}
+						<SettingsChatLicenseTab />
 					{:else if currentSection.fields}
 						<div class="space-y-6">
 							<SettingsChatFields

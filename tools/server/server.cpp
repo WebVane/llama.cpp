@@ -12,8 +12,13 @@
 #include "llama.h"
 #include "log.h"
 
-#ifdef VISIO_TRIAL
-#include "license/Trial.h"
+#ifdef PROVISION_LICENSE
+#include "license/LicenseLib.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
 #endif
 
 #include <atomic>
@@ -89,46 +94,357 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
-#ifdef VISIO_TRIAL
+#ifdef PROVISION_LICENSE
+//
+// License subsystem (src/license, shared with provision_ocr_server): signed
+// .lic files, online activation against the License Server and an HMAC
+// request counter. Modes: trial (N requests per install, then locked),
+// online / offline (.lic installed), none (locked until activation).
+//
 // In router mode the parent process proxies every user request to a child
-// instance; both run this same binary and share one state file. Count only
-// in the router / standalone process so each request is charged exactly
-// once — child instances (spawned with LLAMA_SERVER_ROUTER_PORT set) pass
-// through unmodified.
-static bool trial_is_child_server() {
+// instance; both run this same binary and share one state directory. The
+// license is initialised and enforced only in the router / standalone
+// process so each request is charged exactly once — child instances
+// (spawned with LLAMA_SERVER_ROUTER_PORT set) pass through unmodified.
+//
+
+static bool license_is_child_server() {
     server_child probe;
     return probe.is_child();
 }
 
-// wrapper that gates a handler behind the trial request counter. Each allowed
-// request consumes one unit; once the limit is reached the handler is no longer
-// invoked and a 403 is returned instead. Only inference endpoints are wrapped
-// (see route registration below) — health, metrics, props, models, tokenize
-// and static web UI assets are intentionally left ungated.
-static server_http_context::handler_t trial_gate(server_http_context::handler_t func) {
-    if (trial_is_child_server()) {
+// "trial" | "online" | "offline" | "none" — the vocabulary /license/status
+// documents; the internal Token mode has no public equivalent yet.
+static const char * license_public_mode(visio::license::Mode m) {
+    using visio::license::Mode;
+    switch (m) {
+        case Mode::Trial:   return "trial";
+        case Mode::Online:  return "online";
+        case Mode::Offline: return "offline";
+        default:            return "none";
+    }
+}
+
+static std::string license_format_time(std::chrono::system_clock::time_point tp) {
+    if (tp == std::chrono::system_clock::time_point{}) {
+        return "";
+    }
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32]{};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+// Sanitised snapshot shared by GET /license/status and the activation
+// response: mode / validity / budget only — no fingerprint, no signing key,
+// nothing that identifies the machine.
+static json license_status_json() {
+    using namespace visio::license;
+    auto & lib = LicenseLib::instance();
+    const Decision d = lib.check_license();
+    const auto cur = lib.current();
+
+    const char * status_str = d.allow ? "valid" : (d.reason == DenyReason::Expired ? "expired" : "none");
+    // -1 = a valid licence without a request quota (the server omits requestLimit)
+    int64_t limit_out = d.limit;
+    if (cur && !cur->limits.request_limit.has_value()) {
+        limit_out = -1;
+    }
+    json body {
+        {"mode",   license_public_mode(d.mode)},
+        {"status", status_str},
+        {"used",   d.used},
+        {"limit",  limit_out},
+        {"reason", d.allow ? "" : deny_reason_label(d.reason)},
+    };
+    if (cur) {
+        body["product"]   = cur->product;
+        body["tariff"]    = cur->tariff;
+        body["expiresAt"] = license_format_time(cur->expires_at);
+    }
+    // licensed modes count in 30-day windows; the trial budget never resets
+    if (const auto cs = lib.counter_snapshot();
+        cs && d.mode != Mode::Trial && cs->limit > 0 && cs->window_start_unix > 0) {
+        body["windowResetsAt"] = license_format_time(std::chrono::system_clock::from_time_t(
+            (std::time_t) (cs->window_start_unix + kCounterWindowSeconds)));
+    }
+    return body;
+}
+
+// 403 for a refused request: the OpenAI-style error object clients and the
+// web UI render, plus a machine-readable `license` block for dashboards.
+static server_http_res_ptr license_denied_response(const visio::license::Decision & d, int64_t units = 1) {
+    using namespace visio::license;
+    std::string msg;
+    switch (d.reason) {
+        case DenyReason::RequestLimitReached:
+            if (units > 1 && d.used < d.limit) {
+                msg = string_format(
+                    "This request would produce %lld results but only %lld of the %lld %s requests remain. "
+                    "Send a smaller batch or activate a license (Settings -> License in the web UI, or POST /license/activate).",
+                    (long long) units, (long long) (d.limit - d.used), (long long) d.limit,
+                    d.mode == Mode::Trial ? "trial" : "licensed");
+            } else if (d.mode == Mode::Trial) {
+                msg = string_format(
+                    "Trial limit reached: this evaluation build allows %lld inference requests and all of them are used. "
+                    "Activate a license to continue (Settings -> License in the web UI, or POST /license/activate).",
+                    (long long) d.limit);
+            } else {
+                msg = string_format("License request limit reached (%lld of %lld used in the current window).",
+                    (long long) d.used, (long long) d.limit);
+            }
+            break;
+        case DenyReason::NoLicense:
+        case DenyReason::NotInitialised:
+            msg = "No valid license: activate the product (Settings -> License in the web UI, or POST /license/activate).";
+            break;
+        case DenyReason::Expired:
+            msg = "License expired: renew the license and activate again.";
+            break;
+        default:
+            msg = std::string("License check refused the request: ") + deny_reason_label(d.reason);
+            break;
+    }
+    auto res = std::make_unique<server_http_res>();
+    json error_data = format_error_response(msg, ERROR_TYPE_PERMISSION);
+    error_data["license"] = json {
+        {"mode",   license_public_mode(d.mode)},
+        {"reason", deny_reason_label(d.reason)},
+        {"used",   d.used},
+        {"limit",  d.limit},
+    };
+    res->status = json_value(error_data, "code", 403);
+    res->data   = safe_json_to_str({{ "error", error_data }});
+    res->headers["X-License-Mode"]  = license_public_mode(d.mode);
+    res->headers["X-License-Used"]  = std::to_string(d.used);
+    res->headers["X-License-Limit"] = std::to_string(d.limit);
+    if (d.mode == Mode::Trial) {
+        // kept for tooling that grew up with the trial-only build
+        res->headers["X-Trial-Limit"] = std::to_string(d.limit);
+        res->headers["X-Trial-Used"]  = std::to_string(d.used);
+    }
+    return res;
+}
+
+// Number of results one request produces — the unit of metering, so a trial
+// cannot be stretched by batching. Which field is the batch depends on the
+// endpoint: /completion(s) `prompt` arrays and n / n_cmpl completions,
+// /embedding(s) `input` (legacy: `content`) arrays, /rerank `documents`.
+// Arrays of numbers are one tokenized prompt, not a batch. Everything else
+// (responses, whose `input` is a message list, messages, infill, audio
+// uploads) is one unit.
+static int64_t license_request_units(const server_http_req & req) {
+    const char * batch_key     = nullptr;
+    const char * batch_key_alt = nullptr;
+    bool         has_n         = false;
+    if (string_ends_with(req.path, "/completion") || string_ends_with(req.path, "/completions")) {
+        batch_key = "prompt";
+        has_n     = true;
+    } else if (string_ends_with(req.path, "/embedding") || string_ends_with(req.path, "/embeddings")) {
+        batch_key     = "input";
+        batch_key_alt = "content";
+    } else if (string_ends_with(req.path, "/rerank") || string_ends_with(req.path, "/reranking")) {
+        batch_key = "documents";
+    } else {
+        return 1;
+    }
+    int64_t units = 1;
+    try {
+        const json body = json::parse(req.body);
+        if (!body.is_object()) {
+            return 1;
+        }
+        for (const char * key : {batch_key, batch_key_alt}) {
+            if (!key || !body.contains(key)) {
+                continue;
+            }
+            const json & arr = body.at(key);
+            if (arr.is_array() && arr.size() > 0 && !json_is_array_and_contains_numbers(arr)) {
+                units = std::max(units, (int64_t) arr.size());
+            }
+        }
+        if (has_n) {
+            const int64_t n = json_value(body, "n", json_value(body, "n_cmpl", (int64_t) 1));
+            units *= std::max((int64_t) 1, n);
+        }
+    } catch (const std::exception &) {
+        // not JSON: one unit
+    }
+    return std::max((int64_t) 1, units);
+}
+
+// wrapper that gates a handler behind the license, reserve-then-commit: the
+// request's units are reserved atomically BEFORE inference (so concurrent
+// requests cannot all pass a read-only check for the same last slot and run
+// work nobody is charged for) and refunded when the result is not delivered
+// — a 400 / 404 / 503 from the handler (bad request, model failed to load,
+// queue full), a client that hung up while waiting (the handlers return an
+// empty 200 then), or a stream torn down before its end. Only inference
+// endpoints are wrapped (see route registration below) — health, metrics,
+// props, models, tokenize and the web UI assets stay free.
+static server_http_context::handler_t license_gate(server_http_context::handler_t func) {
+    if (license_is_child_server()) {
         return func;
     }
     return [func = std::move(func)](const server_http_req & req) -> server_http_res_ptr {
-        if (!visio::license::Trial::instance().consume()) {
-            const auto st = visio::license::Trial::instance().status();
-            auto res = std::make_unique<server_http_res>();
-            json error_data = format_error_response(
-                "Trial limit reached: this evaluation build is limited to a fixed number of "
-                "requests. Please obtain a licensed build to continue.",
-                ERROR_TYPE_PERMISSION);
-            res->status = json_value(error_data, "code", 403);
-            res->data   = safe_json_to_str({{ "error", error_data }});
-            res->headers["X-Trial-Limit"] = std::to_string(st.limit);
-            res->headers["X-Trial-Used"]  = std::to_string(st.used);
+        auto & lib = visio::license::LicenseLib::instance();
+        const int64_t units = license_request_units(req);
+        if (const auto d = lib.authorize_request(units); !d.allow) {
+            return license_denied_response(d, units);
+        }
+        SRV_DBG("license: reserved %lld unit(s) for %s\n", (long long) units, req.path.c_str());
+        server_http_res_ptr res;
+        try {
+            res = func(req);
+        } catch (...) {
+            SRV_DBG("license: refund %lld unit(s), handler threw (%s)\n", (long long) units, req.path.c_str());
+            lib.refund_request(units);
+            throw;
+        }
+        if (!res || res->status < 200 || res->status >= 300 || req.should_stop()) {
+            SRV_DBG("license: refund %lld unit(s), not delivered (status=%d, client_gone=%d)\n",
+                    (long long) units, res ? res->status : 0, (int) req.should_stop());
+            lib.refund_request(units);
             return res;
         }
-        return func(req);
+        if (res->is_stream()) {
+            // a stream counts once it ran to its end; if the response dies
+            // before that (client gone, write error) the reservation is
+            // returned by the guard's destructor
+            struct stream_charge {
+                int64_t units = 0;
+                bool    done  = false;
+                ~stream_charge() {
+                    if (!done) {
+                        SRV_DBG("license: refund %lld unit(s), stream did not finish\n", (long long) units);
+                        visio::license::LicenseLib::instance().refund_request(units);
+                    }
+                }
+            };
+            // constructed in place: a temporary copied into the shared_ptr would
+            // run this destructor immediately and refund the reservation
+            auto charge = std::make_shared<stream_charge>();
+            charge->units = units;
+            auto orig_next = std::move(res->next);
+            std::function<bool()> should_stop = req.should_stop;
+            res->next = [orig_next = std::move(orig_next), charge, should_stop](std::string & out) {
+                const bool more = orig_next(out);
+                if (!more) {
+                    const bool gone = should_stop();
+                    SRV_DBG("license: stream ended, client_gone=%d\n", (int) gone);
+                    if (!gone) {
+                        charge->done = true;
+                    }
+                }
+                return more;
+            };
+        }
+        return res;
     };
 }
+
+// Startup: resolve the license mode (persisted .lic -> env activation code ->
+// trial fallback). Never fatal: with nothing usable the server starts LOCKED
+// (inference -> 403) so /health, /license/status and /license/activate stay
+// reachable and the operator can activate without a restart.
+static void license_startup() {
+    using namespace visio::license;
+    auto & lib = LicenseLib::instance();
+    const auto cfg = Config::from_defaults();
+    auto r = lib.init(cfg);
+    const bool have_valid_lic = r.ok && (r.mode == Mode::Online || r.mode == Mode::Offline);
+
+    if (have_valid_lic) {
+        LOG_INF("[license] using existing .lic at %s; mode=%s detail=%s\n",
+                cfg.lic_path.string().c_str(), mode_label(r.mode), r.detail.c_str());
+    } else if (const char * code = std::getenv("PROVISION_LICENSE_ACTIVATION_CODE"); code && *code) {
+        LOG_INF("%s", "[license] no valid .lic - running online activation (PROVISION_LICENSE_ACTIVATION_CODE is set)\n");
+        const auto a = lib.activate(code);
+        if (a.ok) {
+            // activate() ends with a re-init and reports its outcome
+            LOG_INF("[license] activated; mode=%s detail=%s\n", mode_label(a.mode), a.detail.c_str());
+        } else if (r.ok) {
+            LOG_WRN("[license] activation failed (%s); falling back to mode=%s\n", a.detail.c_str(), mode_label(r.mode));
+        } else {
+            LOG_ERR("[license] activation failed and no fallback available: %s\n", a.detail.c_str());
+            LOG_ERR("[license] starting LOCKED (mode=none): inference requests get 403 until activation succeeds or a .lic is placed at %s\n",
+                    cfg.lic_path.string().c_str());
+        }
+    } else if (!r.ok) {
+        LOG_WRN("[license] no license sources - starting LOCKED (mode=none): %s\n", r.detail.c_str());
+        LOG_WRN("[license] activate via POST /license/activate, set PROVISION_LICENSE_ACTIVATION_CODE, or place a .lic at %s\n",
+                cfg.lic_path.string().c_str());
+    } else {
+        // trial resolved normally
+        const auto d = lib.check_license();
+        LOG_WRN("[license] mode=%s: %s (%lld of %lld requests used)\n",
+                mode_label(r.mode), r.detail.c_str(), (long long) d.used, (long long) d.limit);
+    }
+    LOG_INF("[license] product=%s activation_url=%s state_dir=%s\n",
+            cfg.product.c_str(),
+            cfg.activation_url.empty() ? "<not configured>" : cfg.activation_url.c_str(),
+            cfg.state_dir.string().c_str());
+}
+
+static server_http_res_ptr license_status_handler(const server_http_req &) {
+    auto res = std::make_unique<server_http_res>();
+    res->status = 200;
+    res->data   = safe_json_to_str(license_status_json());
+    return res;
+}
+
+static server_http_res_ptr license_activate_handler(const server_http_req & req) {
+    auto res = std::make_unique<server_http_res>();
+
+    std::string code;
+    try {
+        const json body = json::parse(req.body);
+        code = json_value(body, "activationCode", std::string());
+    } catch (const std::exception &) {
+        // reported as a bad request below
+    }
+    // activation codes are short printable ASCII (XXXX-XXXX-XXXX); anything
+    // else is refused before it can reach the License Server
+    const bool printable_ascii = std::all_of(code.begin(), code.end(), [](char c) { return c >= 0x20 && c <= 0x7E; });
+    if (code.empty() || code.size() > 256 || !printable_ascii) {
+        json err = format_error_response(
+            "activationCode must be a printable ASCII string of at most 256 characters", ERROR_TYPE_INVALID_REQUEST);
+        res->status = json_value(err, "code", 400);
+        res->data   = safe_json_to_str({{ "error", err }});
+        return res;
+    }
+    // concurrent activations are serialised inside LicenseLib: a second caller
+    // waits for the first round-trip and gets the idempotent result (the
+    // License Server answers the same machine + code with the same .lic)
+    const auto r = visio::license::LicenseLib::instance().activate(code);
+
+    if (r.ok) {
+        LOG_INF("[license] /license/activate: activated; mode=%s detail=%s\n",
+                visio::license::mode_label(r.mode), r.detail.c_str());
+    } else {
+        LOG_WRN("[license] /license/activate failed: %s\n", r.detail.c_str());
+    }
+    json body = license_status_json();
+    body["activated"] = r.ok;
+    body["detail"]    = r.detail;
+    if (!r.ok) {
+        body["message"] = r.detail; // what API clients / the web UI show for the 502
+    }
+    // 502: activation is a proxied operation against the License Server —
+    // bad code, no free slot and LS unreachable all surface here with the reason
+    res->status = r.ok ? 200 : 502;
+    res->data   = safe_json_to_str(body);
+    return res;
+}
 #else
-// no-op pass-through when the trial is not compiled in
-static inline server_http_context::handler_t trial_gate(server_http_context::handler_t func) {
+// no-op pass-through when the license subsystem is not compiled in
+static inline server_http_context::handler_t license_gate(server_http_context::handler_t func) {
     return func;
 }
 #endif
@@ -244,20 +560,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     std::optional<server_models_routes> models_routes{};
 
-#ifdef VISIO_TRIAL
-    if (!trial_is_child_server()) {
-        auto & trial = visio::license::Trial::instance();
-        trial.init();
-        const auto st = trial.status();
-        LOG_WRN("=========================================================\n");
-        LOG_WRN("TRIAL build: limited to %d inference request(s); %d used so far\n", st.limit, st.used);
-        LOG_WRN("trial state file: %s\n", st.state_path.c_str());
-        if (st.tampered) {
-            LOG_WRN("trial state failed integrity/clock check — requests will be denied\n");
-        } else if (st.exhausted) {
-            LOG_WRN("trial limit already reached — inference requests will be denied\n");
-        }
-        LOG_WRN("=========================================================\n");
+#ifdef PROVISION_LICENSE
+    if (!license_is_child_server()) {
+        license_startup();
     }
 #endif
 
@@ -320,29 +625,38 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
-    // inference endpoints are gated by the trial counter (no-op in non-trial builds)
-    ctx_http.post("/completion",               trial_gate(ex_wrapper(routes.post_completions))); // legacy
-    ctx_http.post("/completions",              trial_gate(ex_wrapper(routes.post_completions)));
-    ctx_http.post("/v1/completions",           trial_gate(ex_wrapper(routes.post_completions_oai)));
-    ctx_http.post("/chat/completions",         trial_gate(ex_wrapper(routes.post_chat_completions)));
-    ctx_http.post("/v1/chat/completions",      trial_gate(ex_wrapper(routes.post_chat_completions)));
+    // inference endpoints are gated by the license subsystem (no-op when it is not compiled in)
+    ctx_http.post("/completion",               license_gate(ex_wrapper(routes.post_completions))); // legacy
+    ctx_http.post("/completions",              license_gate(ex_wrapper(routes.post_completions)));
+    ctx_http.post("/v1/completions",           license_gate(ex_wrapper(routes.post_completions_oai)));
+    ctx_http.post("/chat/completions",         license_gate(ex_wrapper(routes.post_chat_completions)));
+    ctx_http.post("/v1/chat/completions",      license_gate(ex_wrapper(routes.post_chat_completions)));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control)); // control channel (not gated)
-    ctx_http.post("/v1/responses",             trial_gate(ex_wrapper(routes.post_responses_oai)));
-    ctx_http.post("/responses",                trial_gate(ex_wrapper(routes.post_responses_oai)));
-    ctx_http.post("/v1/audio/transcriptions",  trial_gate(ex_wrapper(routes.post_transcriptions_oai)));
-    ctx_http.post("/audio/transcriptions",     trial_gate(ex_wrapper(routes.post_transcriptions_oai)));
-    ctx_http.post("/v1/messages",              trial_gate(ex_wrapper(routes.post_anthropic_messages))); // anthropic messages API
-    ctx_http.post("/infill",                   trial_gate(ex_wrapper(routes.post_infill)));
-    ctx_http.post("/embedding",                trial_gate(ex_wrapper(routes.post_embeddings))); // legacy
-    ctx_http.post("/embeddings",               trial_gate(ex_wrapper(routes.post_embeddings)));
-    ctx_http.post("/v1/embeddings",            trial_gate(ex_wrapper(routes.post_embeddings_oai)));
-    ctx_http.post("/rerank",                   trial_gate(ex_wrapper(routes.post_rerank)));
-    ctx_http.post("/reranking",                trial_gate(ex_wrapper(routes.post_rerank)));
-    ctx_http.post("/v1/rerank",                trial_gate(ex_wrapper(routes.post_rerank)));
-    ctx_http.post("/v1/reranking",             trial_gate(ex_wrapper(routes.post_rerank)));
+    ctx_http.post("/v1/responses",             license_gate(ex_wrapper(routes.post_responses_oai)));
+    ctx_http.post("/responses",                license_gate(ex_wrapper(routes.post_responses_oai)));
+    ctx_http.post("/v1/audio/transcriptions",  license_gate(ex_wrapper(routes.post_transcriptions_oai)));
+    ctx_http.post("/audio/transcriptions",     license_gate(ex_wrapper(routes.post_transcriptions_oai)));
+    ctx_http.post("/v1/messages",              license_gate(ex_wrapper(routes.post_anthropic_messages))); // anthropic messages API
+    ctx_http.post("/infill",                   license_gate(ex_wrapper(routes.post_infill)));
+    ctx_http.post("/embedding",                license_gate(ex_wrapper(routes.post_embeddings))); // legacy
+    ctx_http.post("/embeddings",               license_gate(ex_wrapper(routes.post_embeddings)));
+    ctx_http.post("/v1/embeddings",            license_gate(ex_wrapper(routes.post_embeddings_oai)));
+    ctx_http.post("/rerank",                   license_gate(ex_wrapper(routes.post_rerank)));
+    ctx_http.post("/reranking",                license_gate(ex_wrapper(routes.post_rerank)));
+    ctx_http.post("/v1/rerank",                license_gate(ex_wrapper(routes.post_rerank)));
+    ctx_http.post("/v1/reranking",             license_gate(ex_wrapper(routes.post_rerank)));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
+#ifdef PROVISION_LICENSE
+    // license status is public (read-only, never metered); activation goes
+    // through the regular API-key check. Both live only in the process that
+    // enforces the license (router / standalone), not in child instances.
+    if (!license_is_child_server()) {
+        ctx_http.get ("/license/status",   ex_wrapper(license_status_handler));
+        ctx_http.post("/license/activate", ex_wrapper(license_activate_handler));
+    }
+#endif
     // token counting
     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
     ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));

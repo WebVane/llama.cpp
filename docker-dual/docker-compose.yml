@@ -44,11 +44,19 @@ services:
   llama-dual:
     image: ${LLAMA_DUAL_IMAGE:-nexus.scan-dev.com:6001/llama_dual:latest}
     container_name: llama-dual
+    # Stable hostname: an online license is bound to (machine-id, hostname);
+    # Docker's random per-container hostname would invalidate it on every
+    # recreate.  Only matters for TRIAL / licensed images, harmless otherwise.
+    hostname: llama-dual
     restart: unless-stopped
     ports:
       - "${PORT:-8096}:8080"
     environment:
       PORT: "8080"
+      # License subsystem (TRIAL images): optional activation code applied on
+      # first start (idempotent, the persisted .lic wins afterwards).  Codes
+      # can also be entered in the web UI (Settings -> License) at any time.
+      PROVISION_LICENSE_ACTIVATION_CODE: "${PROVISION_LICENSE_ACTIVATION_CODE:-}"
       # 1 = swap models between requests (~+1-5 s on switch, half VRAM)
       # 2 = keep both resident (required to actually use two GPUs at once)
       MODELS_MAX: "${MODELS_MAX:-2}"
@@ -67,6 +75,8 @@ services:
       - ./models:/models:ro
       # Override the baked-in preset without rebuilding the image:
       - ./models.ini:/config/models.ini:ro
+      # License state (.lic, request counter) for TRIAL / licensed images.
+      - llama-license-state:/var/lib/provision-llm
     deploy:
       resources:
         reservations:
@@ -94,3 +104,9 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
+
+volumes:
+  # License state (signed .lic, request counter, persisted machine-id) —
+  # must survive container recreation, otherwise every restart needs a
+  # new activation and eventually exhausts the licence's server slots.
+  llama-license-state:

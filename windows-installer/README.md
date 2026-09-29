@@ -114,34 +114,51 @@ Override the GPU set if you want a slimmer build:
 .\build-payload.ps1 -CudaArch "61-real;86-real" -Clean
 ```
 
-### Trial build (request-limited)
+### Trial build (N requests, then activation)
 
-Pass `-Trial` to produce an evaluation build of `provision-server` that serves
-a fixed number of **inference** requests and then refuses with HTTP 403:
+Pass `-Trial` to produce an evaluation build of `provision-server` with the
+license subsystem: it serves a fixed number of **inference** requests, then
+refuses with HTTP 403 until the product is activated with a code from the
+License Server:
 
 ```powershell
-.\build-payload.ps1 -Trial                 # default limit: 50 requests
-.\build-payload.ps1 -Trial -TrialLimit 100 # custom limit
+.\build-payload.ps1 -Trial -LicenseKeyringJson .\keyring.json   # default: 50 requests
+.\build-payload.ps1 -Trial -TrialLimit 100 -LicenseKeyringJson .\keyring.json
 ```
 
+- `-LicenseKeyringJson` is the trusted Ed25519 keyring
+  (`{ "keys": [ { "kid": "...", "pubkey": "<base64url>" } ] }`) that lets the
+  build verify the `.lic` the License Server issues. Without it the trial
+  still runs, but activation fails (`unknown kid`).
+- Product / server defaults: `-LicenseProduct LLM`,
+  `-LicenseActivationUrl https://license.scan-dev.com`; both can also be
+  overridden at runtime with `PROVISION_LICENSE_PRODUCT` /
+  `PROVISION_LICENSE_ACTIVATION_URL`.
 - The limit applies to both the web UI and the API — they hit the same
   endpoints (`/chat/completions`, `/completions`, `/v1/responses`,
   `/v1/messages`, `/embeddings`, `/rerank`, transcriptions, `/infill`).
-- Health checks (`/health`, `/v1/health`) and metadata endpoints (`/props`,
-  `/models`, `/metrics`, `/tokenize`, `/detokenize`, web UI assets) are **not**
-  counted.
-- The counter persists across restarts in a tamper-resistant,
-  HMAC-SHA256-signed file at `%PROGRAMDATA%\ProvisionOCR\trial.dat`. Editing
-  the file or rolling the system clock back locks the trial out.
+- Health checks (`/health`, `/v1/health`), metadata endpoints (`/props`,
+  `/models`, `/metrics`, `/tokenize`, `/detokenize`, web UI assets) and the
+  license endpoints (`GET /license/status`, `POST /license/activate`) are
+  **not** counted; only a delivered 2xx result burns a slot.
+- **Activation**: web UI → Settings → License (or the banner on the chat
+  screen) → enter the code; or `POST /license/activate
+  {"activationCode": "XXXX-XXXX-XXXX"}`; or set
+  `PROVISION_LICENSE_ACTIVATION_CODE` in the environment before the first
+  start. The signed `.lic` is stored under `%PROGRAMDATA%\ProvisionLLM` next
+  to the HMAC-signed request counter; editing those files or rolling the
+  system clock back locks requests out.
 - In router mode (the default for this installer), the request is counted once
   in the router process; spawned child instances do not double-count.
-- `-Trial` also turns on `LLAMA_BUILD_BORINGSSL` so the libcrypto the limiter
-  needs is statically bundled — no extra DLL to ship and no system OpenSSL
-  required.
+- `-Trial` also turns on `LLAMA_BUILD_BORINGSSL` so libcrypto (SHA-256, HMAC,
+  Ed25519) and TLS for the activation call are statically bundled — no extra
+  DLL to ship and no system OpenSSL required.
 
-The limiter is compiled in via `-DLLAMA_SERVER_TRIAL=ON`
-(`-DLLAMA_SERVER_TRIAL_LIMIT=N`, optional `-DLLAMA_SERVER_TRIAL_KEY="..."`).
-A normal build (no `-Trial`) is unrestricted.
+The subsystem is compiled in via `-DLLAMA_SERVER_TRIAL=ON`
+(`-DLLAMA_SERVER_TRIAL_LIMIT=N`, `-DLLAMA_SERVER_LICENSE_PRODUCT`,
+`-DLLAMA_SERVER_LICENSE_ACTIVATION_URL`, `-DLLAMA_SERVER_LICENSE_KEYRING_JSON`;
+see `tools/server/CMakeLists.txt`). A normal build (no `-Trial`) is
+unrestricted.
 
 ## Step 3 — compile the installer
 

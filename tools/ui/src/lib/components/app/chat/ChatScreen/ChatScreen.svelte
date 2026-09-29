@@ -9,6 +9,7 @@
 		ChatScreenForm,
 		ChatScreenServerError,
 		ChatScreenStreamResumeStatus,
+		LicenseBanner,
 		ServerLoadingSplash
 	} from '$lib/components/app';
 	import { LANDING_SETTLE_MAX_MS, LANDING_STABLE_FRAMES, ROUTES } from '$lib/constants';
@@ -332,6 +333,8 @@
 			<ChatScreenGreeting {isEmpty} />
 
 			<ChatScreenServerError />
+
+			<LicenseBanner />
 
 			{#if page.params.id}
 				<ChatScreenStreamResumeStatus />

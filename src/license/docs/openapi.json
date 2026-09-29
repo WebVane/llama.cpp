@@ -1,0 +1,405 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Provision OCR License",
+    "version": "2.1.0"
+  },
+  "servers": [
+    { "url": "https://license.example.com", "description": "Prod (placeholder)" },
+    { "url": "http://localhost:8080", "description": "Dev" }
+  ],
+  "tags": [
+    { "name": "client", "description": "Публичный клиентский путь (LicenseLib)" },
+    { "name": "ci", "description": "Регистрация ключей на этапе сборки" },
+    { "name": "admin", "description": "Кабинет/админ — требует auth" }
+  ],
+  "paths": {
+    "/api/v1/activate": {
+      "post": {
+        "tags": ["client"],
+        "summary": "Online-активация",
+        "description": "Привязывает fingerprint к слоту лицензии и возвращает подписанный .lic. Тот же fingerprint → идемпотентно тот же .lic (слот не плодится). Слоты заняты другими fingerprint → 403. Код активации — переиспользуемый креденциал (валиден пока лицензия не REVOKED/SUSPENDED/CANCELLED и не истёк код).",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "description": "UUID; стабильный для повтора с той же машины. Тот же ключ+тело → сохранённый ответ; другое тело при том же ключе → 409.",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ActivateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Активация успешна; подписанный .lic",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActivateResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": {
+            "description": "Неверный, отозванный или истёкший код активации",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "403": {
+            "description": "Нет свободного слота (активных привязок = max_servers)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "Конфликт идемпотентности (тот же Idempotency-Key с другим телом)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": ["client"],
+        "summary": "Состояние и серверное время",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "UP" },
+                    "serverTime": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ci/keys/challenge": {
+      "get": {
+        "tags": ["ci"],
+        "summary": "Выдать stateless challenge для proof-of-possession",
+        "description": "Возвращает base64url(nonce ‖ expiry ‖ HMAC-SHA256). Ничего не хранится (HA-friendly); подлинность и TTL проверяются HMAC при регистрации.",
+        "responses": {
+          "200": {
+            "description": "Challenge",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["challenge"],
+                  "properties": { "challenge": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ci/keys": {
+      "post": {
+        "tags": ["ci"],
+        "summary": "Зарегистрировать клиентский токен-pubkey (PoP)",
+        "description": "Проверяет HMAC/срок challenge, затем подпись клиента над challenge присланным pubkey. На успехе создаёт клиента и регистрирует публичный токен-ключ; возвращает clientId+kid. Приватный ключ сервер не хранит.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["challenge", "publicKey", "signature"],
+                "properties": {
+                  "challenge": { "type": "string", "description": "из /ci/keys/challenge" },
+                  "publicKey": { "type": "string", "description": "Ed25519 публичный ключ (base64url)" },
+                  "signature": { "type": "string", "description": "подпись challenge приватным ключом (base64url)" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ключ зарегистрирован",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "clientId": { "type": "string", "format": "uuid" },
+                    "kid": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Невалидный challenge или подпись",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/activation-codes": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Выпустить код активации (создать лицензию)",
+        "description": "Создаёт лицензию PENDING + activationCode (CSPRNG). Сырой код возвращается ОДИН РАЗ; в БД хранится только key_hash.",
+        "security": [{ "adminAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IssueActivationCodeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Создано",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["licenseId", "activationCode"],
+                  "properties": {
+                    "licenseId": { "type": "string", "format": "uuid" },
+                    "activationCode": { "type": "string", "description": "сырой код, показывается один раз" }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/admin/licenses/{licenseId}/bindings": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Список привязок лицензии",
+        "description": "Активные/отозванные привязки — чтобы выбрать, какую отозвать.",
+        "security": [{ "adminAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/LicenseId" }],
+        "responses": {
+          "200": {
+            "description": "Привязки",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Binding" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/admin/licenses/{licenseId}/bindings/revoke": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Отозвать привязку (освободить слот)",
+        "description": "status='revoked' → слот свободен для новой активации. Работающая машина НЕ гасится — её .lic действует до истечения.",
+        "security": [{ "adminAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/LicenseId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Указать fingerprint ИЛИ bindingId",
+                "properties": {
+                  "fingerprint": { "type": "string" },
+                  "bindingId": { "type": "string", "format": "uuid" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Отозвано" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/admin/licenses/{licenseId}/offline": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Выпустить offline-.lic",
+        "description": "Подписывает .lic БЕЗ fingerprint, с activationCode/сроком/limits. Слот не занимает. expiresAt по умолчанию = срок лицензии (опц. override на более короткий).",
+        "security": [{ "adminAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/LicenseId" }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "requestLimit": { "type": "integer", "nullable": true },
+                  "expiresAt": { "type": "string", "format": "date-time", "nullable": true, "description": "опц. override (не позже срока лицензии)" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Offline .lic (без fingerprint)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/License" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": {
+            "description": "Лицензия REVOKED/CANCELLED/истёкшая — выдача отклонена",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/licenses/{licenseId}/upgrade": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Апгрейд/продление (перевыпуск)",
+        "description": "Обновляет tariff и/или продлевает end_date + пишет transaction. Изменения вступают в силу при следующей активации (online) или новой offline-выдаче. Рантайм-смены тарифа нет.",
+        "security": [{ "adminAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/LicenseId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "tariff": { "type": "string", "nullable": true },
+                  "extendDays": { "type": "integer", "nullable": true, "description": "продлить end_date на N дней" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Обновлено" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "LicenseId": {
+        "name": "licenseId",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string", "format": "uuid" }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Некорректный запрос (напр. отсутствует Idempotency-Key)",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "Не аутентифицирован (админ-путь)",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "securitySchemes": {
+      "adminAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "PRE-PROD: фильтр аутентификации перед /api/v1/admin/* (mTLS/API-ключ). До его подключения путь наружу не выставлять."
+      }
+    },
+    "schemas": {
+      "ActivateRequest": {
+        "type": "object",
+        "required": ["activationCode", "fingerprint"],
+        "properties": {
+          "activationCode": { "type": "string", "description": "Код активации (креденциал лицензии)" },
+          "fingerprint": {
+            "type": "string",
+            "description": "SHA-256 hex = SHA-256(CPU_ID ‖ Hostname ‖ clientId ‖ product), считается на клиенте; clientId/product зашиты в сборку на CI"
+          }
+        }
+      },
+      "ActivateResponse": {
+        "type": "object",
+        "required": ["lic", "kid"],
+        "properties": {
+          "lic": { "$ref": "#/components/schemas/License" },
+          "kid": { "type": "string", "description": "id ключа подписи (дублирует lic.kid)" }
+        }
+      },
+      "License": {
+        "type": "object",
+        "description": "Единый .lic (online и offline). Подпись Ed25519 по каноническому JSON (RFC 8785/JCS) всех полей КРОМЕ signature. Различие режимов — наличие поля fingerprint (online) или его отсутствие (offline).",
+        "required": ["licenseId", "clientId", "product", "tariff", "activationCode", "maxServers", "limits", "issuedAt", "expiresAt", "kid", "signature"],
+        "properties": {
+          "licenseId": { "type": "string", "format": "uuid" },
+          "clientId": { "type": "string", "format": "uuid" },
+          "product": { "type": "string", "example": "OCR" },
+          "tariff": { "type": "string", "example": "BUSINESS" },
+          "activationCode": { "type": "string", "description": "Идентификатор/код лицензии" },
+          "fingerprint": {
+            "type": "string",
+            "nullable": true,
+            "description": "SHA-256 hex. Присутствует ТОЛЬКО в online-.lic; в offline-.lic поле отсутствует. Клиент сверяет с локально вычисленным."
+          },
+          "maxServers": { "type": "integer", "description": "Информативно; слот-кап применяется на сервере при активации" },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "requestLimit": { "type": "integer", "nullable": true, "description": "Лимит запросов (опц.); проверяется на клиенте локальным счётчиком" },
+              "gpu": { "type": "boolean" }
+            }
+          },
+          "issuedAt": { "type": "string", "format": "date-time" },
+          "expiresAt": { "type": "string", "format": "date-time", "description": "Фиксированный конец срока лицензии (не now+term)" },
+          "kid": { "type": "string", "description": "id ключа подписи (keyring, accept-if-any)" },
+          "signature": { "type": "string", "description": "Ed25519-подпись (base64url) по каноническому JSON всех полей кроме signature" }
+        }
+      },
+      "Binding": {
+        "type": "object",
+        "properties": {
+          "bindingId": { "type": "string", "format": "uuid" },
+          "fingerprint": { "type": "string" },
+          "activatedAt": { "type": "string", "format": "date-time" },
+          "status": { "type": "string", "enum": ["active", "revoked"] }
+        }
+      },
+      "IssueActivationCodeRequest": {
+        "type": "object",
+        "required": ["product", "maxServers", "termDays", "tariff"],
+        "properties": {
+          "product": { "type": "string", "example": "OCR" },
+          "maxServers": { "type": "integer", "description": "купленные слоты" },
+          "termDays": { "type": "integer", "description": "срок в днях (end_date = now + termDays)" },
+          "requestLimit": { "type": "integer", "nullable": true },
+          "tariff": { "type": "string", "example": "BUSINESS" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  }
+}

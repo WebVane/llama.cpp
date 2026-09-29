@@ -91,17 +91,26 @@ build_llama_dual:
 
 # =========================================================================
 # Build the TRIAL llama-dual image: same as build_llama_dual but the server
-# is compiled with -DLLAMA_SERVER_TRIAL=ON (TRIAL_LIMIT inference requests,
-# then HTTP 403; health checks exempt — see docker-dual/Dockerfile and
-# src/license/Trial.cpp).
+# is compiled with the license subsystem and the trial fallback
+# (-DLLAMA_SERVER_TRIAL=ON): TRIAL_LIMIT inference requests per install,
+# then HTTP 403 until the product ("LLM" on the License Server) is
+# activated — see docker-dual/Dockerfile and src/license/README.md.
 #
 # Single rolling image only: one tag, :trial, overwritten every build (we
 # keep only the latest trial version — no per-commit / per-branch tags).
 # The previous :trial is pulled as the BuildKit cache donor for incremental
 # rebuilds.
 #
-# The signed counter lives at /var/lib/provision-ocr/trial.dat in the
-# container; mount a volume there to persist it across container recreation.
+# License state (.lic + request counter) lives in /var/lib/provision-llm in
+# the container; mount a volume there to persist it across recreation.
+#
+# The trusted keyring comes from the PROVISION_LICENSE_KEYRING_JSON CI
+# variable (Settings -> CI/CD -> Variables, Protected + Masked; the same
+# variable the OCR pipeline uses).  It is fed to docker build as a BuildKit
+# secret: the bytes never enter the image layers, only the generated
+# keyring_baked.cpp inside the build stage.  Optional overrides:
+# PROVISION_LICENSE_PRODUCT (default LLM) and
+# PROVISION_LICENSE_ACTIVATION_URL (default https://license.scan-dev.com).
 # =========================================================================
 build_llama_dual_trial:
   stage: build
@@ -115,18 +124,48 @@ build_llama_dual_trial:
   script:
   # 1. Pull the previous :trial image as a cache donor (ignored if absent).
   - docker pull $RELEASE_IMG:trial || true
-  # 2. Build the trial variant (TRIAL=1) and tag it :trial only.
+  # 2. Materialise the keyring for the build secret.  Branch policy (same as
+  #    the OCR pipeline):
+  #      * dev    -> the PUBLIC k3 test pubkey from src/license/docs/vectors
+  #                  (works with the test License Server; NOT for production),
+  #                  image tagged :trial-dev so it never replaces :trial.
+  #      * master -> PROVISION_LICENSE_KEYRING_JSON (Protected + Masked CI
+  #                  variable).  Missing = FATAL: a :trial image with an
+  #                  empty keyring could never be activated by a customer.
   - |
-    docker build -f docker-dual/Dockerfile \
-      --cache-from $RELEASE_IMG:trial \
+    if [ "$CI_COMMIT_BRANCH" = "dev" ]; then
+      cp src/license/docs/vectors/keyring.json license_keyring.json
+      TRIAL_TAG=trial-dev
+      echo "[license] DEV branch - baking the public k3 TEST pubkey, image tag :$TRIAL_TAG"
+    elif [ -n "$PROVISION_LICENSE_KEYRING_JSON" ]; then
+      printf '%s' "$PROVISION_LICENSE_KEYRING_JSON" > license_keyring.json
+      TRIAL_TAG=trial
+      echo "[license] keyring materialised ($(wc -c < license_keyring.json) bytes)"
+    else
+      echo "FATAL: PROVISION_LICENSE_KEYRING_JSON is empty - refusing to build a :trial image that cannot verify any .lic."
+      echo "Set it in Settings -> CI/CD -> Variables (Protected + Masked) and make sure this branch is protected."
+      exit 1
+    fi
+    echo "TRIAL_TAG=$TRIAL_TAG" > trial_tag.env
+  # 3. Build the trial variant (TRIAL=1) and tag it :trial (master) / :trial-dev (dev).
+  - |
+    . ./trial_tag.env
+    DOCKER_BUILDKIT=1 docker build -f docker-dual/Dockerfile \
+      --cache-from $RELEASE_IMG:$TRIAL_TAG \
       --build-arg BUILDKIT_INLINE_CACHE=1 \
       --build-arg CUDA_ARCH="$CUDA_ARCH" \
       --build-arg TRIAL=1 \
       --build-arg TRIAL_LIMIT="$TRIAL_LIMIT" \
-      -t $RELEASE_IMG:trial \
+      --build-arg LICENSE_PRODUCT="${PROVISION_LICENSE_PRODUCT:-LLM}" \
+      --build-arg LICENSE_ACTIVATION_URL="${PROVISION_LICENSE_ACTIVATION_URL:-https://license.scan-dev.com}" \
+      --secret id=license_keyring,src=license_keyring.json \
+      -t $RELEASE_IMG:$TRIAL_TAG \
       .
-  # 3. Push the single rolling tag, overwriting the previous trial image.
-  - docker push $RELEASE_IMG:trial
+  # 4. Push the single rolling tag, overwriting the previous trial image.
+  - |
+    . ./trial_tag.env
+    docker push $RELEASE_IMG:$TRIAL_TAG
   after_script:
-  - echo "=== llama-dual TRIAL pushed - $RELEASE_IMG:trial ==="
+  - rm -f license_keyring.json trial_tag.env
+  - echo "=== llama-dual TRIAL pushed - see the tag printed above ==="
   - docker images $RELEASE_IMG --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | head -n 5

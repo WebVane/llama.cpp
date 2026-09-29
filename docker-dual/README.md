@@ -90,38 +90,62 @@ docker build -f docker-dual/Dockerfile \
     -t llama-dual .
 ```
 
-### c) trial build (request-limited, self-contained)
+### c) trial build (N requests, then activation; self-contained)
 
-Pass `--build-arg TRIAL=1` to compile a request-limited evaluation image:
-the server then serves at most `TRIAL_LIMIT` **inference** requests (web UI
-and API alike) and afterwards refuses with HTTP 403.
+Pass `--build-arg TRIAL=1` to compile the license subsystem (shared with
+`provision_ocr_server`, see `src/license/README.md`) into the image with the
+trial fallback: the server serves `TRIAL_LIMIT` **inference** requests (web
+UI and API alike), then refuses with HTTP 403 until the product is activated
+with a code from the License Server (product `LLM`).
 
 The trial image is **self-contained** — the two GGUF weights are downloaded
 from HuggingFace at build time and baked into `/models`, so no model mount
-is needed:
+is needed. The trusted keyring is passed as a BuildKit secret so the image
+can verify the `.lic` it receives on activation:
 
 ```bash
-docker build -f docker-dual/Dockerfile \
+DOCKER_BUILDKIT=1 docker build -f docker-dual/Dockerfile \
     --build-arg TRIAL=1 \
     --build-arg TRIAL_LIMIT=50 \
+    --secret id=license_keyring,src=./keyring.json \
     -t llama-dual:trial .
 
 # Run it — note: do NOT mount /models, the weights are already inside.
+# The license state volume and a STABLE hostname are required: online
+# licenses are bound to (machine-id, hostname), a random container hostname
+# would invalidate the license on every restart.
 docker run -d --name llama-dual-trial --gpus all \
+    --hostname llama-dual \
     -p 8080:8080 \
-    -v llama-trial-state:/var/lib/provision-ocr \
+    -v llama-license-state:/var/lib/provision-llm \
     llama-dual:trial
 ```
 
+- **Activation**: web UI → Settings → License (or the banner on the chat
+  screen) → enter the code; or
+  `curl -X POST localhost:8080/license/activate -d '{"activationCode":"XXXX-XXXX-XXXX"}'`;
+  or start the container with `-e PROVISION_LICENSE_ACTIVATION_CODE=...`
+  (idempotent — the persisted `.lic` wins on later boots). `GET /license/status`
+  shows mode / used / limit without consuming anything.
 - Counted: `/chat/completions`, `/completions`, `/v1/responses`,
-  `/v1/messages`, `/embeddings`, `/rerank`, transcriptions, `/infill`.
+  `/v1/messages`, `/embeddings`, `/rerank`, transcriptions, `/infill` — and
+  only a delivered 2xx result; a 400/503 never burns a slot.
 - **Not** counted: `/health`, `/props`, `/models`, `/metrics`,
-  `/tokenize`, `/detokenize`, web UI assets. The Docker `HEALTHCHECK`
-  therefore never consumes the trial.
-- The signed counter (HMAC-SHA256, tamper- and clock-rollback-resistant)
-  lives at `/var/lib/provision-ocr/trial.dat`; the `-v llama-trial-state:...`
-  mount above persists it across container recreation (drop it if you want
-  the counter to reset on every fresh container).
+  `/tokenize`, `/detokenize`, `/license/*`, web UI assets. The Docker
+  `HEALTHCHECK` therefore never consumes the trial.
+- License state — the signed `.lic`, the HMAC-signed request counter
+  (tamper- and clock-rollback-resistant) and the persisted machine-id —
+  lives in `/var/lib/provision-llm` (`PROVISION_LICENSE_STATE_DIR`); the
+  `-v llama-license-state:...` mount persists it across container
+  recreation. Deleting the volume restarts the trial budget but also drops
+  the license, so a customer would have to activate again (and each
+  activation of a new machine identity consumes one of the license's server
+  slots).
+- Build args: `LICENSE_PRODUCT` (default `LLM`), `LICENSE_ACTIVATION_URL`
+  (default `https://license.scan-dev.com`); runtime overrides:
+  `PROVISION_LICENSE_PRODUCT`, `PROVISION_LICENSE_ACTIVATION_URL`,
+  `PROVISION_LICENSE_CPU_ID_OVERRIDE` / `PROVISION_LICENSE_HOSTNAME_OVERRIDE`
+  (pin the machine identity explicitly).
 - In router mode (the default) the request is counted once in the router
   process; the spawned child instances do not double-count.
 - The weights come from `bartowski/Qwen2.5-7B-Instruct-GGUF` and

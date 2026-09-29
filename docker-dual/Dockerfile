@@ -38,14 +38,23 @@ FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 # will fail at ptxas time.
 ARG CUDA_ARCH=default
 
-# Trial / evaluation build.  TRIAL=1 compiles the server as a request-limited
-# trial (see tools/server/CMakeLists.txt and src/license/Trial.cpp): it serves
-# at most TRIAL_LIMIT inference requests (web UI and API alike) and then
-# refuses with HTTP 403.  Health checks and metadata endpoints are exempt.
-# The signed counter lives at /var/lib/provision-ocr/trial.dat inside the
-# container (mount a volume there to persist it across container recreation).
+# Trial / evaluation build.  TRIAL=1 compiles the license subsystem
+# (src/license, shared with provision_ocr_server) into the server with the
+# trial fallback: out of the box it serves TRIAL_LIMIT inference requests
+# (web UI and API alike), then refuses with HTTP 403 until the product is
+# activated — POST /license/activate {"activationCode": ...} (Settings ->
+# License in the web UI), or PROVISION_LICENSE_ACTIVATION_CODE in the
+# environment at first start.  Health checks and metadata endpoints are
+# exempt.  License state (.lic, request counter) lives in
+# /var/lib/provision-llm inside the container: mount a volume there.
+#
+# Activation needs the trusted keyring baked in: pass it as a BuildKit
+# secret (--secret id=license_keyring,src=keyring.json).  Without it the
+# image runs the trial but cannot verify any .lic.
 ARG TRIAL=0
 ARG TRIAL_LIMIT=50
+ARG LICENSE_PRODUCT=LLM
+ARG LICENSE_ACTIVATION_URL=https://license.scan-dev.com
 
 # CUDA 12.2 supports gcc up to 12; Ubuntu 22.04 ships gcc-11 by default
 # but we install gcc-12 explicitly for slightly better C++20 coverage in
@@ -80,13 +89,22 @@ ENV CC=gcc-12 CXX=g++-12 CUDAHOSTCXX=g++-12
 WORKDIR /src
 COPY . /src
 
-RUN EXTRA_CMAKE_ARGS="" && \
+RUN --mount=type=secret,id=license_keyring \
+    EXTRA_CMAKE_ARGS="" && \
     if [ "${CUDA_ARCH}" != "default" ]; then \
         EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"; \
     fi && \
     if [ "${TRIAL}" = "1" ]; then \
-        echo "*** TRIAL build: request limit = ${TRIAL_LIMIT} ***"; \
+        echo "*** TRIAL build: ${TRIAL_LIMIT} requests, then activation (product ${LICENSE_PRODUCT}) ***"; \
         EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS} -DLLAMA_SERVER_TRIAL=ON -DLLAMA_SERVER_TRIAL_LIMIT=${TRIAL_LIMIT}"; \
+        EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS} -DLLAMA_SERVER_LICENSE_PRODUCT=${LICENSE_PRODUCT}"; \
+        EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS} -DLLAMA_SERVER_LICENSE_ACTIVATION_URL=${LICENSE_ACTIVATION_URL}"; \
+        if [ -s /run/secrets/license_keyring ]; then \
+            echo "*** baking license keyring ($(wc -c < /run/secrets/license_keyring) bytes) ***"; \
+            EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS} -DLLAMA_SERVER_LICENSE_KEYRING_JSON=/run/secrets/license_keyring"; \
+        else \
+            echo "*** WARNING: no license_keyring secret - this image cannot verify any .lic, activation will fail ***"; \
+        fi; \
     fi && \
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
@@ -182,6 +200,9 @@ ENV MODEL_DEVICES=""
 # CUDA default "fastest first", so `device = CUDAn` in models.ini is stable
 # on hosts with mixed GPU models.
 ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
+# License state directory (TRIAL=1 images): signed .lic, request counter,
+# persisted machine-id.  Must be a persistent volume — see docker-compose.yml.
+ENV PROVISION_LICENSE_STATE_DIR=/var/lib/provision-llm
 
 WORKDIR /app
 

@@ -349,3 +349,10 @@ export { MigrationService } from './migration.service';
  * @see settingsStore in stores/settings/index.svelte.ts - reactive state + business logic
  */
 export { SettingsService } from './settings.service';
+
+/**
+ * **LicenseService** - License status + online activation
+ *
+ * Wraps GET /license/status and POST /license/activate of provision-server.
+ */
+export { LicenseService } from './license.service';

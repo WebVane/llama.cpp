@@ -1,0 +1,151 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Provision OCR License — client view",
+    "version": "2.1.0",
+    "description": "Filtered view of the License Server contract — only the paths that LicenseLib actually calls. Full contract (with /ci and /admin) lives at openapi.json."
+  },
+  "servers": [
+    { "url": "https://license.example.com", "description": "Prod (placeholder)" },
+    { "url": "http://localhost:8080", "description": "Dev" }
+  ],
+  "tags": [
+    { "name": "client", "description": "Публичный клиентский путь (LicenseLib)" }
+  ],
+  "paths": {
+    "/api/v1/activate": {
+      "post": {
+        "tags": ["client"],
+        "summary": "Online-активация",
+        "description": "Привязывает fingerprint к слоту лицензии и возвращает подписанный .lic. Тот же fingerprint → идемпотентно тот же .lic (слот не плодится). Слоты заняты другими fingerprint → 403. Код активации — переиспользуемый креденциал (валиден пока лицензия не REVOKED/SUSPENDED/CANCELLED и не истёк код).",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "description": "UUID; стабильный для повтора с той же машины. Тот же ключ+тело → сохранённый ответ; другое тело при том же ключе → 409.",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ActivateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Активация успешна; подписанный .lic",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActivateResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": {
+            "description": "Неверный, отозванный или истёкший код активации",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "403": {
+            "description": "Нет свободного слота (активных привязок = max_servers)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "Конфликт идемпотентности (тот же Idempotency-Key с другим телом)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": ["client"],
+        "summary": "Состояние и серверное время",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "UP" },
+                    "serverTime": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "BadRequest": {
+        "description": "Некорректный запрос (напр. отсутствует Idempotency-Key)",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "ActivateRequest": {
+        "type": "object",
+        "required": ["activationCode", "fingerprint"],
+        "properties": {
+          "activationCode": { "type": "string", "description": "Код активации (креденциал лицензии)" },
+          "fingerprint": {
+            "type": "string",
+            "description": "SHA-256 hex = SHA-256(CPU_ID ‖ Hostname ‖ clientId ‖ product), считается на клиенте; clientId/product зашиты в сборку на CI"
+          }
+        }
+      },
+      "ActivateResponse": {
+        "type": "object",
+        "required": ["lic", "kid"],
+        "properties": {
+          "lic": { "$ref": "#/components/schemas/License" },
+          "kid": { "type": "string", "description": "id ключа подписи (дублирует lic.kid)" }
+        }
+      },
+      "License": {
+        "type": "object",
+        "description": "Единый .lic (online и offline). Подпись Ed25519 по каноническому JSON (RFC 8785/JCS) всех полей КРОМЕ signature. Различие режимов — наличие поля fingerprint (online) или его отсутствие (offline).",
+        "required": ["licenseId", "clientId", "product", "tariff", "activationCode", "maxServers", "limits", "issuedAt", "expiresAt", "kid", "signature"],
+        "properties": {
+          "licenseId": { "type": "string", "format": "uuid" },
+          "clientId": { "type": "string", "format": "uuid" },
+          "product": { "type": "string", "example": "OCR" },
+          "tariff": { "type": "string", "example": "BUSINESS" },
+          "activationCode": { "type": "string", "description": "Идентификатор/код лицензии" },
+          "fingerprint": {
+            "type": "string",
+            "nullable": true,
+            "description": "SHA-256 hex. Присутствует ТОЛЬКО в online-.lic; в offline-.lic поле отсутствует. Клиент сверяет с локально вычисленным."
+          },
+          "maxServers": { "type": "integer", "description": "Информативно; слот-кап применяется на сервере при активации" },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "requestLimit": { "type": "integer", "nullable": true, "description": "Лимит запросов (опц.); проверяется на клиенте локальным счётчиком" },
+              "gpu": { "type": "boolean" }
+            }
+          },
+          "issuedAt": { "type": "string", "format": "date-time" },
+          "expiresAt": { "type": "string", "format": "date-time", "description": "Фиксированный конец срока лицензии (не now+term)" },
+          "kid": { "type": "string", "description": "id ключа подписи (keyring, accept-if-any)" },
+          "signature": { "type": "string", "description": "Ed25519-подпись (base64url) по каноническому JSON всех полей кроме signature" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -225,3 +225,11 @@ export type { ReasoningEffortLevel } from './reasoning';
 
 // Splash
 export type { SplashDimensions } from './splash';
+
+// License types
+export type {
+	ApiLicenseActivateResponse,
+	ApiLicenseMode,
+	ApiLicenseStatus,
+	ApiLicenseStatusValue
+} from './license';

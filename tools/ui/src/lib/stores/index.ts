@@ -58,3 +58,6 @@ export { toolsStore } from './tools.svelte';
 export { versionStore } from './version.svelte';
 
 export { deviceStore } from './device.svelte';
+
+// LICENSE (provision-server license subsystem: status + activation)
+export { licenseStore } from './license.svelte';

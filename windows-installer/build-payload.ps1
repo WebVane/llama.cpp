@@ -46,14 +46,28 @@ param(
     # Wipe the build dir first (use after changing CUDA toolkit / flags).
     [switch] $Clean,
 
-    # Build a request-limited TRIAL of provision-server. The server then
-    # serves at most -TrialLimit inference requests (web UI and API alike);
-    # health checks and metadata endpoints are exempt. State is signed and
-    # stored under %PROGRAMDATA%\ProvisionOCR\trial.dat.
+    # Build provision-server with the license subsystem and the trial
+    # fallback: the server serves at most -TrialLimit inference requests
+    # (web UI and API alike), then refuses with HTTP 403 until the product
+    # is activated (Settings -> License in the web UI, or POST
+    # /license/activate).  Health checks and metadata endpoints are exempt.
+    # License state (.lic, signed request counter) lives under
+    # %PROGRAMDATA%\ProvisionLLM.
     [switch] $Trial,
 
-    # Number of inference requests the trial allows before locking out.
-    [int] $TrialLimit = 50
+    # Number of inference requests the trial allows before activation is required.
+    [int] $TrialLimit = 50,
+
+    # Trusted Ed25519 keyring JSON baked into the trial build so it can
+    # verify the .lic the License Server issues.  Without it the trial
+    # works but activation fails ("unknown kid").
+    [string] $LicenseKeyringJson = "",
+
+    # Product name a .lic must carry (as registered on the License Server).
+    [string] $LicenseProduct = "LLM",
+
+    # License Server base URL used for online activation.
+    [string] $LicenseActivationUrl = "https://license.scan-dev.com"
 )
 
 $ErrorActionPreference = "Stop"
@@ -131,17 +145,27 @@ if ($Clean -and (Test-Path $BuildDir)) {
     Remove-Item -Recurse -Force $BuildDir
 }
 
-# Trial build: enable the request limiter, and bundle BoringSSL so the
-# HMAC-SHA256 libcrypto the limiter needs is always present (statically
-# linked -- no extra DLL to ship) even on machines without OpenSSL.
+# Trial build: license subsystem + trial fallback, and bundle BoringSSL so
+# the libcrypto it needs (SHA-256 / HMAC / Ed25519) and TLS for the
+# https:// activation URL are always present (statically linked -- no extra
+# DLL to ship) even on machines without OpenSSL.
 $TrialArgs = @()
 if ($Trial) {
-    Write-Host "  TRIAL build: request limit = $TrialLimit" -ForegroundColor Yellow
+    Write-Host "  TRIAL build: $TrialLimit requests, then activation (product $LicenseProduct)" -ForegroundColor Yellow
     $TrialArgs = @(
         "-DLLAMA_SERVER_TRIAL=ON",
         "-DLLAMA_SERVER_TRIAL_LIMIT=$TrialLimit",
+        "-DLLAMA_SERVER_LICENSE_PRODUCT=$LicenseProduct",
+        "-DLLAMA_SERVER_LICENSE_ACTIVATION_URL=$LicenseActivationUrl",
         "-DLLAMA_BUILD_BORINGSSL=ON"
     )
+    if ($LicenseKeyringJson) {
+        if (-not (Test-Path $LicenseKeyringJson)) { Fail "License keyring not found: $LicenseKeyringJson" }
+        $TrialArgs += "-DLLAMA_SERVER_LICENSE_KEYRING_JSON=$((Resolve-Path $LicenseKeyringJson).Path)"
+        Write-Host "  license keyring = $LicenseKeyringJson"
+    } else {
+        Write-Host "  WARNING: no -LicenseKeyringJson - the build cannot verify any .lic (activation will fail)" -ForegroundColor Yellow
+    }
 }
 
 Write-Step "Configuring (CMake)"

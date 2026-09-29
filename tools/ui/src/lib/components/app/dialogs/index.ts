@@ -526,3 +526,11 @@ export { default as DialogMcpResourcePreview } from './DialogMcpResourcePreview.
  * ```
  */
 export { default as DialogMermaidPreview } from './DialogMermaidPreview.svelte';
+
+/**
+ * **DialogLicenseActivate** - Online license activation
+ *
+ * Wraps LicenseActivationForm in a dialog; opened from the chat screen
+ * banner when the server runs as a trial or refuses requests.
+ */
+export { default as DialogLicenseActivate } from './DialogLicenseActivate.svelte';

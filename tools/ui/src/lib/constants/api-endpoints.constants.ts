@@ -39,3 +39,9 @@ export const STREAM_QUERY_PARAMS = {
 
 /** CORS proxy endpoint path */
 export const CORS_PROXY_ENDPOINT = '/cors-proxy';
+
+// license subsystem (provision-server): read-only status + online activation
+export const API_LICENSE = {
+	ACTIVATE: '/license/activate',
+	STATUS: '/license/status'
+};

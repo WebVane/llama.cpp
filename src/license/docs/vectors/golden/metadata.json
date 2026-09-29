@@ -1,0 +1,10 @@
+{
+  "algorithm": "Ed25519",
+  "canonicalization": "RFC 8785 (JCS); plus DEL(U+007F) escaped as \\u007f",
+  "datetime": "RFC 3339, always 'Z' (UTC), seconds precision",
+  "requestLimitAbsentWhenUnset": true,
+  "kid": "k3",
+  "publicKey": "4EaSZPBnAwrANV021KqPSKePl5AJhOGURJBcamjSFEo",
+  "online":  { "lic": "online.lic",  "payload": "online.payload.json",  "signature": "e2qOPytwzZWJ-mGyrw4vtF4PEwwMXQisRVHzdy-jpXqMpfFNEQgguvp6NkcX24pOFyhcGEoE8UFc9J5DKnOTDw" },
+  "offline": { "lic": "offline.lic", "payload": "offline.payload.json", "signature": "SC7s4ujJ99EEM3iSJsaAZLkrCgOfd7wSBh3rtV2ZDsCnQ7QdwON0XY8CYRTEhfyo6H71yR2bEPtCQpB1GxJ9AA" }
+}
