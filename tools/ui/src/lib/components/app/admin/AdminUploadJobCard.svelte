@@ -23,7 +23,7 @@
 	import * as Collapsible from '$lib/components/ui/collapsible';
 	import { Input } from '$lib/components/ui/input';
 	import { ADMIN_FIT_VERDICT_LABELS, ADMIN_UPLOAD_NGINX_SNIPPET } from '$lib/constants';
-	import { AdminFeature, AdminFitVerdict } from '$lib/enums';
+	import { AdminErrorType, AdminFeature, AdminFitVerdict } from '$lib/enums';
 	import {
 		AdminUploadBlock,
 		AdminUploadJobPhase,
@@ -41,6 +41,7 @@
 		describeUploadBlock,
 		describeUploadRejection,
 		formatDuration,
+		uploadNameLimit,
 		validateModelName
 	} from '$lib/utils/admin-upload';
 	import { onDestroy } from 'svelte';
@@ -155,6 +156,17 @@
 		)
 	);
 	let renameProblem = $derived(renameValue ? validateModelName(renameValue.trim()) : 'empty');
+	/** The checks wait for a shorter name (Windows, split model): its longest length */
+	let nameLimit = $derived(
+		job.phase === AdminUploadJobPhase.READY &&
+			session?.blocked_by === AdminUploadBlock.CHECK_FAILED
+			? uploadNameLimit(session.blocked)
+			: null
+	);
+	let limitedRenameProblem = $derived(
+		renameProblem ??
+			(nameLimit !== null && renameValue.trim().length > nameLimit ? 'too_long_here' : null)
+	);
 	let model = $derived(session?.result?.model ?? job.name);
 	let fitVerdict = $derived.by(() => {
 		const fit = job.fit;
@@ -286,8 +298,13 @@
 				<span data-testid="upload-progress-text">{progressText}</span>
 
 				{#if job.phase === AdminUploadJobPhase.QUEUED}
-					<span class="flex items-center gap-1"><Clock class="h-3 w-3" /> waiting for its turn</span
-					>
+					<span class="flex items-center gap-1" data-testid="upload-queued" role="status">
+						<Clock class="h-3 w-3 shrink-0" />
+
+						{job.errorType === AdminErrorType.TOO_MANY_UPLOADS && job.error
+							? `waiting: ${job.error}`
+							: 'waiting for its turn'}
+					</span>
 				{:else if job.phase === AdminUploadJobPhase.CREATING}
 					<span class="flex items-center gap-1">
 						<Loader2 class="h-3 w-3 animate-spin" /> starting...
@@ -299,6 +316,7 @@
 				<div
 					class="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm"
 					data-testid="upload-refused"
+					role="alert"
 				>
 					<p class="text-destructive">
 						The server refused {refusedFiles.length === 1 ? 'a file' : 'some files'} of this upload. Drop
@@ -327,6 +345,7 @@
 				</div>
 			{:else if send && send.state !== AdminUploadSendState.UPLOADING && send.state !== AdminUploadSendState.IDLE && send.state !== AdminUploadSendState.DONE && send.state !== AdminUploadSendState.FILE_REJECTED}
 				<p
+					aria-live="polite"
 					class={[
 						'flex items-start gap-2 text-sm',
 						send.state === AdminUploadSendState.PAUSED
@@ -334,6 +353,7 @@
 							: 'text-amber-700 dark:text-amber-400'
 					]}
 					data-testid="upload-send-state"
+					role="status"
 				>
 					<TriangleAlert class="mt-0.5 h-4 w-4 shrink-0" />
 
@@ -341,8 +361,10 @@
 				</p>
 			{:else if needsFiles}
 				<p
+					aria-live="polite"
 					class="flex items-start gap-2 text-sm text-amber-700 dark:text-amber-400"
 					data-testid="upload-needs-files"
+					role="status"
 				>
 					<FolderOpen class="mt-0.5 h-4 w-4 shrink-0" />
 
@@ -371,12 +393,24 @@
 			</span>
 
 			{#if session?.progress && session.progress.total_bytes > 0}
-				<div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+				{@const percent = Math.min(
+					100,
+					Math.round((session.progress.done_bytes / session.progress.total_bytes) * 100)
+				)}
+
+				<div
+					aria-label={job.phase === AdminUploadJobPhase.PUBLISHING
+						? 'Publishing progress'
+						: 'Check progress'}
+					aria-valuemax={100}
+					aria-valuemin={0}
+					aria-valuenow={percent}
+					class="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+					role="progressbar"
+				>
 					<div
 						class="h-full rounded-full bg-primary transition-[width] duration-300"
-						style="width: {Math.round(
-							(session.progress.done_bytes / session.progress.total_bytes) * 100
-						)}%"
+						style="width: {percent}%"
 					></div>
 				</div>
 			{/if}
@@ -417,6 +451,9 @@
 		<div
 			class="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm"
 			data-block={session?.blocked_by}
+			data-block-code={session?.blocked?.code ?? ''}
+			data-testid="upload-block"
+			role={session?.blocked_by === AdminUploadBlock.MANUAL ? 'status' : 'alert'}
 		>
 			<p class="font-medium text-amber-800 dark:text-amber-300">{block.title}</p>
 
@@ -489,6 +526,42 @@
 
 				{#if renameValue && renameProblem}
 					<p class="text-xs text-destructive">{describeModelNameProblem(renameProblem)}</p>
+				{/if}
+			{/if}
+
+			{#if nameLimit !== null && nameLimit > 0}
+				<div class="flex flex-wrap items-center gap-2">
+					<Input
+						bind:value={renameValue}
+						aria-invalid={renameValue && limitedRenameProblem ? 'true' : undefined}
+						aria-label="New name"
+						class="h-8 max-w-xs font-mono text-xs"
+						data-testid="upload-rename"
+						maxlength={nameLimit}
+						placeholder="new name, at most {nameLimit} characters"
+						spellcheck={false}
+					/>
+
+					<Button
+						disabled={busy || limitedRenameProblem !== null}
+						onclick={() =>
+							act(async () => {
+								await adminUploadStore.rename(job.key, renameValue.trim());
+								// Retry: the checks run again with the shorter name
+								await adminUploadStore.publish(job.key);
+							})}
+						size="sm"
+					>
+						Rename and check again
+					</Button>
+				</div>
+
+				{#if renameValue && limitedRenameProblem}
+					<p class="text-xs text-destructive">
+						{limitedRenameProblem === 'too_long_here'
+							? `The name may be at most ${nameLimit} characters long on this server.`
+							: describeModelNameProblem(limitedRenameProblem)}
+					</p>
 				{/if}
 			{/if}
 		</div>
@@ -645,7 +718,8 @@
 				>
 					Publish
 				</Button>
-			{:else if session?.blocked_by === AdminUploadBlock.CHECK_FAILED}
+			{:else if session?.blocked_by === AdminUploadBlock.CHECK_FAILED && nameLimit === null}
+				<!-- a path_too_long waits for a rename (above): the same name would be refused again -->
 				<Button
 					disabled={busy}
 					onclick={() => act(() => adminUploadStore.publish(job.key))}

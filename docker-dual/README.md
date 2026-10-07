@@ -415,7 +415,7 @@ Full description, API reference and upgrade checklist:
   front of it may need a larger body limit for `/admin/`, see
   [`docs/provision-admin.md`](../docs/provision-admin.md#169-behind-a-reverse-proxy).
 - Models in `./models-rw/local` (uploaded or dropped in) can be deleted in the
-  panel (**Delete files...**): only the files the model uses, other files in its
+  panel (**Delete files**): only the files the model uses, other files in its
   folder stay. **Remove projector** drops only the projector of a model.
   Downloaded models keep their **Delete**.
 <!-- s3-recheck: UI labels "Upload GGUF", "Delete files...", "Remove projector"; owner of uploaded files in Docker. -->

@@ -659,7 +659,10 @@ def test_upload_single_file_in_small_chunks():
     record = _read_json(_record(sid))
     assert record["id"] == sid and record["name"] == "tiny-up" and record["state"] == "receiving"
     hint = _read_json(_staging(sid, "session.json"))
-    assert set(hint) == {"version", "id", "name", "note", "files"}
+    # owner: the router that writes it (another router on the same models dir leaves the session alone); idle_ms:
+    # how far its expiry counted
+    assert set(hint) == {"version", "id", "name", "owner", "idle_ms", "note", "files"}
+    assert re.fullmatch(r"[0-9a-f]{32}", hint["owner"])
     assert set(hint["files"][0]) == {"index", "name", "size", "durable_offset", "dropped"}
 
     # 64 KiB chunks with a CRC32 each

@@ -570,6 +570,118 @@ describe('AdminUploadScheduler', () => {
 		expect(sameBytes(t, 0)).toBe(true);
 	});
 
+	it('keeps the resume overlap below half a chunk, so a stepped-down chunk still reaches past the offset', async () => {
+		// an older server answered a chunk that lies wholly inside the stored bytes with a false 507
+		const t = setup([8 * MIB], {
+			hooks: [
+				(request, server) =>
+					!request.verify && request.offset + request.data.length <= server.files[0].offset
+						? error(507, 'disk_full', { free_bytes: 10 ** 12 })
+						: null
+			],
+			scheduler: { ceiling: 960 * KIB, overlapFirst: true },
+			stored: [5 * MIB]
+		});
+
+		await run(t);
+
+		expect(t.transport.requests[0].offset).toBe(5 * MIB - 480 * KIB);
+		expect(t.transport.requests[0].data.length).toBe(960 * KIB);
+		expect(t.states).not.toContain(AdminUploadSendState.DISK_FULL);
+		expect(t.finished?.state).toBe(AdminUploadSendState.DONE);
+		expect(sameBytes(t, 0)).toBe(true);
+	});
+
+	it('overlaps 120 KiB when a file is picked again while the chunk size is 240 KiB', async () => {
+		const t = setup([2 * MIB], { scheduler: { ceiling: 240 * KIB }, stored: [MIB] });
+
+		t.scheduler.setFileBlob(0, new Blob([t.datas[0] as unknown as BlobPart]));
+		await run(t);
+
+		expect(t.transport.requests[0].offset).toBe(MIB - 120 * KIB);
+		expect(t.finished?.state).toBe(AdminUploadSendState.DONE);
+		expect(sameBytes(t, 0)).toBe(true);
+	});
+
+	it('steps down when the connection drops on a chunk shorter than the chunk size (the rest of a file)', async () => {
+		// 6 MiB left after a resume: less than the 8 MiB chunk, and a proxy resets bodies over 1 MB
+		const t = setup([6 * MIB], {
+			hooks: [(request) => (request.data.length > 1_000_000 ? { body: null, status: 0 } : null)],
+			scheduler: { overlapFirst: true },
+			stored: [MIB]
+		});
+
+		await run(t);
+
+		expect(t.finished?.state).toBe(AdminUploadSendState.DONE);
+		expect(t.ceilings).toEqual([[960 * KIB, false]]);
+		expect(accepted(t).every((chunk) => chunk.length <= 960 * KIB)).toBe(true);
+		expect(sameBytes(t, 0)).toBe(true);
+	});
+
+	it('does not step down on dropped connections below the size that already went through', async () => {
+		let drops = 0;
+
+		// the last chunk (2 MiB) drops four times: a flaky network, not a size limit
+		const t = setup([10 * MIB], {
+			hooks: [
+				(request) =>
+					request.offset === 8 * MIB && drops++ < 4 ? { body: null, status: 0 } : null
+			]
+		});
+
+		await run(t);
+
+		expect(drops).toBeGreaterThanOrEqual(4);
+		expect(t.ceilings).toEqual([]);
+		expect(t.finished?.state).toBe(AdminUploadSendState.DONE);
+	});
+
+	it('reads the session after a 5xx page of a proxy (not the JSON of the server)', async () => {
+		let once = true;
+
+		const t = setup([4 * MIB], {
+			hooks: [
+				() => {
+					if (!once) return null;
+
+					once = false;
+
+					return { body: null, status: 502 };
+				}
+			]
+		});
+
+		await run(t);
+
+		expect(t.server.gets).toBeGreaterThanOrEqual(1);
+		expect(t.finished?.state).toBe(AdminUploadSendState.DONE);
+		expect(sameBytes(t, 0)).toBe(true);
+	});
+
+	it('learns from the session that another tab sends when a proxy turns the refusal into a 502', async () => {
+		let first = true;
+
+		const t = setup([20 * MIB], {
+			hooks: [
+				(_request, server) => {
+					if (!first) return null;
+
+					first = false;
+					server.lastClientAt = server.clock.now(); // the other tab wrote a moment ago
+
+					return { body: null, status: 502 };
+				}
+			]
+		});
+
+		await run(t, () => stateOf(t) === AdminUploadSendState.OTHER_CLIENT);
+
+		expect(t.server.gets).toBe(1);
+		expect(stateOf(t)).toBe(AdminUploadSendState.OTHER_CLIENT);
+		t.scheduler.stop();
+	});
+
 	it('asks for the file when it was not picked again, then continues', async () => {
 		const t = setup([3 * MIB], { files: [{ blob: null }], stored: [MIB] });
 

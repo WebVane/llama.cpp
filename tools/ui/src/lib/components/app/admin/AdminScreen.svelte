@@ -121,7 +121,31 @@
 	});
 
 	onDestroy(() => adminStore.leave());
+
+	/*
+	 * A file dropped where the admin page does not take it (its header, the
+	 * overlay of a dialog ...) would make the browser open the file and leave
+	 * the page, uploads in progress included: such drags are refused. The
+	 * drop areas of the page and its dialogs handle theirs first.
+	 */
+	function isUnhandledFileDrag(event: DragEvent): boolean {
+		return !event.defaultPrevented && !!event.dataTransfer?.types.includes('Files');
+	}
+
+	function refuseFileDrag(event: DragEvent) {
+		if (!isUnhandledFileDrag(event)) return;
+
+		event.preventDefault();
+
+		if (event.dataTransfer) event.dataTransfer.dropEffect = 'none';
+	}
+
+	function refuseFileDrop(event: DragEvent) {
+		if (isUnhandledFileDrag(event)) event.preventDefault();
+	}
 </script>
+
+<svelte:window ondragover={refuseFileDrag} ondrop={refuseFileDrop} />
 
 <div class="mx-auto flex w-full max-w-6xl flex-col gap-4 px-4 pt-14 pb-10 md:pt-6">
 	<header class="flex flex-wrap items-center justify-between gap-3">

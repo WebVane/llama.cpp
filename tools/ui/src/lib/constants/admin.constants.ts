@@ -335,6 +335,8 @@ export const ADMIN_UPLOAD = {
 	OVERLAP_BYTES: MIB,
 	/** Session poll while the server checks or publishes */
 	POLL_CHECKING_MS: 1_000,
+	/** List poll while a queued model waits for a free upload slot (the server's max_sessions) */
+	POLL_SLOT_MS: 10_000,
 	/** Session poll while chunks are sent: the header checks of the files */
 	POLL_UPLOADING_MS: 4_000,
 	/** No answer this long after the whole chunk was sent: treated as a network error */

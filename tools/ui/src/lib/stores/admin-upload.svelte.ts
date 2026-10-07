@@ -17,7 +17,7 @@
 
 import { browser } from '$app/environment';
 import { ADMIN_UPLOAD, ADMIN_UPLOAD_STORAGE } from '$lib/constants';
-import { AdminFeature, AdminNoticeLevel } from '$lib/enums';
+import { AdminErrorType, AdminFeature, AdminNoticeLevel } from '$lib/enums';
 import {
 	AdminAddModelTab,
 	AdminUploadFileRole,
@@ -39,12 +39,14 @@ import type {
 	ApiAdminUploadCreateResult,
 	ApiAdminUploadInfo,
 	ApiAdminUploadSession,
+	ApiAdminUploadSessionResult,
 	ApiAdminUploadSummary
 } from '$lib/types/admin-upload';
 import { crc32, crc32Hex } from '$lib/utils/admin-crc32';
 import {
 	describeUploadBlock,
 	describeUploadRejection,
+	describeUploadSlotWait,
 	isJobFinished,
 	jobPhaseOf,
 	openUploadSessions
@@ -121,9 +123,16 @@ class AdminUploadStore {
 	private jobSeq = 0;
 	private keyListener: (() => void) | null = null;
 	private lastPoll = new Map<string, number>();
+	private lastSlotPoll = 0;
 	private pollTimer: ReturnType<typeof setTimeout> | null = null;
 	private pumping = false;
 	private schedulers = new Map<string, AdminUploadScheduler>();
+	/**
+	 * A create was refused with too_many_uploads: the queue waits until one of
+	 * these open sessions of the server ends (their ids from the refusal; an
+	 * empty set: until fewer than max_sessions are open). null: not waiting.
+	 */
+	private slotWait: Set<string> | null = null;
 	private transport: AdminUploadTransport | null = null;
 	private unloadListening = false;
 
@@ -281,17 +290,35 @@ class AdminUploadStore {
 		if (job && !isJobFinished(job.phase)) return;
 
 		this.jobs = this.jobs.filter((item) => item.key !== key);
+		void this.pump();
 	}
 
-	/** Drop one file from a job (a wrong pick the server refused); the rest continues. */
+	/** Drop one file from a job (a wrong pick the server refused); the rest continues. Throws. */
 	async dropFile(key: string, index: number): Promise<void> {
 		const job = this.job(key);
 
 		if (!job?.sessionId) return;
 
-		const result = await adminStore.runWithKey((k) =>
-			AdminService.updateUpload(k, { drop_files: [index], id: job.sessionId as string })
-		);
+		let result: ApiAdminUploadSessionResult;
+
+		try {
+			result = await adminStore.runWithKey((k) =>
+				AdminService.updateUpload(k, { drop_files: [index], id: job.sessionId as string })
+			);
+		} catch (error) {
+			if (error instanceof AdminApiError && error.status === 409 && error.type === 'upload_busy') {
+				// the session moved on meanwhile: show where it is now
+				await this.refreshJob(key);
+
+				if (error.details?.staged === true) {
+					throw new Error(
+						'The files of this upload were already checked and arranged for publishing together, so a file cannot be dropped any more: cancel the upload and upload the model again without that file.'
+					);
+				}
+			}
+
+			throw error;
+		}
 
 		this.applySession(key, result.upload);
 
@@ -421,6 +448,7 @@ class AdminUploadStore {
 			try {
 				this.info = await adminStore.runWithKey((k) => AdminService.getUploads(k));
 				this.infoError = null;
+				this.checkSlotWait();
 			} catch (error) {
 				this.infoError = errorText(error);
 			}
@@ -550,6 +578,8 @@ class AdminUploadStore {
 		job.phase = AdminUploadJobPhase.QUEUED;
 		job.error = null;
 		job.errorType = null;
+		// asked by the admin: try now, even while the queue waits for a free upload slot
+		this.slotWait = null;
 		void this.pump();
 	}
 
@@ -636,14 +666,65 @@ class AdminUploadStore {
 			job.sessionId = session.id;
 			job.session = session;
 			job.phase = AdminUploadJobPhase.UPLOADING;
+			job.error = null;
+			job.errorType = null;
 			this.startScheduler(job, false);
 			void this.loadInfo();
 		} catch (error) {
+			if (error instanceof AdminApiError && error.type === AdminErrorType.TOO_MANY_UPLOADS) {
+				// the server's limit of open uploads: the job stays queued until one of them ends
+				// (published, cancelled, expired); pump() waits for that, see slotFreed()
+				const listed = Array.isArray(error.details?.sessions)
+					? (error.details.sessions as { id?: unknown }[])
+					: [];
+				const ids = listed
+					.map((session) => session?.id)
+					.filter((id): id is string => typeof id === 'string' && id.length > 0);
+				const first = job.errorType !== AdminErrorType.TOO_MANY_UPLOADS;
+
+				job.phase = AdminUploadJobPhase.QUEUED;
+				job.errorType = AdminErrorType.TOO_MANY_UPLOADS;
+				job.error = describeUploadSlotWait(
+					ids.length > 0 ? ids.length : (this.info?.limits.max_sessions ?? null)
+				);
+				this.slotWait = new Set(ids);
+				this.lastSlotPoll = Date.now();
+
+				if (first) toast.info(`${job.name} waits in the queue: ${job.error}`);
+
+				// a session may have ended between the refusal and now
+				void this.loadInfo();
+				this.schedulePoll();
+
+				return;
+			}
+
 			job.phase = AdminUploadJobPhase.FAILED;
 			job.error = errorText(error);
 			job.errorType = error instanceof AdminApiError ? error.type : null;
 			toast.error(`The upload of ${job.name} could not start: ${job.error}`);
 		}
+	}
+
+	/** The queue waits for a free upload slot: go on when a session of the refusal ended. */
+	private checkSlotWait(): void {
+		if (!this.slotWait || !this.info) return;
+
+		const open = openUploadSessions(this.info.sessions ?? []);
+		const freed =
+			this.slotWait.size > 0
+				? [...this.slotWait].some((id) => !open.some((session) => session.id === id))
+				: open.length < this.info.limits.max_sessions;
+
+		if (freed) this.slotFreed();
+	}
+
+	/** An upload session of the server ended: a job waiting for a free slot may start. */
+	private slotFreed(): void {
+		if (!this.slotWait) return;
+
+		this.slotWait = null;
+		void this.pump();
 	}
 
 	private job(key: string): AdminUploadJob | undefined {
@@ -777,6 +858,9 @@ class AdminUploadStore {
 				break;
 		}
 
+		// its session ended: one upload slot of the server is free again
+		if (job.sessionId && isJobFinished(job.phase)) this.slotWait = null;
+
 		void this.loadInfo();
 		void this.pump();
 	}
@@ -822,6 +906,12 @@ class AdminUploadStore {
 	private async pollOnce(): Promise<void> {
 		const now = Date.now();
 
+		// waiting for a free upload slot: the sessions that hold them may end in another tab
+		if (this.isWaitingForSlot() && now - this.lastSlotPoll >= ADMIN_UPLOAD.POLL_SLOT_MS) {
+			this.lastSlotPoll = now;
+			await this.loadInfo();
+		}
+
 		for (const job of [...this.jobs]) {
 			if (!job.sessionId || isJobFinished(job.phase)) continue;
 
@@ -839,31 +929,47 @@ class AdminUploadStore {
 		}
 	}
 
-	/** Advance the queue: create the next session when nothing is being sent. */
+	/**
+	 * Advance the queue: create the next session when nothing is being sent.
+	 * A create that fails leaves its job FAILED and the next one is tried at
+	 * once; a create refused with too_many_uploads keeps its job queued and the
+	 * queue waits for a free slot (slotFreed).
+	 */
 	private async pump(): Promise<void> {
 		if (this.pumping) return;
 
 		this.pumping = true;
 
 		try {
-			const busy = this.jobs.some(
-				(job) =>
-					job.phase === AdminUploadJobPhase.CREATING ||
-					(job.phase === AdminUploadJobPhase.UPLOADING &&
-						job.send?.state !== AdminUploadSendState.DONE &&
-						job.files.some((file) => file.file))
-			);
+			while (!this.slotWait) {
+				const busy = this.jobs.some(
+					(job) =>
+						job.phase === AdminUploadJobPhase.CREATING ||
+						(job.phase === AdminUploadJobPhase.UPLOADING &&
+							job.send?.state !== AdminUploadSendState.DONE &&
+							job.files.some((file) => file.file))
+				);
 
-			if (busy) return;
+				if (busy) break;
 
-			const next = this.jobs.find((job) => job.phase === AdminUploadJobPhase.QUEUED);
+				const next = this.jobs.find((job) => job.phase === AdminUploadJobPhase.QUEUED);
 
-			if (next) await this.createSession(next);
+				if (!next) break;
+
+				await this.createSession(next);
+			}
 		} finally {
 			this.pumping = false;
 		}
 
 		this.updateUnloadGuard();
+	}
+
+	/** A queued job waits because the server has its maximum of open uploads. */
+	private isWaitingForSlot(): boolean {
+		return (
+			this.slotWait !== null && this.jobs.some((job) => job.phase === AdminUploadJobPhase.QUEUED)
+		);
 	}
 
 	/** Read one job's session again. */
@@ -886,6 +992,7 @@ class AdminUploadStore {
 				this.schedulers.get(key)?.stop();
 				this.schedulers.delete(key);
 				this.updateUnloadGuard();
+				this.slotFreed();
 			}
 		}
 	}
@@ -935,13 +1042,15 @@ class AdminUploadStore {
 	private schedulePoll(): void {
 		if (this.pollTimer) return;
 
-		const needed = this.jobs.some(
-			(job) =>
-				job.sessionId &&
-				!isJobFinished(job.phase) &&
-				job.phase !== AdminUploadJobPhase.READY &&
-				job.phase !== AdminUploadJobPhase.QUEUED
-		);
+		const needed =
+			this.isWaitingForSlot() ||
+			this.jobs.some(
+				(job) =>
+					job.sessionId &&
+					!isJobFinished(job.phase) &&
+					job.phase !== AdminUploadJobPhase.READY &&
+					job.phase !== AdminUploadJobPhase.QUEUED
+			);
 
 		if (!needed) return;
 
@@ -981,10 +1090,12 @@ class AdminUploadStore {
 					size: file.size
 				};
 			}),
-			onCeiling: (ceiling, proxy) => {
+			// a ceiling found by a proxy's 413 or by connections dropped on a size: kept for the
+			// browser session, so a reload (or the next model) does not have to find it again
+			onCeiling: (ceiling) => {
 				this.ceiling = ceiling;
 
-				if (!proxy || !browser) return;
+				if (!browser) return;
 
 				try {
 					sessionStorage.setItem(ADMIN_UPLOAD_STORAGE.CHUNK_CEILING, String(ceiling));

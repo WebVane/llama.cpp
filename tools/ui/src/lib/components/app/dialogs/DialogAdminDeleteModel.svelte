@@ -48,6 +48,10 @@
 	);
 	let confirmed = $derived(mode === 'projector' || typed.trim() === modelId);
 	let keptHidden = $derived(preview ? Math.max(0, preview.n_kept - preview.kept.length) : 0);
+	/** Every kept entry is a projector or draft set for all models (none from the model's folder) */
+	let sharedOnly = $derived(
+		!!preview && preview.kept.length > 0 && preview.kept.every((entry) => entry.shared)
+	);
 
 	$effect(() => {
 		const key = open && modelId ? `${modelId}|${projectorOnly}` : '';
@@ -236,8 +240,11 @@
 			{:else if preview}
 				<div class="flex flex-col gap-4 text-sm">
 					<div>
-						<p class="mb-1 text-xs font-medium text-muted-foreground">
-							{mode === 'projector' ? 'Removed' : 'Deleted'} ({preview.n_files} file{preview.n_files ===
+						<p
+							class="mb-1 text-xs font-medium text-muted-foreground"
+							data-testid="delete-files-heading"
+						>
+							{mode === 'projector' ? 'Will be removed' : 'Will be deleted'} ({preview.n_files} file{preview.n_files ===
 							1
 								? ''
 								: 's'}, {formatBytes(preview.total_bytes)})
@@ -265,19 +272,31 @@
 					{#if preview.n_kept > 0}
 						<div data-testid="delete-kept">
 							<p class="mb-1 text-xs font-medium text-muted-foreground">
-								Kept: not part of this model ({preview.n_kept} entr{preview.n_kept === 1
-									? 'y'
-									: 'ies'}{preview.kept_bytes ? `, ${formatBytes(preview.kept_bytes)}` : ''})
+								Kept: {sharedOnly ? 'used by every model' : 'not part of this model'} ({preview.n_kept}
+								entr{preview.n_kept === 1 ? 'y' : 'ies'}{preview.kept_bytes
+									? `, ${formatBytes(preview.kept_bytes)}`
+									: ''})
 							</p>
 
 							<ul
 								class="flex max-h-40 flex-col divide-y overflow-y-auto rounded-md border border-dashed"
 							>
 								{#each preview.kept as entry (entry.path)}
-									<li class="flex items-center gap-2 px-3 py-1.5 text-muted-foreground">
+									<li
+										class="flex items-center gap-2 px-3 py-1.5 text-muted-foreground"
+										data-shared={entry.shared ? 'true' : undefined}
+									>
 										<span class="min-w-0 flex-1 truncate font-mono text-xs" title={entry.path}
 											>{entry.path}</span
 										>
+
+										{#if entry.shared}
+											<Badge
+												class="font-normal"
+												title="Set for every model (router command line or [*] of models.ini): not deleted from here"
+												variant="outline">used by every model</Badge
+											>
+										{/if}
 
 										<span class="text-xs"
 											>{entry.kind === 'file' ? formatBytes(entry.bytes ?? 0) : entry.kind}</span
@@ -289,14 +308,14 @@
 							{#if keptHidden > 0}
 								<p class="mt-1 text-xs text-muted-foreground">... and {keptHidden} more.</p>
 							{/if}
-
-							{#if preview.folder}
-								<p class="mt-1 text-xs text-muted-foreground">
-									The folder <span class="font-mono">{preview.folder}</span> stays because it holds other
-									files.
-								</p>
-							{/if}
 						</div>
+					{/if}
+
+					{#if preview.folder && !preview.folder_removed && preview.kept.some((entry) => !entry.shared)}
+						<p class="text-xs text-muted-foreground">
+							The folder <span class="font-mono">{preview.folder}</span> stays because it holds other
+							files.
+						</p>
 					{:else if preview.folder && preview.folder_removed}
 						<p class="text-xs text-muted-foreground">
 							The folder <span class="font-mono">{preview.folder}</span> is removed too (nothing else

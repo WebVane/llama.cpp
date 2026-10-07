@@ -51,6 +51,12 @@
 		{ icon: Download, id: AdminAddModelTab.HUGGING_FACE, label: 'Hugging Face' },
 		{ icon: Upload, id: AdminAddModelTab.UPLOAD, label: 'Upload GGUF' }
 	];
+	/** One panel for both tabs: it shows the content of the selected one */
+	const TAB_PANEL_ID = 'admin-add-model-panel';
+
+	function tabId(id: AdminAddModelTab): string {
+		return `admin-add-model-tab-${id}`;
+	}
 
 	let input = $state('');
 	let check = $state<ApiAdminDownloadCheck | null>(null);
@@ -190,6 +196,39 @@
 		if (shownTab === AdminAddModelTab.HUGGING_FACE && repoInput) repoInput.focus();
 		else content?.focus();
 	}
+
+	function isFileDrag(event: DragEvent): boolean {
+		return !!event.dataTransfer?.types.includes('Files');
+	}
+
+	/**
+	 * Files dragged anywhere over the dialog: the Upload tab takes them (the
+	 * browser would otherwise open the file and the dialog would be lost).
+	 * Without the upload routes nothing is accepted.
+	 */
+	function handleDragOver(event: DragEvent) {
+		// the dropzone of the Upload tab handled it already
+		if (event.defaultPrevented || !isFileDrag(event)) return;
+
+		event.preventDefault();
+
+		if (event.dataTransfer) event.dataTransfer.dropEffect = uploadEnabled ? 'copy' : 'none';
+	}
+
+	function handleDrop(event: DragEvent) {
+		if (event.defaultPrevented || !isFileDrag(event)) return;
+
+		event.preventDefault();
+
+		const dropped = [...(event.dataTransfer?.files ?? [])];
+
+		if (!uploadEnabled || dropped.length === 0) return;
+
+		// the Upload tab groups them: added to the files under review, or a new review
+		tab = AdminAddModelTab.UPLOAD;
+		void adminUploadStore.loadInfo();
+		files = dropped;
+	}
 </script>
 
 <Dialog.Root onOpenChange={handleOpenChange} {open}>
@@ -203,6 +242,8 @@
 				: 'w-[calc(100%-2rem)]! max-w-xl!'
 		]}
 		data-testid="admin-add-model"
+		ondragover={handleDragOver}
+		ondrop={handleDrop}
 		onOpenAutoFocus={handleOpenAutoFocus}
 		tabindex={-1}
 	>
@@ -236,6 +277,7 @@
 					{@const TabIcon = item.icon}
 
 					<button
+						aria-controls={TAB_PANEL_ID}
 						aria-selected={shownTab === item.id}
 						class={[
 							'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors',
@@ -244,6 +286,7 @@
 								: 'text-muted-foreground hover:text-foreground'
 						]}
 						data-tab={item.id}
+						id={tabId(item.id)}
 						onclick={() => selectTab(item.id)}
 						onkeydown={handleTabKeydown}
 						role="tab"
@@ -259,11 +302,21 @@
 		{/if}
 
 		{#if shownTab === AdminAddModelTab.UPLOAD}
-			<div class="-mx-6 min-h-0 flex-1 overflow-y-auto px-6 pb-1">
+			<div
+				aria-labelledby={tabId(AdminAddModelTab.UPLOAD)}
+				class="-mx-6 min-h-0 flex-1 overflow-y-auto px-6 pb-1"
+				id={TAB_PANEL_ID}
+				role="tabpanel"
+			>
 				<AdminUploadTab {files} onFilesTaken={() => (files = null)} {onOpenSettings} />
 			</div>
 		{:else}
-			<div class="space-y-4">
+			<div
+				aria-labelledby={uploadEnabled ? tabId(AdminAddModelTab.HUGGING_FACE) : undefined}
+				class="space-y-4"
+				id={uploadEnabled ? TAB_PANEL_ID : undefined}
+				role={uploadEnabled ? 'tabpanel' : undefined}
+			>
 				<div class="space-y-2">
 					<Label for="admin-add-model">Repository</Label>
 

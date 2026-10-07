@@ -974,19 +974,50 @@ export interface AdminFailureText {
 	hint: string;
 }
 
+/** An error line about the projector (mmproj): clip / mtmd, "failed to load multimodal model". */
+const PROJECTOR_LINE = /mmproj|multimodal model|\bclip[_:.]|\bmtmd[_:]/i;
+const ERROR_WORDS = /error|fail|mismatch|wrong|unable|invalid|cannot|not supported/i;
+
+/** The output of a failed start says that the projector (mmproj) could not be used. */
+export function failureMentionsProjector(
+	reason: ApiAdminFailureReason | null | undefined,
+	lines: readonly string[] = []
+): boolean {
+	return [reason?.line ?? '', ...lines].some(
+		(line) => PROJECTOR_LINE.test(line) && ERROR_WORDS.test(line)
+	);
+}
+
 export function describeFailureReason(
-	reason: ApiAdminFailureReason | null | undefined
+	reason: ApiAdminFailureReason | null | undefined,
+	context: {
+		/** Output tail of the failed instance */
+		lines?: readonly string[];
+		/** A models_dir model: "Delete files..." can remove only its projector */
+		projectorRemovable?: boolean;
+	} = {}
 ): AdminFailureText {
+	// a projector that does not fit the model (n_embd, a damaged file) makes every start fail,
+	// and the generic "model could not be loaded" points at the wrong file
+	const projector =
+		reason?.code !== AdminFailureCode.OUT_OF_MEMORY &&
+		reason?.code !== AdminFailureCode.INVALID_DEVICE &&
+		failureMentionsProjector(reason, context.lines)
+			? context.projectorRemovable
+				? 'The projector (mmproj) may not match this model: Delete files... -> Remove only the projector keeps the model.'
+				: 'The projector (mmproj) may not match this model: check the projector set for it.'
+			: null;
+
 	if (!reason) {
 		return {
-			hint: 'Show the output for details.',
+			hint: [projector, 'Show the output for details.'].filter(Boolean).join(' '),
 			label: ADMIN_FAILURE_LABELS[AdminFailureCode.UNKNOWN],
 			message: 'The model stopped before it was ready.'
 		};
 	}
 
 	const label = ADMIN_FAILURE_LABELS[reason.code as AdminFailureCode] ?? reason.code;
-	const hints = [reason.hint];
+	const hints = projector ? [projector] : [reason.hint];
 
 	if (reason.hints?.includes('memory_tight')) {
 		hints.push('llama.cpp warned that memory was tight while it planned the load.');

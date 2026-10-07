@@ -93,7 +93,11 @@
 			states.every((state) => state?.request)
 	);
 
-	// files handed over by the dialog (dropped on the Models tab)
+	// the files of the current review, and files dropped while their headers were being read
+	let reviewFiles: File[] = [];
+	let pendingFiles: File[] = [];
+
+	// files handed over by the dialog (dropped on the Models tab or on the dialog)
 	$effect(() => {
 		const handed = files;
 
@@ -101,13 +105,41 @@
 
 		untrack(() => {
 			onFilesTaken?.();
-			void processFiles(handed);
+			addFiles(handed);
 		});
 	});
+
+	function sameFile(a: File, b: File): boolean {
+		return a.name === b.name && a.size === b.size && a.lastModified === b.lastModified;
+	}
+
+	/**
+	 * Files dropped on the dialog: during a review they join the files under
+	 * review (a forgotten projector or part) and everything is grouped again;
+	 * otherwise they start a new review.
+	 */
+	function addFiles(more: File[]) {
+		if (reading) {
+			pendingFiles = [...pendingFiles, ...more];
+
+			return;
+		}
+
+		if (mode === 'review' && grouping) {
+			const added = more.filter((file) => !reviewFiles.some((known) => sameFile(known, file)));
+
+			if (added.length > 0) void processFiles([...reviewFiles, ...added]);
+
+			return;
+		}
+
+		void processFiles(more);
+	}
 
 	async function processFiles(picked: File[]) {
 		if (picked.length === 0 || reading) return;
 
+		reviewFiles = picked;
 		reading = true;
 		mode = 'review';
 		grouping = null;
@@ -142,6 +174,13 @@
 		projectorChoice = choice;
 		grouping = result;
 		reading = false;
+
+		if (pendingFiles.length > 0) {
+			const more = pendingFiles;
+
+			pendingFiles = [];
+			addFiles(more);
+		}
 	}
 
 	function onPicked(event: Event) {

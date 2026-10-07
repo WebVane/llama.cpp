@@ -34,7 +34,7 @@ The admin layer adds an API under `/admin` and an **Admin** page to the web UI
 | See all models, load / unload them, download a model from Hugging Face, delete a downloaded model, rescan the model directories | Admin page, **Models** tab. Uses the server's *existing* model routes. |
 | Check a download before starting it: which files, how big, is there enough disk space | `POST /admin/models/download/check` |
 | Upload GGUF files from the browser: one model (a file or a split set, with or without its projector) or several at once; it continues after a dropped connection, a reload of the page or a restart of the server; this server build checks the files before the model appears, and the GPU and context are chosen before its first start | Models tab, **Add model** -> **Upload GGUF**, or drop the files onto the tab; `/admin/models/upload`, see [16](#16-uploading-gguf-files) |
-| Delete a model of the models directory (uploaded or dropped in by hand): only the files it uses; or remove only its projector | Models tab, **Delete files...**; `POST /admin/models/delete`, see [17](#17-deleting-models-of-the-models-directory) |
+| Delete a model of the models directory (uploaded or dropped in by hand): only the files it uses; or remove only its projector | Models tab, **Delete files**; `POST /admin/models/delete`, see [17](#17-deleting-models-of-the-models-directory) |
 | Change the maximum number of loaded models without a restart | `POST /admin/settings` (`models_max`) |
 | Choose the GPU for models that were added later (downloaded or dropped in) | `POST /admin/settings` (`default_device`) |
 | Pin models so they are never unloaded to make room for another one | `POST /admin/settings` (`pinned`) |
@@ -58,7 +58,6 @@ directory or downloaded, no longer stops the server at start-up or at a rescan (
 model is listed without image / audio input and the log names the file); and a download
 with `POST /models` no longer takes an `@` in a file path of the repository for the user
 part of the URL, which could send the request, with `HF_TOKEN`, to another host.
-<!-- s3-recheck: B.5a (typed mmproj pre-check before update_caps: listed as "no multimodal" + warning) and B.5b (the @ user-info fix in common/http.h) as implemented. -->
 
 It works the same in the unlicensed (`:dev`) and the licensed (`:release`) image, and
 in a build made from source. Admin requests are never counted against the license
@@ -562,20 +561,21 @@ The web UI decides with the status probe `GET /admin/status`
 | The probe answers | Admin item | A direct visit to `#/admin` |
 |---|---|---|
 | `200`: the admin layer is on and the address is allowed | shown | the Admin page; it asks for the key when it has none |
-| `403`: the address is refused by nginx (`ADMIN_ALLOW_RULES`, or the `geo` list of the host site) or by the server's own allow-list (`PROVISION_ADMIN_ALLOW_FROM`) | hidden | goes to the start page of the chat, without a message. Only a browser that holds a saved admin key (for this browser session, or "Remember on this device") gets the Admin page with the explanation, in which the server's message names the address it saw |
+| `403`: the address is refused by nginx (`ADMIN_ALLOW_RULES`, or the `geo` list of the host site) or by the server's own allow-list (`PROVISION_ADMIN_ALLOW_FROM`) | hidden | goes to the start page of the chat, without a message. Only a browser that holds an admin key (entered in this tab, kept for the browser session, or saved with "Remember on this device") gets the Admin page with the explanation "Admin API is not available from this address", in which the server's message names the address it saw |
 | `404`: the admin layer is off, or the server is older than the admin panel | hidden | the Admin page says that the admin API is not available |
+| no answer (the server is down or unreachable) | hidden | the Admin page says that the admin API is not available, with **Retry** |
 
 - With no allow-list configured (the default of a host without nginx) the item is shown
   to everyone who can reach the server, as before; they still need the key.
 - When an admin request answers `403` later in the session (the allow-list was changed,
   the client moved to another address, a VPN reconnected with another one), the item
-  disappears at once, without a reload.
+  disappears at once, without a reload. An Admin page that is open at that moment
+  switches to "Admin API is not available from this address" with the server's message,
+  **Retry** and **Back to chat**; a tab that holds no admin key goes back to the chat.
 - A `401` (no or a wrong key) does not hide the item: the Admin page asks for the key.
 - Hiding the item is a convenience, not a lock. The locks are the address allow-list and
   the admin key ([4.1](#41-address-allow-list-nginx) to
   [4.3](#43-built-in-address-allow-list-hosts-without-nginx)).
-
-<!-- s3-recheck: B.8 as implemented in the UI: the "saved admin key" condition (sessionStorage and/or localStorage), what a refused direct visit with a saved key shows, what happens to an open Admin page on a mid-session 403, and the 404 / network-error rows (unchanged stage-1 behaviour). -->
 
 ## 5. Settings
 
@@ -860,7 +860,7 @@ a phase:
   model goes back to the `models.ini` / inherited values. The confirmation lists every
   field with its old and new value. The restart rules of [6.5](#65-saving-and-restarting)
   apply. API: `POST /admin/models/settings` with `reset: true`.
-- **Delete** of a downloaded model, and **Delete files...** of a model of the models
+- **Delete** of a downloaded model, and **Delete files** of a model of the models
   directory ([17](#17-deleting-models-of-the-models-directory)), ask "Also remove its
   saved settings" (ticked by default). Without it, a later download or upload of a model
   with the same id gets the old settings back (an upload asks first, see
@@ -952,32 +952,39 @@ group of the settings: GPU, context size and parallel requests, with the role
 become visible the server saves them as the model's per-model settings (phase
 `pending`), so the first start of the model already uses them, and the trial, commit and
 automatic revert of [6.6](#66-trial-commit-and-automatic-revert) apply as to any saved
-value. Everything else is set later in the Settings dialog. Cancelling the upload, a
-rejected file or the expiry of the upload drops the values with it.
+value. Everything else is set later in the Settings dialog. Cancelling the upload, its
+rejection or its expiry drops the values with it. The values are checked again right
+before publishing, against the GPUs and locks of that moment (`settings_invalid` when
+one no longer fits, for example its GPU is gone).
 
 - **Locks.** A field that is locked for every new model, the GPU by a `MODEL_DEVICES`
-  `*=` entry or any key given on the router command line ([6.4](#64-locked-fields)), is
-  shown with its lock; a value for it is refused (`409 field_locked`).
-  <!-- s3-recheck: spec C.1 - lock for a not-yet-listed id synthesised from [*] + router CLI at create, or (fallback) only shown after publish "and say so". -->
+  `*=` entry in the `[*]` section of `models.ini` or any key given on the router command
+  line ([6.4](#64-locked-fields)), is shown with its lock already when the upload is
+  created (`locks` of the create answer, worked out from `[*]` and the command line for
+  the id the model will get); a value for it is refused (`409 field_locked`).
 - **Saved settings of an earlier model with the same id** (deleted or removed with its
   settings kept, an `orphaned` entry of [6.7](#67-removing-custom-settings)): the dialog
-  shows them and asks "keep / start fresh". **Start fresh** (the default) drops them;
-  **Keep** uses them again, with the values of the dialog on top.
+  shows them and asks "Start fresh" / "Keep them". **Start fresh** (the default) drops
+  them at publishing; **Keep them** uses them again, with the values of the dialog on
+  top. Either way the entry is saved again as `pending`, so the first start of the new
+  files is a trial with the automatic revert of
+  [6.6](#66-trial-commit-and-automatic-revert).
 - **Admin state directory not writable.** The values cannot be saved, so they would be
   lost at the next restart of the server. The dialog says so when the upload is
   created, and the upload stops before publishing as `ready` (`settings_not_saved`):
   publish it without the placement (the model then starts with its inherited values), or
   fix the directory and publish.
-- **After publishing**, when a placement was chosen, the dialog runs the fit check
-  ([8](#8-will-it-fit)) of the new model at once. Before the upload only a rough
-  estimate from the file sizes is possible.
+- **After publishing**, when a placement was chosen, the upload card runs the fit check
+  ([8](#8-will-it-fit)) of the new model at once and shows its verdict; without a
+  placement it runs no fit check (**Open settings** has the full check). Before the
+  upload only a rough estimate from the file sizes is possible.
 
 **Downloaded models.** The download dialog has no placement of its own. When a download
-started from the Admin page finishes, the page opens the Settings dialog of the new
-model, so its GPU and context can be set right away. Until they are saved, a downloaded
-model gets "GPU for new models" ([5.3](#53-gpu-for-new-models-default_device)) and the
-`[*]` defaults of `models.ini`.
-<!-- s3-recheck: B.4 - when exactly the settings dialog opens after a download (successful download_finished only, only while the Admin page is open in that tab?). -->
+finishes successfully while the Admin page is open, the page opens the Settings dialog
+of the new model (as soon as no other dialog is open), so its GPU and context can be set
+right away. A failed or cancelled download, or one that ends while the page is closed,
+opens nothing. Until they are saved, a downloaded model gets "GPU for new models"
+([5.3](#53-gpu-for-new-models-default_device)) and the `[*]` defaults of `models.ini`.
 
 ## 7. GPUs and memory
 
@@ -1188,8 +1195,8 @@ provision-llm` show; it is available only with the admin key.
 A model of the models directory whose projector does not fit it (the wrong `mmproj` file
 was uploaded or dropped in; the upload checks cannot see that,
 [16.4](#164-checks-before-the-model-becomes-visible)) fails at every start.
-**Remove projector** ([17.4](#174-remove-projector)) keeps the model and drops only the
-projector.
+**Delete files** -> **Remove only the projector** ([17.4](#174-remove-projector)) keeps
+the model and drops only the projector.
 
 ## 10. Diagnostics
 
@@ -1257,15 +1264,26 @@ upload with its `.part` files, and moves the files of a deleted model into a `tr
 subfolder there before it removes them. The model list never shows anything from it:
 the scan looks only at the files directly inside the first level of subfolders, and this
 folder holds only folders. Do not put files into it, do not edit it and do not mount
-anything over it; the server removes what it no longer needs (an upload 72 hours after
-its last progress, counted while the server runs; a subfolder without an upload record
-after an hour; a trash folder at once). The record of each upload (name, settings,
-state) is kept in the admin state directory; the folder holds only the data. It must be
-on the same filesystem as the models directory, which the server checks. `GET
-/admin/storage` lists the uploads with their size. Several servers that share one
-models directory leave each other's uploads alone ([16.6](#166-resuming)); each of them
-must be able to list this folder.
-<!-- s3-recheck: name/location of the upload records in the state dir, the sweep rules (1 h for folders without a record, trash at once) and the group-readable mode of .provision-upload. -->
+anything over it; the server removes what it no longer needs: an upload 72 hours after
+its last progress, counted while the server runs; a trash folder as soon as it is
+written (and a leftover one at the next start); a subfolder that belongs to no upload
+after an hour, unless another server holds it (see below). Each upload subfolder holds
+its `.part` files, a `.lock` file and a `session.json` hint (offsets only, the id of
+the server that writes it and how long the upload has been idle); the server checks the
+hint against the files and never trusts it alone. The record of each upload (name,
+settings, state) is `<state dir>/uploads/<id>.json` in the admin state directory, next
+to `<state dir>/uploads/owner`, the id this server writes into its hints; the folder
+holds only the data. It must be on the same filesystem as the models directory, which
+the server checks. `GET /admin/storage` lists the uploads with their size.
+
+Several servers that share one models directory leave each other's uploads alone
+([16.6](#166-resuming)): a server never takes over or removes an upload whose hint names
+another server; it removes such a folder only when that upload could have expired
+(72 hours minus the idle time in its hint) plus 24 hours have passed since its hint was
+last written, and only when no process holds its lock. Each of them must be able to
+list this folder: on Linux the server gives `.provision-upload` and its subfolders mode
+`0770` and its files `0660` (group read and write); see **Ownership** below for the
+owner and group.
 
 Both kinds of added models start with the `[*]` defaults of `models.ini` (context
 size, GPU layers, flash attention, offline) plus the GPU from
@@ -1286,21 +1304,30 @@ mkdir -p models-rw/hf models-rw/local
 If they are missing, the entrypoint creates them and gives them the owner of
 `models-rw`, which is root when Docker had to create `models-rw` itself.
 
-Files and folders that the server publishes after an upload, and the folders of
-`.provision-upload`, get the owner and group of the models directory (in Docker the
-owner of `local/`), so that you can manage them like files you dropped in yourself.
+Files and folders that the server publishes after an upload, and everything in
+`.provision-upload`, are made group-writable (folders `0770`, files `0660`; folders also
+get the set-group-id bit when the models directory has it). When the server runs as root
+and the models directory belongs to another user (Docker: the owner of `local/`), it also
+gives them the owner and group of the models directory, before they become visible, so
+that you can manage them like files you dropped in yourself. A server that runs as its
+own user (the host installation) keeps its own user and the group the system gives new
+files. Where the owner cannot be changed (for example an NFS share that maps root to
+`nobody`) the upload goes on and carries the warning `chown_failed`. Rootless Docker
+needs nothing: the container's root is your own user on the host.
 
 **Disk space.** There is no quota and no reserve. The pre-flight check compares the
 size of a download with the free space and warns; it never blocks a download. An upload
 does the same ([16.8](#168-disk-space)): it warns, and the server refuses only a write
 that actually fails (`507`, the upload is kept). On the default layouts the models
 directory, the model cache, the admin state and the license state are often on one
-filesystem, so a full disk affects all of them; the upload warns when the models
-directory shares its filesystem with the admin state. The license
-counter is written so that a failed write leaves the previous counter intact: a full
-disk does not make a licensed server report its state as tampered. If a full disk
-would hurt other services, point `MODELS_RW_DIR` at a filesystem of its own.
-<!-- s3-recheck: B.6 license write path (flush/close checked, fsync, never rename a short file) and the shared-filesystem warning of the upload dialog. -->
+filesystem, so a full disk affects all of them; on Linux the upload warns when the models
+directory shares its filesystem with the admin state (it does not compare it with the
+license state or the model cache). The license counter, its ledger, the installed
+license file and the machine id are written so that a failed write leaves the previous
+file intact (every write, the sync and the close are checked, and a short file is never
+renamed over a good one): a full disk does not make a licensed server report its state
+as tampered. If a full disk would hurt other services, point `MODELS_RW_DIR` at a
+filesystem of its own.
 The filesystem should support symbolic links (any native Linux filesystem does);
 without them the cache falls back to moving files and still works.
 
@@ -1460,7 +1487,6 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/status
   says what to do.
 - `features` `upload` and `delete`: the routes of [12.14](#1214-get-adminmodelsupload) to
   [12.18](#1218-post-adminmodelsdelete).
-<!-- s3-recheck: feature names "upload" / "delete" (base §6) and the upload object of /admin/status (base §3.12). -->
 - `state.error`: why the saved settings could not be read; empty when fine.
 - `state.model_settings`: the per-model settings file; `error` says why it could not be
   read, `backup_loaded` that its `.bak` was used instead, `read_only` that saving is
@@ -1564,7 +1590,6 @@ the unfinished uploads ([16](#16-uploading-gguf-files)), each as in the list of
 [12.14](#1214-get-adminmodelsupload) (shortened above) plus what it takes on disk
 (`bytes`); `upload_staging`: the folder of the unfinished uploads, what they take
 together and what still waits in the trash of deleted models (`trash_bytes`).
-<!-- s3-recheck: shape of the additive uploads[] list of /admin/storage (base §3.11). -->
 
 ### 12.5 `POST /admin/models/download/check`
 
@@ -2044,31 +2069,38 @@ curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/models/upload?id=9f1c2b7e4a6d4c0e8b3
 ```json
 {
   "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b",
-  "state": "checking", "substate": "hashing", "blocked_by": null,
+  "state": "checking", "substate": "load_check", "blocked_by": null,
   "total_bytes": 3341008960, "received_bytes": 3341008960, "n_files": 2, "auto_publish": true,
   "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T11:02:00Z",
   "error": null, "blocked": null, "expires_at": null,
   "files": [
     { "index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856, "offset": 2489757856, "durable_offset": 2489757856,
-      "complete": true, "dropped": false, "role": "model", "sha256": null, "sha256_expected": null,
-      "head_crc32": "4a3b2c1d", "final_name": null,
-      "header": { "state": "ok", "arch": "gemma3", "type": "model", "message": "gemma3, 3.9B parameters, Q4_K_M, trained context 131072" },
+      "complete": true, "dropped": false, "role": "model",
+      "sha256": "2f4c8f1e9b0d7a6c5e3b1a9d8c7f6e5d4c3b2a19f8e7d6c5b4a3928170615243", "sha256_expected": null,
+      "head_crc32": "4a3b2c1d", "final_name": "gemma-3-4b.gguf",
+      "header": { "state": "ok", "arch": "gemma3", "type": "model" },
       "error": null },
     { "index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104, "offset": 851251104, "durable_offset": 851251104,
-      "complete": true, "dropped": false, "role": "projector", "sha256": null, "sha256_expected": null,
-      "head_crc32": "9e8f7a6b", "final_name": null,
-      "header": { "state": "ok", "arch": "clip", "type": "mmproj", "message": "projector: vision" },
+      "complete": true, "dropped": false, "role": "projector",
+      "sha256": "8d1e5a7c3b9f2e4d6a8c0b1f3e5d7c9a2b4f6e8d0c1a3b5e7f9d2c4b6a8e0f13", "sha256_expected": null,
+      "head_crc32": "9e8f7a6b", "final_name": "mmproj-gemma-3-4b.gguf",
+      "header": { "state": "ok", "arch": "clip", "type": null },
       "error": null }
   ],
   "settings": { "device": "CUDA1", "ctx-size": "16384" }, "settings_mode": "replace",
-  "plan": null, "facts": null, "result": null, "warnings": [],
+  "plan": { "layout": "folder", "target": "gemma-3-4b", "id": "gemma-3-4b",
+            "files": [ { "index": 0, "final_name": "gemma-3-4b.gguf", "role": "model", "split_no": null },
+                       { "index": 1, "final_name": "mmproj-gemma-3-4b.gguf", "role": "projector", "split_no": null } ] },
+  "facts": { "arch": "gemma3", "name": "Gemma 3 4b It", "n_params": 3880263168, "n_ctx_train": 131072, "n_layer": 34,
+             "file_type": 15, "n_tensors": 444 },
+  "result": null, "warnings": [],
   "idle_ms": 0, "last_client_idle_ms": 1500,
   "recovered": false, "recovered_without_record": false, "record_persisted": true,
   "chunk_max": 16777216, "chunk_default": 8388608,
-  "progress": { "done_bytes": 1610612736, "total_bytes": 3341008960 },
+  "progress": null,
   "checks": [
-    { "step": "header", "file": 0, "status": "ok", "message": "gemma3, 3.9B parameters, Q4_K_M, trained context 131072" },
-    { "step": "header", "file": 1, "status": "ok", "message": "projector: vision" }
+    { "step": "header", "file": 0, "status": "ok", "message": "" },
+    { "step": "header", "file": 1, "status": "ok", "message": "" }
   ]
 }
 ```
@@ -2082,43 +2114,80 @@ Per file (`files[]`):
   restart of the server `offset` goes back to this value.
 - `complete`: `offset` equals `size`. `dropped`: the file was taken out of the upload
   (`drop_files` of [12.17](#1217-post-adminmodelsuploadupdate-publish-cancel)).
-- `role`: `model` or `projector` once the header check has read the file, `null` before.
-- `sha256`: known once the checks have hashed the file; `sha256_expected`: the expected
-  value given at create or update.
+- `role`: `model` or `projector` once the server has read the file's header (`adapter`
+  or `imatrix` for such a file, which is then refused), `null` before.
+- `sha256`: computed while the file is received, so it is there as soon as the file is
+  complete (after a restart of the server it is read again from disk, substate
+  `hashing`); `sha256_expected`: the expected value given at create or update.
 - `head_crc32`: the CRC-32 of the first MiB (8 hexadecimal digits), once that much has
-  arrived: a client can compare it with the file it has before it continues.
-- `final_name`: the name in the models directory, once the classification has decided it.
-- `header`: the header check of this file: `state` (`none`, `scanning`, `queued`, `ok`,
-  `warning`, `failed`, `error`), and what it read (`arch`, `type`, `split` with `no` and
-  `count`, `message`).
-- `error`: why this file cannot be used (`code`, `message`), or `null`.
+  arrived: a client compares it with the file it has before it continues
+  ([16.6](#166-resuming)); `null` when the server does not know it (then send the first
+  MiB with `verify=1`, [12.16](#1216-post-adminmodelsuploadchunk)).
+- `final_name`: the name in the models directory, decided by the classification as soon
+  as the header of every file is known (possibly while other files are still sent).
+- `header`: the header check of this file. `state`: `none` (no bytes yet), `scanning`
+  (waiting for the rest of the metadata), `queued`, `ok`, `warning` (the metadata alone
+  did not load; decided by the load check at the end), `failed` (the check could not run;
+  it runs again), `error` (the file is refused, see `error`). Once the metadata was read:
+  `arch` and `type`, the file's `general.architecture` and `general.type` as the converter
+  wrote them (`model`, `adapter`, `imatrix`; projectors often have none or an older value
+  such as `clip-vision`), `null` when absent; `split` (`no`, `count`) for a shard. `message`
+  only with a warning, a failure or a refusal: the reason.
+- `error`: why this file cannot be used (`code`, `message`; the codes are in
+  [16.4](#164-checks-before-the-model-becomes-visible)), or `null`.
 
 The upload:
 
 | `state` | Detail | Meaning |
 |---|---|---|
 | `receiving` | | chunks are accepted |
-| `checking` | `substate`: `queued` (the checks of another upload run), `hashing` (with `progress`), `classifying`, `load_check` | the checks of [16.4](#164-checks-before-the-model-becomes-visible) |
-| `ready` | `blocked_by`: `manual` (automatic publishing is off), `name_taken` (rename it), `publish_error`, `check_failed` (the check could not run), `sha256_mismatch`, `settings_not_saved` (the admin state directory cannot be written), `settings_invalid` (the settings are no longer valid, for example a GPU is gone); `blocked` has the details | all data is there; waits for `update`, `publish` or `cancel` ([12.17](#1217-post-adminmodelsuploadupdate-publish-cancel)) |
+| `checking` | `substate`: `queued` (waiting for its turn: one upload is checked at a time), `hashing` (with `progress`), `classifying`, `load_check` | the checks of [16.4](#164-checks-before-the-model-becomes-visible) |
+| `ready` | `blocked_by`: `manual` (automatic publishing is off, or the upload was rebuilt without its record), `name_taken` (rename it), `publish_error`, `check_failed` (the check could not run), `sha256_mismatch`, `settings_not_saved` (the admin state directory cannot be written), `settings_invalid` (the settings are no longer valid, for example a GPU is gone); `blocked` has the details | all data is there; waits for `update`, `publish` or `cancel` ([12.17](#1217-post-adminmodelsuploadupdate-publish-cancel)) |
 | `publishing` | | the settings entry, the rename and the rebuild of the model list |
 | `published` | `result`: the model and its final files; a `reload_error` when the model list could not be rebuilt ([16.5](#165-where-the-files-end-up)) | done; listed for 24 hours |
-| `rejected` | `error`: `code`, `message` | the files cannot be used as a model; the data is deleted; listed for 24 hours |
-| `cancelled`, `expired` | | the data is deleted; listed for 24 hours |
+| `rejected` | `error`: `code`, `message`, `file` (the index of the file the verdict is about, or `null`) | the files cannot be used as a model; the data is deleted; listed for 24 hours |
+| `cancelled`, `expired` | `expired`: `error.code` is `expired` | the data is deleted; listed for 24 hours |
 
-- `checks`: what the checks found so far, one entry per step and file (`step`, `file`,
-  `status`, `message`); the header check names the architecture, the size in parameters,
-  the quantization and the training context.
-- `plan` (the final names and roles) and `facts` (what the checks read) appear as the
-  checks go on; `warnings` are those of the create answer and of the checks.
-- `last_activity`, `expires_at` (`null` while the server works on the upload),
+`blocked` always has `code` and `message`, and per `blocked_by`:
+
+| `blocked_by` | `blocked.code` and more |
+|---|---|
+| `manual` | `manual` |
+| `name_taken` | `name_taken`, `by` (`model`, `preset`, `alias`, `file`, `upload`), `other` (the name it collides with), `case_variant` |
+| `sha256_mismatch` | `sha256_mismatch`, `file`, `expected`, `actual` |
+| `check_failed` | why the check could not run: `timeout`, `spawn_failed`, `no_result` (the helper ended without an answer, for example killed for its memory), `check_error` (for example "the check ran out of memory"), `hash_failed`, `check_failed` (a header check), `staging_failed` (arranging the files under their final names); on Windows `path_too_long` with `max_name_length` (a split model whose staged path is too long for llama.cpp: rename the upload to at most that many characters, then Retry). After a restart of the server, a file that is now refused under its final name gives its own code (for example `not_gguf`) and `file`: Retry or cancel, it can no longer be dropped |
+| `publish_error` | `staging_failed`, `upload_unavailable` (the models directory is not usable now), `staging_other_filesystem`, `publish_failed` (with `errno`) |
+| `settings_not_saved` | `settings_not_saved` |
+| `settings_invalid` | the error of the settings check (for example `invalid_request_error`, `field_locked`) and `param` |
+
+- `checks`: one entry per file whose header check has started: `step` (`header`), `file`,
+  `status` (the `header.state` of that file), `message` (empty while all is well,
+  otherwise the warning or the reason).
+- `plan`: the final layout, once the classification has decided it: `layout` (`file` or
+  `folder`), `target` (the name in the models directory), `id`, and `files[]` with
+  `index`, `final_name`, `role` and `split_no` (`null` for a single file).
+- `facts`: what the checks read about the model. After the header check of the model
+  file: `arch`, `name` (`general.name`), `n_params`, `n_ctx_train`, `n_layer`, `file_type`
+  (`general.file_type`, the quantization as llama.cpp numbers it), `n_tensors` and, for a
+  split set, `split`. After the load check also `n_vocab`, `desc` (llama.cpp's short
+  description, when it gives one) and, with a projector, `vision` / `audio`.
+- `result` (`published`): `model`, `layout`, `target`, `rename` (how the files were moved
+  into place: `renameat2`, `link`, `check+rename`, `renameatx_np` on macOS, `MoveFileEx`
+  on Windows), `reload_error`, `settings_saved` (a per-model settings entry was written),
+  and `files[]` with `name` (relative to the models directory), `role`, `size` and
+  `sha256`. An upload whose publish had finished when the server stopped shows only
+  `model`, `target` and `recovered`.
+- `warnings`: those of the create answer, plus `chown_failed` ([11](#11-storage)) and
+  `recovered_without_record`.
+- `last_activity`, `expires_at` (set only while the upload is `receiving` or `ready`),
   `idle_ms`: the expiry of [16.6](#166-resuming), counted while the server runs.
 - `last_client_idle_ms`: the time since the last chunk from any sender; below 30 000 a
   chunk from another sender gets `409 other_client_active`.
 - `recovered`: the server took the upload over after a restart; `record_persisted`:
   its record is in the admin state directory (otherwise it survives a restart only
-  without its settings).
-
-<!-- s3-recheck: aligned with tools/server/server-admin-upload.cpp (up_session_json, up_file_json, up_limits_json) while that file was still being written; re-check every field, and the shape of plan / facts / result. -->
+  without its settings); `recovered_without_record`: it was rebuilt from its staging
+  hint alone, without its settings and without automatic publishing (after its checks it
+  waits as `ready` / `manual`).
 
 ### 12.15 `POST /admin/models/upload`
 
@@ -2142,7 +2211,7 @@ curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' -d '{
 | `auto_publish` | default `true`: publish as soon as the checks pass; `false`: wait as `ready` (`manual`) |
 | `dry_run` | `true`: only check; nothing is created (answer `200`, `upload.id` is `null`) |
 
-Answer `201` (a dry run: `200`, with a shorter `upload`):
+Answer `201`:
 
 ```json
 {
@@ -2150,24 +2219,32 @@ Answer `201` (a dry run: `200`, with a shorter `upload`):
   "disk": { "free_bytes": 120000000000, "total_bytes": 480000000000, "needed_bytes": 3341008960, "other_uploads_bytes": 0,
             "shares_disk_with": ["admin_state"] },
   "warnings": ["shares_disk_with_state"],
-  "locks": {}
+  "locks": { "flash-attn": { "by": "router_cli", "value": "on" } },
+  "existing_settings": { "ctx-size": "8192" }
 }
 ```
 
-- `upload`: the new upload, as `GET ?id=` shows it (shortened above).
+- `upload`: the new upload, the full view of `GET ?id=` (shortened above). A dry run
+  answers `200` with only `id` (`null`), `name`, `files` (`index`, `name`, `size`),
+  `settings` (as they would be saved), `chunk_max` and `chunk_default`.
 - `disk`: the filesystem of the models directory: `free_bytes`, `total_bytes`, what this
   upload needs (`needed_bytes`) and what other unfinished uploads still need
   (`other_uploads_bytes`); `shares_disk_with`: other data on the same filesystem
-  (`admin_state`).
+  (`admin_state`; checked on Linux only).
 - `warnings` (they never block): `not_enough_space` (the files are larger than the free
   space minus what the other unfinished uploads still need), `larger_than_disk` (larger
   than the whole filesystem), `shares_disk_with_state` (a full disk would also stop the
-  admin state from being saved), `record_not_persisted` (the record of the upload could
-  not be written to the admin state directory), see [16.8](#168-disk-space).
-- `locks`: the settings that are locked for this model ([6.4](#64-locked-fields)).
+  admin state from being saved), `state_not_writable` (the admin state directory cannot
+  be written: with settings, the publish stops at `settings_not_saved`),
+  `record_not_persisted` (the record of the upload could not be written to the admin
+  state directory), see [16.8](#168-disk-space); and the value warnings of
+  `POST /admin/models/settings` (for example `ctx_above_train`, `device_missing`).
+- `locks`: the settings that are locked for this model, `{ key: { "by", "value" } }`:
+  `by` is `router_cli` (given on the router command line) or `model_devices` (the GPU of
+  a `MODEL_DEVICES` `*=` entry in the `[*]` section), see [6.4](#64-locked-fields).
 - `existing_settings` (only when there are some): the saved settings of an earlier model
   with this id (an `orphaned` entry of `GET /admin/models/settings`,
-  [6.7](#67-removing-custom-settings)). The dialog asks "keep / start fresh" with them.
+  [6.7](#67-removing-custom-settings)). The dialog asks "Start fresh" / "Keep them".
 
 Errors:
 
@@ -2175,20 +2252,18 @@ Errors:
 |---|---|---|
 | 400 | `invalid_request_error` (`param`) | a field is missing or out of its rules |
 | 400 | `invalid_name` (`reason`: `empty`, `too_long`, `charset`, `mmproj`, `gguf`, `draft_prefix`, `shard_suffix`, `trailing_dot`, `reserved`) | the name breaks a rule of [16.3](#163-names) |
-| 400 | `unsupported_file` | a file name says it is a draft model (`mtp-`, `dspark-`, `dflash-`, `eagle3-`) |
+| 400 | `unsupported_file` (`reason` `draft`, `file`) | a file name says it is a draft model (`mtp-`, `dspark-`, `dflash-`, `eagle3-`) |
 | 409 | `upload_unavailable` (`reason`) | uploads are not possible here ([16.1](#161-what-can-be-uploaded)) |
-| 409 | `name_taken` (`by`) | the name collides |
+| 409 | `name_taken` (`by`: `model`, `preset`, `alias`, `file`, `upload`; `other`, `case_variant`) | the name collides with a model id (`model`; `preset` for a `models.ini` section), an alias, an entry of the models directory (`file`) or another unfinished upload (`upload`); `other` is the name it collides with, `case_variant` says that they differ only in case |
 | 409 | `field_locked` (`param`) | a setting against a lock of [6.4](#64-locked-fields) |
-| 409 | `too_many_uploads` (`sessions`) | 4 uploads are unfinished |
-
-<!-- s3-recheck: the create answer as implemented (upload = full session view; existing_settings only when present; locks shape), and the by values of name_taken. -->
+| 409 | `too_many_uploads` (`sessions`) | 4 uploads are unfinished; `sessions` lists them (a dry run is not counted) |
 
 ### 12.16 `POST /admin/models/upload/chunk`
 
-Appends one chunk of one file.
+Appends one chunk of one file, or with `verify=1` only compares it.
 
 ```
-POST /admin/models/upload/chunk?id=<upload id>&file=<index>&offset=<byte offset>[&takeover=1]
+POST /admin/models/upload/chunk?id=<upload id>&file=<index>&offset=<byte offset>[&takeover=1][&verify=1]
 Content-Type: application/octet-stream
 Content-Length: <length>
 X-Admin-Key: <key>
@@ -2210,30 +2285,59 @@ Answer `200`:
 | The chunk | Result |
 |---|---|
 | starts at the current offset | it is appended |
-| starts before it | the part the server already has is compared byte for byte with what it stored (`409 content_mismatch` when it differs: not the same file); the rest, if any, is appended. So sending a chunk again is always safe, and sending the first MiB and up to 1 MiB before the offset proves that a file picked again is the same |
+| starts before it | the part the server already has is compared byte for byte with what it stored (`409 content_mismatch` when it differs: not the same file); the rest, if any, is appended. So sending a chunk again is always safe, also one that lies wholly inside the stored bytes (`200`, nothing is written) |
 | starts after it | `409 offset_mismatch`, with the server's `offset` |
 | reaches beyond the declared size | `400 beyond_declared_size` |
 
-- The body is at most `chunk_max` (16 MiB) and needs a `Content-Length` (no chunked
-  transfer encoding). The server handles a chunk only once it has the whole body, so its
-  offset only ever moves by whole chunks: a chunk cut off in transit changes nothing.
-- `X-Upload-Client` names the sender. A chunk from another sender within 30 seconds of the
-  last one is `409 other_client_active` (with `idle_ms`); `takeover=1` makes this sender
-  the one that writes, and the other one gets `other_client_active` at its next chunk.
+**`verify=1`** compares the body with the stored bytes and never writes: the way to check
+that a file picked again (after a reload, or by a script that continues an upload) is the
+one the server has, before sending more. The usual probe is the first MiB of the file
+(`offset=0`), when `head_crc32` of [12.14](#1214-get-adminmodelsupload) is `null` or not
+used, and the last MiB before the server's offset. Answer `200`:
+
+```json
+{ "verified": true, "verified_bytes": 1048576, "offset": 10485760, "durable_offset": 10485760,
+  "file_complete": false, "state": "receiving" }
+```
+
+`verified_bytes` is how much of the body overlapped the stored bytes; a body beyond the
+server's offset is not compared and not stored. A difference is `409 content_mismatch`
+(with the `offset` of the compared block that differs), a probe that starts after the
+server's offset `409 offset_mismatch`. The sender rule of `X-Upload-Client` (below)
+applies to a probe too, but a probe does not make its sender the one that writes.
+
+- The body is at most `chunk_max` (16 MiB) and needs a `Content-Length`. A request with
+  any `Transfer-Encoding` (also `chunked` next to a `Content-Length`) or without a
+  `Content-Length` is `411 length_required`; a `Content-Encoding` other than `identity`
+  is `415`: the length decides what is admitted, so it must be the real size of the raw
+  body. The server handles a chunk only once it has the whole body, so its offset only
+  ever moves by whole chunks: a chunk cut off in transit changes nothing.
+- `X-Upload-Client` names the sender (send it with every chunk). A chunk from another
+  sender within 30 seconds of the last one is `409 other_client_active` (with `idle_ms`);
+  `takeover=1` makes this sender the one that writes, and the other one gets
+  `other_client_active` at its next chunk.
 - `X-Chunk-CRC32` (CRC-32 as in zip and gzip): a chunk damaged on the way is refused
   (`400 crc_mismatch`) and can be sent again at once.
-- The first chunk of a file shows whether it is a GGUF file (`422 not_gguf` right away)
-  and starts the header check of [16.4](#164-checks-before-the-model-becomes-visible).
-  A file that the check finds unusable is answered `422 file_rejected` (with `file` and
-  `code`); drop it from the upload or cancel.
-- Answered **before the body is read**: a missing or wrong key (`401`), an address the
-  allow-list refuses (`403`), no `Content-Length` (`411`), a `Content-Length` above
-  `chunk_max` (`413 chunk_too_large`), an upload that is busy or over (`409 upload_busy`,
-  `410 upload_gone`), another sender (`other_client_active`), a chunk of this upload
-  already on its way (`chunk_in_progress`), too many chunks at once
-  (`429 upload_slots_busy`). The server then closes the connection, so a client that is
-  still sending may see a reset connection instead of the answer; it asks `GET ?id=` and
-  sends again.
+- The first chunk of a file shows whether it is a GGUF file (`422 not_gguf` right away;
+  what was stored of that file is discarded). As soon as the metadata of a file has
+  arrived, the header check of [16.4](#164-checks-before-the-model-becomes-visible) runs
+  in the background. A file that it finds unusable is marked (`files[].error` of
+  [12.14](#1214-get-adminmodelsupload), `file_error` of this answer), and from then on
+  its chunks get `422 file_rejected` with `file` and `reason` (the code of
+  [16.4](#164-checks-before-the-model-becomes-visible), for example `adapter`); drop it
+  from the upload or cancel.
+- Answered **before the body is read**, in this order: an address the allow-list refuses
+  (`403`), a missing or wrong key (`401`; `503` when the server has no key), a missing
+  `Content-Length` or any `Transfer-Encoding` (`411`), a `Content-Encoding` (`415`), a
+  `Content-Length` above `chunk_max` (`413 chunk_too_large`), a malformed `id` (`400`),
+  an upload that is over (`410 upload_gone`) or busy (`409 upload_busy`), another sender
+  (`409 other_client_active`), a chunk of this upload already on its way
+  (`409 chunk_in_progress`), too many chunks at once (`429 upload_slots_busy`). The
+  server then closes the connection, so a client that is still sending may see a reset
+  connection instead of the answer; it asks `GET ?id=` and sends again. Behind a reverse
+  proxy such an early answer can also arrive as a `502` from the proxy, which saw the
+  connection close while it was still sending the body: treat a `5xx` that is not the
+  server's JSON like a dropped connection.
 - From outside the admin layer: `503` "Loading model" while the server starts, `401` from
   `--api-key` (send the same `Authorization` header as for every other request), and
   `502` / `504` from a proxy. Every answer of 400 or above closes the connection; the
@@ -2245,21 +2349,19 @@ Answer `200`:
 | 400 | `beyond_declared_size` | the chunk reaches beyond the declared size of the file |
 | 400 | `crc_mismatch` | `X-Chunk-CRC32` does not match the body |
 | 409 | `offset_mismatch` (`offset`) | the chunk starts after the server's offset |
-| 409 | `content_mismatch` | the bytes sent again differ from the stored ones: not the same file |
+| 409 | `content_mismatch` (`offset`) | the bytes sent again differ from the stored ones: not the same file |
 | 409 | `chunk_in_progress` | another chunk of this upload is being received |
 | 409 | `other_client_active` (`idle_ms`) | another sender wrote within the last 30 seconds; `takeover=1` |
 | 409 | `upload_busy` (`state`) | the upload is being checked or published, or waits as `ready` |
 | 409 | `file_dropped` | the file was dropped from the upload |
 | 410 | `upload_gone` (`state`) | unknown, expired, cancelled, rejected or published upload |
-| 411 | `length_required` | the chunk has no `Content-Length` |
+| 411 | `length_required` | the chunk has no `Content-Length`, or a `Transfer-Encoding` |
 | 413 | `chunk_too_large` (`chunk_max`), as JSON | the body is larger than `chunk_max`. A `413` without this JSON comes from a proxy in front of the server: send smaller chunks ([16.9](#169-behind-a-reverse-proxy)) |
-| 415 | `unsupported_media_type` | the body is not `application/octet-stream` |
-| 422 | `not_gguf`, `file_rejected` (`file`, `code`) | the file is not GGUF, or the check found it unusable; only that file is affected |
+| 415 | `unsupported_media_type` | the body is not `application/octet-stream`, or it has a `Content-Encoding` |
+| 422 | `not_gguf`, `file_rejected` (`file`, `reason`) | the file is not GGUF, or the header check found it unusable (`reason`: the code); only that file is affected |
 | 429 | `upload_slots_busy` (`retry_after_s`) | 4 chunks are being received already |
-| 507 | `disk_full` (`free_bytes`, `offset`, `durable_offset`) | the disk is full (or a quota is reached); the chunk is discarded and the upload is kept |
-| 500 | `write_failed` | another error while writing; the chunk is discarded and the upload is kept |
-
-<!-- s3-recheck: the early-refusal set of the pre-body hook (spec B.5c) and the 422 file_rejected path, as implemented. -->
+| 507 | `disk_full` (`free_bytes`, `offset`, `durable_offset`) | the disk is full (or a quota is reached), or the chunk does not fit into the free space (checked before it is written); the chunk is discarded and the upload is kept |
+| 500 | `write_failed` (`offset`) | another error while writing or reading the staged file; the chunk is discarded and the upload is kept |
 
 ### 12.17 `POST /admin/models/upload/update`, `.../publish`, `.../cancel`
 
@@ -2268,10 +2370,14 @@ Answer `200`:
 the upload), `settings_mode`, `auto_publish`, `files` (`[{ "index": 0, "sha256": "..." }]`:
 set, or with `""` remove, the expected SHA-256 of a file) and `drop_files` (`[1]`: take
 files out of the upload, for example one that is not GGUF; their data is deleted at
-once). When the files that are left are all complete, the checks start. The answer is
-`{ "upload": ..., "warnings": [...], "locks": {...} }` (plus `existing_settings` when there
-are some). `409 upload_busy` while it is being checked or published, `410 upload_gone`
-once it is over.
+once). When the files that are left are all complete, the checks start. An upload that
+waits as `ready` stays there after an update: send `publish` next (it judges the new name
+or settings then). The answer is `{ "upload": ..., "warnings": [...], "locks": {...} }`
+(plus `existing_settings` when there are some). Refused: dropping every file (`400`,
+cancel instead); dropping a file once the checks have arranged the files under their
+final names (`409 upload_busy` with `staged: true`: cancel the upload and upload again
+without that file); `409 upload_busy` while it is being checked or published; `410
+upload_gone` once it is over.
 
 ```bash
 curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' \
@@ -2280,18 +2386,23 @@ curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' \
 ```
 
 **`publish`** (`{ "id": ... }`) continues an upload that waits as `ready`: with
-`auto_publish` off (`manual`), after a rename (`name_taken`), after a `publish_error`.
-For `check_failed` and `sha256_mismatch` it runs the checks again; with
-`"ignore_sha256_mismatch": true` a differing SHA-256 is accepted ("Publish anyway").
+`auto_publish` off (`manual`), after a rename (`name_taken`), after a `publish_error`
+or a `settings_invalid` (the settings are checked again). For `check_failed` and
+`sha256_mismatch` it runs the checks again (Retry; the SHA-256 is not computed again);
+with `"ignore_sha256_mismatch": true` a differing SHA-256 is accepted ("Publish anyway").
 `"without_settings": true` publishes without the settings of the upload
-(`settings_not_saved`: the model then starts with its inherited values). The answer is
-`202` with `{ "upload": ... }` (`publishing` or `checking`); follow it with `GET ?id=`. An
-upload that is already published answers `200`; one that is publishing or checking
-answers with its state. `409 upload_busy` while it is still receiving.
+(`settings_not_saved`, `settings_invalid`: the model then starts with its inherited
+values). Publishing also switches `auto_publish` on. The answer is `202` with
+`{ "upload": ... }` (`publishing` or `checking`); follow it with `GET ?id=`. An upload
+that is already published answers `200`; one that is publishing or checking answers
+`202` with its state. `409 upload_busy` while it is still receiving, `410 upload_gone`
+for a rejected, cancelled or expired one.
 
 **`cancel`** (`{ "id": ... }`) ends an upload that is not published yet and deletes its
-data: `200` with `{ "cancelled": true, "freed_bytes": ..., "upload": ... }`. `409
-upload_busy` while it is being published.
+data: `200` with `{ "cancelled": true, "freed_bytes": ..., "upload": ... }`. An upload
+that is being checked stops after the current step. An upload that is already over
+answers `200` with `freed_bytes` 0 (`cancelled` is `true` only when it had been
+cancelled). `409 upload_busy` while it is being published.
 
 ```bash
 curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' \
@@ -2301,8 +2412,6 @@ curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' \
 curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' \
     -d '{ "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a" }' $BASE/admin/models/upload/cancel
 ```
-
-<!-- s3-recheck: update fields files[] / drop_files and publish fields ignore_sha256_mismatch / without_settings, as implemented. -->
 
 ### 12.18 `POST /admin/models/delete`
 
@@ -2315,7 +2424,7 @@ downloaded models only.
 | `model` | | the model id |
 | `dry_run` | `false` | only report what would be deleted |
 | `stop` | `false` | stop the model first if it is running; without it a running model is `409 model_running` |
-| `remove_settings` | `true` | also remove its saved settings, its pin and what the server cached about it |
+| `remove_settings` | `true` | also remove its saved settings, its pin and what the server cached about it (not with `projector_only`: the model keeps its settings) |
 | `projector_only` | `false` | **Remove projector**: only the model's projector file |
 
 ```bash
@@ -2331,18 +2440,27 @@ The dry run (`200`):
   "files": [ { "path": "gemma-3-4b/gemma-3-4b.gguf", "bytes": 2489757856, "role": "model" },
              { "path": "gemma-3-4b/mmproj-gemma-3-4b.gguf", "bytes": 851251104, "role": "projector" } ],
   "n_files": 2, "total_bytes": 3341008960,
-  "kept": [ { "path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file" } ], "n_kept": 1, "kept_bytes": 5120,
+  "kept": [ { "path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file" },
+            { "path": "mtp-shared-draft.gguf", "bytes": 52428800, "kind": "file", "shared": true } ],
+  "n_kept": 2, "kept_bytes": 52433920,
   "folder": "gemma-3-4b", "folder_removed": false,
   "running": false, "status": "unloaded", "pinned": false, "has_settings": true,
-  "warnings": []
+  "warnings": [], "dry_run": true
 }
 ```
 
 - `files`: what would be deleted, as paths relative to the models directory, with their
-  `role` (`model`, `shard`, `projector`, `draft`).
-- `kept`: other entries of the model's folder that stay ("kept: not part of this model";
-  at most 100 listed, `kind` `file`, `dir` or `symlink`); `folder_removed`: the folder
-  would be empty and is removed.
+  `role` (`model`, `shard`, `projector`, `draft`). Only what the models directory gives
+  this model: its file (and the shards named after the first one), and for a model in a
+  folder the projector and draft model in that folder.
+- `kept`: what stays: the other entries of the model's folder ("kept: not part of this
+  model"; `kind` `file`, `dir` or `symlink`; `bytes` is `null` for a folder) and, with
+  `shared: true`, a projector or draft model that the model uses but every model gets (on
+  the router command line or in the `[*]` section of `models.ini`). At most 100 are
+  listed; `n_kept` is the number listed, `kept_bytes` the size of all files that stay.
+- `folder` (`null` for a top-level file); `folder_removed`: the folder would be empty and
+  is removed.
+- `running`, `status`, `pinned`, `has_settings`: the model as it is now.
 - `warnings`: `running` (it will be stopped), `folder_keeps_other_model` (another GGUF file
   stays in the folder: after the delete the folder may be listed again under this id,
   with that file).
@@ -2360,21 +2478,25 @@ The answer of the real delete (`200`):
 ```
 
 - `deleted: true`, or `projector_removed: true` with `projector_only`.
-- `trash_left`: the files are out of the model list and wait in the trash, which the
-  server deletes in the background (on Linux the space comes back once no model process
-  has the file open).
+- `files`, `kept` as in the dry run; `freed_bytes` the size of the deleted files.
+- `trash_left`: always `true`: the files are out of the model list and wait in the trash,
+  which the server deletes in the background right away (on Linux the space comes back
+  once no model process has the file open).
 - `reload_error`: the model list could not be rebuilt afterwards (for example a broken
   `models.ini`); the files are gone all the same.
 
 Errors: `400 invalid_request_error`, `409 model_running`, `409 not_deletable` with
-`reason`: `not_found` (no such model; the route never answers `404`), `cache` (a
-downloaded model: use `DELETE /models`), `preset` (a `models.ini` section), `no_projector`
-(`projector_only` for a model without one), `outside_models_dir`, `symlink`, `missing`,
-`other_filesystem`, `no_models_dir`, `no_file` ([17.3](#173-what-is-refused)); `504
-stop_timeout` (nothing was deleted), `500 server_error` (the trash folder could not be
-created).
-
-<!-- s3-recheck: aligned with up_handle_delete / up_owned_files in server-admin-upload.cpp while it was being written; re-check every field and reason. -->
+`reason`: `not_found` (no such model, or one that is still being downloaded; the route
+never answers `404`), `cache` (a downloaded model: use `DELETE /models`), `preset` (a
+`models.ini` section, or a model whose model file is set in `models.ini` or on the
+router command line instead of the one the models directory gives it), `no_projector`
+(`projector_only` for a model without its own projector, also when its projector is
+the shared one of every model), `outside_models_dir`, `symlink`, `missing`,
+`other_filesystem`, `no_models_dir`, `no_file` ([17.3](#173-what-is-refused)); `409
+upload_unavailable` (`reason`: the models directory cannot be used for the trash right
+now, see [16.1](#161-what-can-be-uploaded)); `504 stop_timeout` (nothing was deleted);
+`500 server_error` (the trash folder could not be created, the model's folder could not
+be opened, or a file could not be moved; what was moved is put back).
 
 ## 13. Deployment on a Linux host
 
@@ -3042,8 +3164,8 @@ onto the Models tab. The files go into the models directory (`--models-dir`; in 
 list, and the model's first start already uses the GPU and context chosen in the
 dialog. It works on a host and in Docker, with any GPUs or none, over a LAN, a VPN or a
 reverse proxy, and it survives a dropped connection, a reload of the page and a restart
-of the server.
-<!-- s3-recheck: UI labels "Add model -> Upload GGUF" (tab of DialogAdminAddModel) and the drop target (Models tab). -->
+of the server. Files dropped onto the Models tab ("Drop GGUF files to upload them") open
+the same dialog on its **Upload GGUF** tab.
 
 ### 16.1 What can be uploaded
 
@@ -3067,56 +3189,79 @@ of the server.
   restart it after the change. Uploads never go into the model cache (`LLAMA_CACHE`) or
   into the read-only `/models`.
 
-When uploads are not possible, the Upload tab is shown disabled with the reason and the
-fix (`upload` in `GET /admin/status`, [12.1](#121-get-adminstatus)):
+When uploads are not possible, the **Upload GGUF** tab shows the reason and the fix
+instead of the drop zone (`upload` in `GET /admin/status`, [12.1](#121-get-adminstatus)):
 
 | `reason` | Meaning | Fix |
 |---|---|---|
 | `no_models_dir` | the server runs without `--models-dir` | Docker: mount `/models-rw` (the shipped compose file does). Host: add `--models-dir /srv/provision-llm/models-rw/local` to `PROVISION_LLM_ARGS`. Then restart the server |
 | `models_dir_missing` | the directory named by `--models-dir` does not exist | create it ([13.2](#132-account-directories-files)), restart |
 | `not_writable` | the server cannot write into it | owner and mode, see [11](#11-storage) and [13.2](#132-account-directories-files) |
+| `staging_unusable` | `.provision-upload` in the models directory is a file or a symbolic link, or cannot be created | remove it; the server creates the folder itself |
 | `staging_other_filesystem` | `.provision-upload` inside the models directory is on another filesystem (something is mounted there) | remove that mount: publishing is a rename and needs one filesystem |
 
 ### 16.2 In the panel
 
-1. **Pick.** Drop the files or choose them with the file picker. The dialog shows one row
-   per file with its role (model, shard k of n, projector) and size, and points out
-   problems with the selection (a missing shard, two candidates for one projector)
-   before anything is sent. The browser only reads the file names and the first bytes
-   (`GGUF`); architecture, quantization and training context come from the server's
-   first check a few seconds after a file starts ([16.4](#164-checks-before-the-model-becomes-visible)).
-   <!-- s3-recheck: the browser-side header reader was dropped (critique scope-ux #0); confirm what the pick step shows before the upload starts. -->
+1. **Pick.** Drop the files or **Choose files**. The browser reads the GGUF header of each
+   file itself ("Reading the file headers...", at most 64 MiB of each file, nothing is
+   sent yet) and shows one row per file with its role (model, part k of n, projector),
+   size, architecture, quantization and training context (for a projector: images and /
+   or audio). It groups the files into models, asks which model a projector belongs to
+   when that is not clear, and points out problems before anything is sent: missing parts
+   of a split model, parts of different models, a shard number in the name that differs
+   from the one in the file. Files that cannot be uploaded are listed under "Not
+   uploaded" with the reason (a draft model, not a GGUF file, an unsupported GGUF
+   version, an adapter, an imatrix file, a file picked twice, a projector without its
+   model). This reading is only a hint: the server checks every file itself
+   ([16.4](#164-checks-before-the-model-becomes-visible)).
 2. **Name.** Proposed from the model file (the shard suffix and `.gguf` removed; never
    from the projector), and editable. The server checks it ([16.3](#163-names)) together
-   with the free space; warnings never block ("Upload anyway"). Optionally, per file,
-   the expected SHA-256 (as Hugging Face shows it on the page of the file). When saved
-   settings of an earlier model with the same id exist, the dialog asks "keep / start
-   fresh" (default: start fresh), see [6.9](#69-settings-for-a-model-that-is-being-added).
-3. **Placement** (optional): GPU, context size and parallel requests; the role
-   (embeddings, reranking) under **More**. Fields that are locked for new models show
-   their lock. The switch "Publish automatically when the checks pass" is on by
+   with the free space; warnings never block (**Upload anyway**). Optionally, under
+   "Verify with SHA-256", the expected SHA-256 of each file (as Hugging Face shows it on
+   the page of the file). When saved settings of an earlier model with the same id
+   exist, the dialog asks "Start fresh" (the default) or "Keep them", see
+   [6.9](#69-settings-for-a-model-that-is-being-added).
+3. **Placement** (optional): GPU, context size and parallel requests; the role ("Used
+   for": embeddings, reranking) under **More**. Fields that are locked for new models
+   show their lock. The switch "Publish automatically when the checks pass" is on by
    default.
 4. **Upload.** Progress per file and in total (only what the server confirmed), speed
-   and time left; **Pause**, **Resume**, **Cancel**. The status reads Uploading,
-   Retrying in N s, Server restarting, Disk full, In another tab (**Take over**) or
-   Paused. When the page had to use smaller pieces it says "a proxy limits request size;
-   using smaller pieces" and shows the nginx lines of [16.9](#169-behind-a-reverse-proxy).
-   The upload runs in the page, not in the dialog: closing the dialog does not stop it
-   (a small indicator stays in the admin header). Closing or reloading the browser tab
-   does (the browser asks first); pick the same files again to continue
-   ([16.6](#166-resuming)).
-5. **Checks.** Hashing (with progress), then the classification of the files, then the
-   load check.
+   and time left; **Pause**, **Resume**, **Cancel** (asks first; the uploaded part is
+   deleted on the server). Further models wait as "waiting for its turn". The status
+   line says, for example, "Connection problem, retrying in N s", "The server is
+   restarting, retrying in N s", "Paused: the server cannot be reached", "The disk is
+   full" (**Resume** once there is space) or "Another browser tab or client is uploading
+   this model right now" (**Take over**). When the page has to use smaller pieces it says
+   "A proxy limits the request size; the upload uses smaller pieces" and shows the nginx
+   lines of [16.9](#169-behind-a-reverse-proxy). A file the server refuses while the
+   upload runs is listed with the reason and **Drop this file** (the rest goes on), or
+   cancel the upload. The upload runs in the page, not in the dialog: closing the dialog
+   does not stop it (an "Uploading N%" indicator stays in the admin header). Closing or
+   reloading the browser tab does (the browser asks first); pick the same files again to
+   continue ([16.6](#166-resuming)).
+5. **Checks.** "Computing the SHA-256..." (only after a restart of the server: otherwise
+   the SHA-256 is computed while the file is received), "Reading the files..." (the
+   classification), "Loading the model metadata with llama.cpp..." (the load check), or
+   "Waiting for another check to finish...". The list of files shows "header checked"
+   with the architecture and role of each file.
 6. **Result.**
-   - **Published**: per file the final name, role, size and SHA-256 (copyable), and
-     **Open settings**, **Check fit** (runs by itself when a placement was chosen) and
-     **Load now**. The model is in the list as not loaded; nothing has started it.
+   - **Published**: "Published as *id*: it is in the model list, not loaded yet", per
+     file the final name, role, size and SHA-256 (copyable), and **Open settings** and
+     **Load now**. When a placement was chosen, the fit of that placement is checked by
+     itself and shown there ([6.9](#69-settings-for-a-model-that-is-being-added)).
+     Nothing has started the model.
    - **Rejected**: the reason in plain words ([16.4](#164-checks-before-the-model-becomes-visible)).
-   - **Ready**: what it waits for, with the matching button (**Publish**, **Rename**,
-     **Retry**, **Publish anyway**).
+   - **Ready**: what it waits for, with the matching action: **Publish** (`manual`,
+     `publish_error`), **Retry the checks** (`check_failed`), a corrected value with
+     **Save and check again** or **Publish anyway** (`sha256_mismatch`), a new name with
+     **Rename and publish** (`name_taken`), **Publish without the placement** (and
+     **Retry**, for `settings_not_saved`; also for `settings_invalid`).
+   - **Not started** (the create request was refused): the reason, with **Try again**,
+     or a new name and **Try again with this name** when the name was the problem.
 
-A banner on the Models tab lists unfinished uploads ("1 unfinished upload: *name* 12.3 /
-40 GB", with the time left until it expires) with **Resume** (pick the same files) and
+A banner on the Models tab and in the Upload tab lists the unfinished uploads ("N
+unfinished uploads": each with its name, "12.3 GB of 40 GB uploaded" or what it waits for,
+and the time left until it expires) with **Resume (pick the same files)** or **Show**, and
 **Cancel**. Uploads started in another browser or by another admin are listed too.
 
 ### 16.3 Names
@@ -3151,21 +3296,25 @@ has shown that it can load the files.
 | creating the upload | the name, 1 to 256 files of at least 24 bytes each, the format of an expected SHA-256 (64 hexadecimal characters), the settings with the rules of `POST /admin/models/settings` | `400` / `409`, nothing is created |
 | every chunk | the offset rules, the optional CRC32 of the chunk, nothing beyond the declared size | the chunk is refused, the upload stays ([12.16](#1216-post-adminmodelsuploadchunk)) |
 | the first bytes of each file | `GGUF` and version 2 or 3 | `422 not_gguf`: only that file is marked, the rest of the upload stays |
-| as soon as a file's header has arrived, a few seconds after its start | the header check (below), on the partly received file | a definitive problem rejects the upload within seconds, before the rest is sent |
+| as soon as a file's metadata has arrived, a few seconds after its start | the header check (below), on the partly received file | a definitive problem marks that file or rejects the upload within seconds, before the rest is sent |
+| as soon as the metadata of every file is known (often before the last byte) | the classification: exactly one model (a single file, or a complete split set whose `split.no` / `split.count` match), at most one projector, and a projector only together with a model; the final names | `rejected` |
 | after the last byte | the sizes; the SHA-256 (computed while receiving, or read again from disk after a restart of the server); the expected SHA-256 | a mismatch makes the upload wait as `ready` (`sha256_mismatch`) |
-| then | the classification: exactly one model (a single file, or a complete split set whose `split.no` / `split.count` match), at most one projector, and a projector only together with a model | `rejected` |
-| then | the load check: a projector with the call the server itself makes at every rescan (it must report vision or audio input); the model with llama.cpp's own loader, metadata and vocabulary only (`vocab_only`), on the first shard: tensor data within the file, the complete split set, the architecture, the vocabulary. The weights are not read | `rejected`, or `ready` (`check_failed`) when the check itself could not run |
+| then | the header check of every file again where it did not finish, and the classification again | as above |
+| then | the load check, on the files under their final names: a projector with the call the server itself makes at every rescan (it must report vision or audio input); the model with llama.cpp's own loader, metadata and vocabulary only (`vocab_only`), on the first shard: tensor data within the file, the complete split set, the architecture, the vocabulary. The weights are not read | `rejected`, or `ready` (`check_failed`) when the check itself could not run |
 
 **The header check** reads the GGUF metadata from the partly received file and decides
-within seconds, before the rest is sent: an adapter or an imatrix file (`general.type`),
-a projector whose metadata cannot be read or that reports neither vision nor audio, and
-metadata larger than 64 MiB make that file unusable; an architecture this build does not
-know, a projector (CLIP) uploaded as the model, and `split.no` / `split.count` that do not
-fit the files of the upload reject the upload. What the metadata alone cannot settle is shown as a warning
-("will be confirmed when the upload completes") and decided by the load check at the
-end. The check also reports the architecture, the size in parameters, the
-quantization and the training context, which the dialog shows.
-<!-- s3-recheck: the exact set of definitive verdicts of the header phase, and that it returns arch / params / quant / n_ctx_train (critique scope-ux #0). -->
+within seconds, before the rest is sent. An adapter or an imatrix file (`general.type`),
+a projector whose metadata has values of the wrong type or that reports neither vision
+nor audio, metadata that cannot be parsed, and metadata larger than 64 MiB make that file
+unusable. An architecture this build does not know (also a model file without
+`general.architecture`) rejects the upload. What the metadata alone cannot settle (the
+loader needs more than the metadata) is a `warning` ("the metadata alone did not load
+(...); checked again when the upload is complete") and is decided by the load check at
+the end. The later parts of a split set hold only the split keys; they are checked
+together with the first part. The check also reads what the dialog and `facts`
+([12.14](#1214-get-adminmodelsupload)) show: the architecture, `general.name`, the size in
+parameters, the training context, the number of layers and the quantization
+(`general.file_type`). Its `message` is empty when the file is fine.
 
 **What rejects, and what does not.** Only a definitive verdict rejects. A verdict about
 one file makes only that file unusable; a verdict about the model rejects the upload
@@ -3174,25 +3323,33 @@ the data:
 
 | Outcome | State | What to do |
 |---|---|---|
-| one file cannot be used: not GGUF (`not_gguf`), an adapter or imatrix file, a projector with unreadable metadata or without vision / audio, metadata larger than 64 MiB, a file that cannot be read | that file is marked with its reason (`files[].error`; its chunks get `422`), the rest of the upload stays | drop the file from the upload (**Remove**, `drop_files`), or cancel |
-| the files cannot be a model: an architecture this build does not support (`unknown_architecture`), a projector as the model (`clip_as_model`), a file shorter than its own metadata says (`truncated`), an incomplete or inconsistent split set (`split_incomplete`, `split_mismatch`, `split_no`), two models (`two_models`), a projector without a model (`no_model`), the loader's own refusal (`load_failed`) | `rejected`, with the reason | for an unsupported architecture update the image or the binary, then upload again; otherwise fix the files |
-| the check could not finish: it timed out (slow storage), ran out of memory, or could not be started | `ready`, `check_failed` | **Retry**; the data is kept |
-| the SHA-256 differs from the expected one | `ready`, `sha256_mismatch` | the dialog shows both values: **Publish anyway** (a mistyped or wrong expected value), correct the expected value, or **Cancel** (frees the space) |
+| one file cannot be used: not GGUF or an unsupported GGUF version (`not_gguf`), an adapter (`adapter`) or imatrix file (`imatrix`), a projector with wrongly typed metadata (`projector_bad_metadata`) or without vision / audio (`projector_without_modality`), metadata that cannot be parsed (`malformed`) or larger than 64 MiB (`header_too_large`) | that file is marked with its reason (`files[].error`; its chunks get `422`), the rest of the upload stays; the checks wait until the file is dropped | drop the file from the upload (**Drop this file**, `drop_files`), or cancel |
+| the files cannot be a model: an architecture this build does not support (`unknown_architecture`), a file shorter than its own metadata says (`truncated`), an incomplete or inconsistent split set (`split_incomplete`, `split_mismatch`), two models (`two_models`), two projectors (`two_projectors`), a projector without its model (`projector_without_model`), the loader's own refusal (`load_failed`); in the load check also the codes of the first table row for the model or the projector | `rejected`, with the reason | for an unsupported architecture update the image or the binary, then upload again; otherwise fix the files |
+| the check could not finish: it timed out (slow storage), ran out of memory, could not be started, or could not read a file | `ready`, `check_failed` | **Retry the checks** (`publish`); the data is kept |
+| the SHA-256 differs from the expected one | `ready`, `sha256_mismatch` | the dialog shows both values: **Publish anyway** (a mistyped or wrong expected value), correct the expected value (**Save and check again**), or **Cancel** (frees the space) |
 
-<!-- s3-recheck: file-level codes (up_is_file_level) and upload-level codes as implemented in server-admin-upload.cpp; the UI label for dropping a file. -->
+A file that becomes unusable only after the files were arranged under their final
+names (they were changed on disk while the server was down, or a newer build checks them
+more strictly) can no longer be dropped: the upload waits as `ready` / `check_failed`
+with that file's code; **Retry the checks** or cancel. `rejected` uploads also show
+`staging_missing` when their data disappeared while the server was stopped. The
+loader's `clip_as_model` (a projector loaded as the model) cannot occur through an
+upload, because a file with the architecture `clip` is always taken as the projector.
 
 **Not checked before publishing**: whether the projector fits the model (its width,
 `n_embd`). That needs the projector's weights. A mismatch shows at the first start of the
-model (the failure panel, [9](#9-when-a-model-fails-to-start)); **Remove projector**
-([17.4](#174-remove-projector)) then keeps the model without it.
+model (the failure panel, [9](#9-when-a-model-fails-to-start)); **Delete files** ->
+**Remove only the projector** ([17.4](#174-remove-projector)) then keeps the model
+without it.
 
 The checks run in a short-lived helper process of the server binary, one upload at a
 time (others wait as `queued`), with at most 120 seconds per phase and without any GPU
-backend, so they need no GPU memory. On Linux the helper runs with a fixed limit of its
-address space and is the first process the kernel's OOM killer picks (`oom_score_adj`
-1000), and a file whose metadata section is larger than 64 MiB is refused before it is
-parsed: a crafted file cannot take the memory of the running models.
-<!-- s3-recheck: RLIMIT_AS value, oom_score_adj; Windows: job object or documented absence (spec C.1). -->
+backend, so they need no GPU memory. The helper may use at most 8 GiB of memory: on Linux
+a limit of its address space (`RLIMIT_AS`), and it is the first process the kernel's OOM
+killer picks (`oom_score_adj` 1000); on Windows a job object with a memory limit. A file
+whose metadata section is larger than 64 MiB is refused before it is parsed. A crafted
+file cannot take the memory of the running models; a check that runs out of memory
+counts as `check_failed`, not as a verdict about the file.
 
 ### 16.5 Where the files end up
 
@@ -3210,34 +3367,45 @@ The server decides the final names from the id; the original file names are only
 - Publishing is one rename on the same filesystem, and a set is one folder: a rescan
   never sees half of it. It never replaces anything: when an entry of that name
   appeared in the meantime the upload waits as `ready` (`name_taken`), and a rename
-  that fails leaves it `ready` (`publish_error`) with **Retry**.
+  that fails leaves it `ready` (`publish_error`) with **Publish** to try again.
+- Before publishing, the checks arrange the files under their final names inside the
+  upload's folder in `.provision-upload`. A move that fails there is undone, and one
+  that a crash interrupted is repaired at the next start, so a retry starts from a clean
+  state.
 - Order: first the model's per-model settings are saved
   ([6.9](#69-settings-for-a-model-that-is-being-added)), then the files become visible,
   then the model list is rebuilt. A request that arrives in between (automatic loading)
-  therefore already gets the chosen settings, never the defaults.
+  therefore already gets the chosen settings, never the defaults. When the rename fails,
+  the previous settings entry is put back.
 - The model appears **not loaded**; it starts on its first request or with **Load now**.
 - If the model list cannot be rebuilt after the rename (for example `models.ini` was
   broken in the meantime), the files and the settings stay: the upload is `published`
   with `reload_error`, and the next rescan lists the model. Unlike a failed save of
   per-model settings ([12.8](#128-post-adminmodelssettings)), nothing is rolled back.
-- The files and folders get the owner and group of the models directory (in Docker the
-  owner of the mount, like the entrypoint does for `hf/` and `local/`), set before they
-  become visible, and are synced to disk, together with the directory, before the
-  rename.
-  <!-- s3-recheck: modes of published files/folders on a host (2750/0640 by UMask=0027, or explicit 2770/0660 per critique ops-security #16), and EPERM under rootless Docker (warning in diagnostics). -->
+- The files and folders are group-writable (`0660` / `0770`) and, when the server runs
+  as root (Docker), get the owner and group of the models directory, like the entrypoint
+  does for `hf/` and `local/`; all of this is set before they become visible
+  ([11](#11-storage), **Ownership**). They are synced to disk, together with their
+  directories, before the rename, and the models directory after it.
+- Windows only: the load check of a split model runs on the copy in
+  `.provision-upload`, whose path is about 55 characters longer than the published one,
+  and llama.cpp loads a split model only from a path of at most 259 characters. A name
+  that makes that path too long waits as `ready` / `check_failed` (`path_too_long`, with
+  the longest name that fits in `max_name_length`): rename the upload, then Retry;
+  nothing is uploaded again.
 
 ### 16.6 Resuming
 
 | Event | What happens |
 |---|---|
-| A dropped connection, `429`, `502`, `503`, `504` | The page asks the server how far it got and continues from there, re-sending up to 1 MiB before that point (compared byte for byte, so nothing is stored twice). It waits 1 second at first, growing to 30 seconds. After 30 minutes without success the upload shows "paused: server unreachable" and is retried every minute while the tab is open. |
-| A reload of the page, or the tab was closed | The browser no longer has the files. The banner lists the unfinished uploads; pick the same files again. They are matched by name and size; the server then compares the first MiB of each file and the bytes before its offset with what it has, so a different file with the same name and size is refused ("this is not the same file", `content_mismatch`). Files that were already complete need no new pick. The admin key is still there for the browser session. |
-| The server restarts (systemd `Restart=on-failure`, a container restart, an image update) | Each file goes back to its last checkpoint: at most about 256 MiB or 15 seconds of data are sent again. The checks read the files again from disk for the SHA-256. An upload that was being checked or published is checked again from the files on disk and then published; files that were already published are recognised as such. |
+| A dropped connection, `429`, `502`, `503`, `504`, or another `5xx` that is not the server's JSON | The page asks the server how far it got and continues from there, re-sending up to 1 MiB before that point (compared byte for byte, so nothing is stored twice). It waits 1 second at first, growing to 30 seconds. After 30 minutes without success the upload shows "Paused: the server cannot be reached" and is retried every minute while the tab is open. |
+| A reload of the page, or the tab was closed | The browser no longer has the files. The banner lists the unfinished uploads; **Resume (pick the same files)**. They are matched by name and size; the page then compares the CRC-32 of the first MiB of each file with the server's `head_crc32` (or, when the server does not know it, sends that MiB as a `verify=1` probe, [12.16](#1216-post-adminmodelsuploadchunk)), and the server compares the up to 1 MiB that is sent again before its offset. A different file with the same name and size is refused ("This is not the same file", `content_mismatch`). Files that were already complete need no new pick. The admin key is still there for the browser session. |
+| The server restarts (systemd `Restart=on-failure`, a container restart, an image update) | Each file goes back to its last checkpoint (`durable_offset`): at most about 256 MiB or 15 seconds of data are sent again. The checks read the files again from disk for the SHA-256. An upload that was being checked or published is checked again from the files on disk and then published; files that were already published are recognised as such. An upload whose record in the admin state directory is missing (the directory was not writable) is rebuilt from its folder alone: without its settings, and it waits as `ready` / `manual` after its checks. |
 | Another browser tab or another admin sends to the same upload | A chunk from another tab within 30 seconds of the last one is refused (`409 other_client_active`); that tab offers **Take over**, and the first tab stops at its next chunk. A reloaded tab keeps its own id (it is kept for the tab session), so it does not count as another tab. |
 | The admin key was changed | The next chunk gets `401`; the page asks for the new key and continues. |
 | The disk is full | `507 disk_full`. The chunk that failed is discarded and the upload is kept: free space, then **Resume**; or **Cancel** (frees what was received). |
 
-<!-- s3-recheck: resume identity = CRC32 of the first 1 MiB stored at create + the tail overlap (spec C.1): how the client sends the head probe (an offset=0 chunk compared without writing?). -->
+>>>
 
 **Expiry.** An upload is removed after 72 hours without progress. The time counts only
 while the server runs (a server that was down over a weekend does not remove the uploads
@@ -3246,11 +3414,19 @@ at start-up), and it starts again when an upload becomes `ready`. Finished uploa
 rejected, cancelled and expired uploads is deleted at once.
 
 **Several servers on one models directory** (for example GPU hosts sharing a network
-share): each server holds a lock on the uploads it is receiving, and the others neither
-take them over at a restart nor remove them. Every server must be able to list
-`.provision-upload` in that directory: the server creates it readable for the group of
-the models directory.
-<!-- s3-recheck: per-session advisory lock (fcntl/flock, Windows equivalent) with owner info; recovery and sweep skip locked sessions. -->
+share): each server holds a lock on every upload it has open (`flock` on the upload's
+`.lock` file on Linux, an exclusive handle on Windows; the file names the process, host
+and server), and writes its own server id into the upload's `session.json` hint
+(`<state dir>/uploads/owner`; a server whose state directory cannot be written derives
+the id from its host name and directories, so it still knows its own uploads after a
+restart). Another server never takes over an upload whose hint names another server, not
+even while that server is down, and never touches its lock; it removes such a folder only
+when the upload could have expired (72 hours minus the idle time in the hint) plus 24
+hours have passed since the hint was last written, and no process holds its lock. A hint
+without a server id (written by an older build) is taken over at start-up by the server
+that finds its lock free. Every server must be able to list `.provision-upload` in that
+directory: on Linux the server makes it group-readable and -writable
+([11](#11-storage)).
 
 ### 16.7 Limits and memory
 
@@ -3269,12 +3445,13 @@ Fixed; there is nothing to tune per host.
 
 **Memory of the server.** A chunk is held in memory while it is received, about 3.5
 times its size: with 4 uploads at 16 MiB that is at most about 220 MiB. The answers that
-need no body are given on the chunk route **before** the body is read: no or a wrong
-key, an address the allow-list refuses, an upload busy with another chunk or in its
-checks, too many chunks at once, a `Content-Length` above 16 MiB. Every other route
-reads the body first, as before (at most 100 MB per request, the server's general
-limit).
-<!-- s3-recheck: B.5c pre-request handler: exact set of early refusals and whether a chunked (no Content-Length) body is refused early. -->
+need no body are given on the chunk route **before** the body is read: an address the
+allow-list refuses, no or a wrong key, no `Content-Length` or any `Transfer-Encoding`
+(`411`), a `Content-Encoding` (`415`), a `Content-Length` above 16 MiB, an upload that is
+over, busy in its checks or written by another sender, a chunk of the same upload on its
+way, too many chunks at once ([12.16](#1216-post-adminmodelsuploadchunk)). So a body is
+read only when its real size is known and a slot is free. Every other route reads the
+body first, as before (at most 100 MB per request, the server's general limit).
 
 **Memory of the browser.** It reads one chunk of a file at a time (at most 16 MiB) and
 never holds a whole file.
@@ -3284,7 +3461,6 @@ per CPU core, not measured), which may limit an upload above about 2 Gbit/s. It 
 files every 256 MiB or 15 seconds and, on Linux, tells the kernel to drop the written
 data from the page cache, so a 40 GB upload does not push the weights of running CPU
 models out of memory.
-<!-- s3-recheck: checkpoint interval (256 MiB / 15 s) and posix_fadvise(DONTNEED) after fdatasync (base §3.4). -->
 
 ### 16.8 Disk space
 
@@ -3292,12 +3468,13 @@ models out of memory.
   in the dry run of the dialog) the declared size is compared with the free space minus
   what other unfinished uploads still need: `not_enough_space`, or `larger_than_disk`
   when the files are larger than the whole filesystem. The dialog asks "Upload anyway?".
-  It also warns (`shares_disk_with_state`) when the models directory is on the same
-  filesystem as the admin state directory: a full disk then also stops settings from
-  being saved.
-  <!-- s3-recheck: critique ops-security #4 also names the license state dir and LLAMA_CACHE; the implementation (up_disk_json) compares only the admin state dir, and only on POSIX. -->
-- **The server refuses only facts**: a full disk while writing (`507`, the upload is
-  kept) and bytes beyond the declared size.
+  On Linux it also warns (`shares_disk_with_state`) when the models directory is on the
+  same filesystem as the admin state directory: a full disk then also stops settings
+  from being saved. The license state and the model cache are not compared; on the
+  default layouts they are often on that filesystem too ([11](#11-storage)).
+- **The server refuses only facts**: a chunk that does not fit into the free space
+  (checked before it is written) or a write that fails because the disk is full (`507`,
+  the upload is kept), and bytes beyond the declared size.
 - No preallocation, no reserve, and nothing is deleted to make room.
 - Publishing needs no extra space: it is a rename on the same filesystem.
 - `GET /admin/storage` lists the unfinished uploads with their size
@@ -3441,7 +3618,7 @@ jq '{ state, blocked_by, error, files: [ (.files // [])[] | { name, role, size, 
 ## 17. Deleting models of the models directory
 
 Admin page, **Models** tab: rows of models from the models directory (source
-`models_dir`: uploaded ones and ones dropped in by hand) have **Delete files...**.
+`models_dir`: uploaded ones and ones dropped in by hand) have **Delete files**.
 Downloaded models (source `cache`) keep their **Delete**, the public `DELETE /models`
 ([12.6](#126-downloading-and-deleting-existing-routes-no-admin-key)); sections of
 `models.ini` are removed in `models.ini`.

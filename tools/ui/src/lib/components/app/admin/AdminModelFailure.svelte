@@ -3,6 +3,8 @@
 	import { Button } from '$lib/components/ui/button';
 	import * as Collapsible from '$lib/components/ui/collapsible';
 	import { ADMIN_RESTART_RISK_NOTE } from '$lib/constants';
+	import { AdminFeature, ServerModelSource } from '$lib/enums';
+	import { adminStore, modelsStore } from '$lib/stores';
 	import type { ApiAdminFailureReason } from '$lib/types';
 	import { copyToClipboard, describeFailureReason } from '$lib/utils';
 	import type { Snippet } from 'svelte';
@@ -36,7 +38,14 @@
 		truncated = false
 	}: Props = $props();
 
-	let text = $derived(describeFailureReason(reason));
+	// a models_dir model: "Delete files..." can remove only its projector, which the hint names
+	let projectorRemovable = $derived(
+		adminStore.hasFeature(AdminFeature.DELETE) &&
+			modelsStore.routerModels.some(
+				(model) => model.id === modelId && model.source === ServerModelSource.MODELS_DIR
+			)
+	);
+	let text = $derived(describeFailureReason(reason, { lines, projectorRemovable }));
 	let logOpen = $state(false);
 
 	$effect(() => {

@@ -604,11 +604,34 @@ export function describeUploadBlock(
 				text: 'The SHA-256 you entered does not match the uploaded file. Correct it, publish anyway, or cancel.',
 				title: 'SHA-256 does not match'
 			};
-		case AdminUploadBlock.CHECK_FAILED:
+		case AdminUploadBlock.CHECK_FAILED: {
+			const limit = uploadNameLimit(details);
+
+			if (limit !== null) {
+				// Windows: llama.cpp loads a split model only from a path of at most 259 characters
+				return {
+					text:
+						limit > 0
+							? `This server loads a split model only from a short path: rename it to at most ${limit} characters, then it is checked again. Nothing is uploaded again.`
+							: 'This server loads a split model only from a short path, and the path of its models directory is already too long for one: cancel the upload, or move the models directory to a shorter path.',
+					title: 'The name is too long for this server'
+				};
+			}
+
+			if (typeof details?.file === 'number') {
+				// a file refused when the checks ran again (after a restart): the files are already
+				// arranged for publishing together, so it cannot be dropped any more
+				return {
+					text: `${message || 'A file was refused.'} The upload cannot go on without it: Retry checks the files again, otherwise cancel the upload and upload the model again.`,
+					title: 'A file was refused when the checks ran again'
+				};
+			}
+
 			return {
 				text: `${message || 'The check did not finish.'} The data is kept; Retry runs the checks again.`,
 				title: 'The checks could not run'
 			};
+		}
 		case AdminUploadBlock.SETTINGS_NOT_SAVED:
 			return {
 				text: `${message || 'The placement could not be saved.'} Publish without the placement, or fix the state directory and retry.`,
@@ -622,6 +645,29 @@ export function describeUploadBlock(
 		default:
 			return { text: message, title: 'Waiting' };
 	}
+}
+
+/**
+ * The longest name a ready session can be renamed to when its checks wait
+ * for a shorter name (`check_failed` with code `path_too_long`), else null.
+ */
+export function uploadNameLimit(
+	details: { code?: unknown; max_name_length?: unknown; [key: string]: unknown } | null | undefined
+): number | null {
+	if (details?.code !== 'path_too_long') return null;
+
+	const limit = details.max_name_length;
+
+	return typeof limit === 'number' && Number.isFinite(limit) && limit >= 0
+		? Math.floor(limit)
+		: null;
+}
+
+/** Why a queued model waits: the server has its maximum of open uploads (`too_many_uploads`). */
+export function describeUploadSlotWait(open: number | null): string {
+	const count = open !== null && open > 0 ? `${open} uploads` : 'its maximum of uploads';
+
+	return `the server already has ${count} open; this one starts when one of them is published or cancelled.`;
 }
 
 /** A warning of the upload create / dry run, as a sentence. */
@@ -652,11 +698,11 @@ export function describeDeleteRefusal(reason: string | null | undefined): string
 		case 'cache':
 			return 'This model is in the download cache: use Delete on its row.';
 		case 'preset':
-			return 'This model is defined in models.ini: change it there.';
+			return 'The file of this model is set in models.ini or on the router command line, not by the models directory: change it there.';
 		case 'not_found':
 			return 'The model is no longer in the list.';
 		case 'no_projector':
-			return 'This model has no projector.';
+			return 'This model has no projector of its own (a projector set for every model, on the router command line or in [*] of models.ini, is not removed from here).';
 		case 'outside_models_dir':
 			return 'Its files are outside the models directory.';
 		case 'symlink':

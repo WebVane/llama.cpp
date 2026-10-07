@@ -41,7 +41,9 @@ export enum AdminErrorType {
 	/** The model is running: the change needs `restart: true` */
 	RESTART_REQUIRED = 'restart_required',
 	/** The running model did not stop in time: nothing was saved */
-	STOP_TIMEOUT = 'stop_timeout'
+	STOP_TIMEOUT = 'stop_timeout',
+	/** The server has its maximum of open upload sessions: a new one waits until one ends */
+	TOO_MANY_UPLOADS = 'too_many_uploads'
 }
 
 /**

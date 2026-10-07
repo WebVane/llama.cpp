@@ -250,11 +250,16 @@ export interface ApiAdminDeleteFile {
 	role: 'model' | 'shard' | 'projector' | 'draft';
 }
 
-/** An entry of the model's folder that is not part of the model and stays. */
+/**
+ * An entry that stays: in the model's folder but not part of the model, or
+ * (`shared`) a projector or draft every model uses (router command line,
+ * [*] of models.ini).
+ */
 export interface ApiAdminDeleteKept {
 	path: string;
 	bytes: number | null;
 	kind: 'file' | 'dir' | 'symlink';
+	shared?: boolean;
 }
 
 /** POST /admin/models/delete with dry_run. */

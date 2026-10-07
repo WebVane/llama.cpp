@@ -12,11 +12,15 @@
  * - The chunk size doubles while chunks finish in under 2 s, halves above
  *   15 s, and steps down 8 MiB -> 960 KiB -> 480 KiB -> 240 KiB when a proxy
  *   refuses the size (a 413 that is not the server's JSON) or drops the
- *   connection on the first chunk of a size twice.
- * - After a network error the session is read again (GET ?id=): the chunk
- *   may have landed, another tab may be sending, or the session may have
- *   moved on. Retries back off from 1 s to 30 s; after 30 min of failures it
- *   retries every minute ("server unreachable").
+ *   connection twice on a body longer than any that went through (a short
+ *   last chunk included).
+ * - After a network error (or a 5xx page of a proxy) the session is read
+ *   again (GET ?id=): the chunk may have landed, another tab may be sending,
+ *   or the session may have moved on. Retries back off from 1 s to 30 s;
+ *   after 30 min of failures it retries every minute ("server unreachable").
+ * - A resend before the server offset (after a reload, or a file picked
+ *   again) overlaps at most 1 MiB and at most half a chunk, so it always
+ *   reaches past the offset.
  * - Refusals that need the admin (a disk full, another tab, a refused file,
  *   a rejected key, not the same file) stop the loop until resume().
  *
@@ -201,12 +205,16 @@ export class AdminUploadScheduler {
 	private failures = 0;
 	private files: AdminUploadSchedulerFile[];
 	private inFlight = 0;
+	/** The longest chunk the server accepted: a body this long passes whatever is on the way */
+	private largestAccepted = 0;
 	/** When this client last got a chunk accepted (the server's "last client" rule) */
 	private lastAck: number | null = null;
 	private lastEmit = 0;
 	private loopRunning = false;
 	private needResync = false;
+	/** Network errors in a row on a body of netFailSize bytes */
 	private netFailsAtSize = 0;
+	private netFailSize = 0;
 	private offsetMismatches = 0;
 	private opts: AdminUploadSchedulerOptions;
 	/** Files whose next chunk starts an overlap before the server offset */
@@ -221,8 +229,6 @@ export class AdminUploadScheduler {
 	private sleepAbort: AbortController | null = null;
 	private state: AdminUploadSendState = AdminUploadSendState.IDLE;
 	private stopped = false;
-	/** Chunk sizes that went through at least once */
-	private successAtSize = new Set<number>();
 	private takeoverNext = false;
 	private wake: (() => void) | null = null;
 	private writeFails = 0;
@@ -347,8 +353,7 @@ export class AdminUploadScheduler {
 		this.crcFails = 0;
 		this.writeFails = 0;
 		this.offsetMismatches = 0;
-
-		if (length >= this.chunkSize) this.successAtSize.add(this.chunkSize);
+		this.largestAccepted = Math.max(this.largestAccepted, length);
 
 		this.sample();
 	}
@@ -662,14 +667,23 @@ export class AdminUploadScheduler {
 			return;
 		}
 
+		// the size of the body that failed: a chunk can be shorter than chunkSize (a small file,
+		// the tail of a file after a resume), and a limit on the way refuses it all the same
+		const failed = Math.min(length, this.chunkSize);
+
+		if (failed !== this.netFailSize) {
+			this.netFailSize = failed;
+			this.netFailsAtSize = 0;
+		}
+
 		if (
-			length >= this.chunkSize &&
-			!this.successAtSize.has(this.chunkSize) &&
-			++this.netFailsAtSize >= ADMIN_UPLOAD.NET_FAILS_BEFORE_STEP_DOWN &&
-			this.chunkSize > this.opts.chunkMin
+			failed > this.largestAccepted &&
+			failed > this.opts.chunkMin &&
+			++this.netFailsAtSize >= ADMIN_UPLOAD.NET_FAILS_BEFORE_STEP_DOWN
 		) {
-			// the connection drops on every chunk of this size: something on the way limits it
-			this.stepDown(length, false);
+			// the connection drops on every chunk of this size and none this large went through:
+			// something on the way limits the request size
+			this.stepDown(failed, false);
 
 			return;
 		}
@@ -788,7 +802,13 @@ export class AdminUploadScheduler {
 
 		if (this.overlapPending.has(file.index)) {
 			this.overlapPending.delete(file.index);
-			start = Math.max(0, file.offset - ADMIN_UPLOAD.OVERLAP_BYTES);
+
+			// at most half a chunk: the chunk then always ends past the server's offset, so it
+			// appends bytes (a chunk that lies wholly inside the stored bytes proves nothing new,
+			// and an older server answered it with a false 507 disk_full)
+			const overlap = Math.min(ADMIN_UPLOAD.OVERLAP_BYTES, Math.floor(this.chunkSize / 2));
+
+			start = Math.max(0, file.offset - overlap);
 		}
 
 		const length = Math.min(this.chunkSize, file.size - start);
@@ -893,7 +913,10 @@ export class AdminUploadScheduler {
 			return;
 		}
 
-		if (result.status === 0) {
+		// no answer, or a 5xx that is not the server's JSON: a proxy in front of it (an nginx 502
+		// when the server refused the chunk before its body and closed the connection). Either
+		// way the session tells what happened
+		if (result.status === 0 || (result.status >= 500 && !result.body)) {
 			await this.handleNetworkError(file, start, length, before);
 
 			return;
