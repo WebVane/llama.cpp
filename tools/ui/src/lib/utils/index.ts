@@ -7,6 +7,130 @@
  * import { ... } from '$lib/utils/browser-only'
  */
 
+// Admin panel helpers
+export {
+	buildAdminModelRows,
+	buildSettingsUpdate,
+	cacheModelIds,
+	countRunningModels,
+	createSettingsDraft,
+	describeDownloadWarnings,
+	formatBytes,
+	isDownloadPlaceholderStatus,
+	isValidDeviceSpec,
+	isValidHfModelSpec,
+	maxPinnedModels,
+	normalizeDeviceSpec,
+	normalizeHfModelSpec,
+	parseModelsMax,
+	rebaseSettingsDraft,
+	resolveDownloadResult,
+	sumDownloadProgress,
+	validateSettingsDraft
+} from './admin';
+
+// Admin panel: fit of a model on its GPUs (exact check + instant rough formula)
+export {
+	describeFit,
+	estimateFitByFormula,
+	fitCheckErrorKind,
+	fitFromCheck,
+	fitGpuStates,
+	fitTargetDevices,
+	fitVerdict,
+	formatAge,
+	gpuLayerCount,
+	kvCells,
+	layerPlacement,
+	roughComputeBytes,
+	toFitVerdict,
+	worstFitVerdict
+} from './admin-fit';
+
+// Admin panel: GPU cards and diagnostics
+export {
+	describeGpuBackend,
+	describeGpuFree,
+	describeGpuMapping,
+	describeGpuMemorySource,
+	describeModelMemorySource,
+	describeProbeState,
+	formatDiagnosticsReport,
+	formatDiagnosticValue,
+	gpuBarSegments,
+	summarizeDiagnosticValue
+} from './admin-gpus';
+
+// Admin panel: per-model settings (draft, values, texts, restart progress)
+export {
+	buildModelSettingsUpdate,
+	canonicalSettingValue,
+	changedSettingKeys,
+	contextModeOf,
+	createModelSettingsDraft,
+	createRestartTracker,
+	describeDeviceValue,
+	describeFailureReason,
+	describeInheritedValue,
+	describeModelWarning,
+	describeResetChanges,
+	describeSaveResult,
+	describeSettingOrigin,
+	describeSettingValue,
+	draftChangesEffect,
+	draftContext,
+	draftSettingValue,
+	draftValueUnlessInherited,
+	draftWarnings,
+	effectiveDraftSetting,
+	formatTokenCount,
+	formatTokensShort,
+	isAdminSettingKey,
+	isInstanceAfterFailure,
+	isQuantizedCacheType,
+	isRunningStatus,
+	isSettingLocked,
+	modelRoleOf,
+	normalizeDraftValue,
+	padContext,
+	placementSummary,
+	rebaseModelSettingsDraft,
+	restartPhase,
+	revertPlan,
+	settingField,
+	settingSchema,
+	settingValuesEqual,
+	splitDeviceList,
+	trackRestartStatus,
+	ubatchHelp,
+	validateModelSettingsDraft,
+	validateSettingValue,
+	withContextMode,
+	withFailedSettings,
+	withModelRole
+} from './admin-model-settings';
+export type {
+	AdminDraftContext,
+	AdminFailureText,
+	AdminPlacementSummary,
+	AdminRawSettingValue,
+	AdminRestartTracker,
+	AdminRevertPlan
+} from './admin-model-settings';
+export type { AdminFitFormulaInput, AdminFitText } from './admin-fit';
+export type { AdminGpuState } from './admin-gpus';
+
+// Admin panel: export / import of the settings of one model
+export {
+	applyImportToDraft,
+	buildImportPreview,
+	buildSettingsExport,
+	describeImportIssue,
+	parseSettingsFile,
+	settingsFileName
+} from './admin-transfer';
+export type { AdminSettingsFileParse } from './admin-transfer';
+
 // API utilities
 export { getAuthHeaders, getJsonHeaders, sanitizeHeaders } from './api-headers';
 export { ApiError, apiFetch, apiFetchWithParams, apiPost } from './api-fetch';

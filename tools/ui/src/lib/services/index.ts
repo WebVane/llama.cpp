@@ -356,3 +356,15 @@ export { SettingsService } from './settings.service';
  * Wraps GET /license/status and POST /license/activate of provision-server.
  */
 export { LicenseService } from './license.service';
+
+/**
+ * **AdminService** - Admin panel API (router mode with PROVISION_ADMIN=1)
+ *
+ * Wraps the /admin routes of provision-server: the status probe plus the
+ * settings, storage and download pre-flight routes that take the admin key.
+ * The only sender of the X-Admin-Key header. Failures are AdminApiError
+ * instances that keep the server's `error.type`.
+ *
+ * @see adminStore in stores/admin.svelte.ts - probe, key handling, page state
+ */
+export { AdminApiError, AdminService } from './admin.service';

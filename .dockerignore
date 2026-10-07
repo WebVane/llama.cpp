@@ -20,3 +20,9 @@ models/*
 arm_neon.h
 compile_commands.json
 Dockerfile
+
+# provision-admin: models next to docker-dual/docker-compose.yml and unfinished GGUF
+# uploads, so that "docker compose build" does not send them as build context
+docker-dual/models/
+docker-dual/models-rw/
+**/.provision-upload/

@@ -1,4 +1,5 @@
-import { Package, Search, Settings, SquarePen } from '@lucide/svelte';
+import { ROUTES } from './routes.constants';
+import { Package, Search, Settings, ShieldCheck, SquarePen } from '@lucide/svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
 import type { DesktopIconStripItem } from '$lib/types';
 
@@ -65,5 +66,12 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		action: SidebarAction.SETTINGS,
 		icon: Settings,
 		tooltip: 'Settings'
+	},
+	{
+		activeRouteId: '/admin',
+		icon: ShieldCheck,
+		requiresAdmin: true,
+		route: ROUTES.ADMIN,
+		tooltip: 'Admin'
 	}
 ];

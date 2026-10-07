@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-context.h"
 #include "server-stream.h"
+#include "server-admin.h" // provision-admin
 
 #include "build-info.h"
 #include "preset.h"
@@ -186,6 +187,7 @@ private:
             LOG_DBG("[%5d] %s", c.port, line.c_str()); // prevent spamming the log
             models.handle_child_state(c.name, line);
         } else {
+            server_admin_child_line(c.name, c.proc.get(), c.port, line); // provision-admin: output tail for /admin/models/log
             LOG("[%5d] %s", c.port, line.c_str()); // forward log
         }
     }
@@ -277,6 +279,10 @@ struct server_lru_sched {
             }
             // already on its way out, or a queued request wants it
             if (models.stopping_models.count(m.first) || find(m.first)) {
+                continue;
+            }
+            // provision-admin: a pinned model is never evicted
+            if (models.pinned_models.count(m.first)) {
                 continue;
             }
             if (victim.empty() || m.second.meta.last_used < victim_last_used) {
@@ -562,6 +568,8 @@ void server_model_meta::update_caps() {
         common_models_handler_apply(handler, params); // note: this won't download the model because offline=true
         if (params.no_mmproj || params.mmproj.path.empty()) {
             multimodal = { false, false };
+        } else if (!server_admin_mmproj_usable(params.mmproj.path)) { // provision-admin: typed pre-check, a bad projector aborted the router
+            multimodal = { false, false };
         } else {
             multimodal = mtmd_get_cap_from_file(params.mmproj.path.c_str());
         }
@@ -720,6 +728,9 @@ void server_models::load_models() {
         source_map[name] = SERVER_MODEL_SOURCE_PRESET;
     }
 
+    // provision-admin: per-model admin settings, and "GPU for new models" for cache / models_dir entries without a device
+    const uint64_t admin_overlay_gen = server_admin_overlay_presets(ctx_preset, final_presets, source_map, base_preset);
+
     // overlay router's own CLI args on top of every model preset so that
     // e.g. `llama-server --temp 0` is honoured by all child processes
     for (auto & [name, preset] : final_presets) {
@@ -877,6 +888,19 @@ void server_models::load_models() {
     } else {
         // RELOAD: diff the new preset list against the current mapping and reconcile
         is_reloading = true;
+        // provision-admin: a reload that throws must not leave is_reloading set, every later load() would wait forever;
+        // what it changed before the failure stays, so finish that part like a successful reload does
+        server_admin_on_throw reload_guard([&]() {
+            if (!lk.owns_lock()) {
+                lk.lock();
+            }
+            apply_stop_timeout();
+            apply_hidden();
+            is_reloading = false;
+            cv.notify_all();
+            lk.unlock();
+            notify_sse("models_reload", "*");
+        });
 
         // find running models whose source was removed or whose preset changed
         std::vector<std::string> to_unload;
@@ -997,6 +1021,12 @@ void server_models::load_models() {
         apply_stop_timeout();
         apply_hidden();
 
+        // provision-admin: the admin device setting changed after Phase 1 read it (e.g. this reload released the
+        // lock above while the one started by the settings change ran): rebuild on the next get_meta()
+        if (server_admin_overlay_changed(admin_overlay_gen)) {
+            need_reload = true;
+        }
+
         // clear reload flag under the lock, this releases the load() calls waiting on !is_reloading
         is_reloading = false;
         cv.notify_all();
@@ -1022,6 +1052,43 @@ void server_models::load_startup_models() {
     for (const auto & name : to_load) {
         SRV_INF("(startup) loading model %s\n", name.c_str());
         load(name);
+    }
+}
+
+//
+// provision-admin: hooks for the admin layer (server-admin.cpp)
+//
+
+void server_models::set_models_max(int models_max) {
+    std::unique_lock<std::mutex> lk(mutex);
+    base_params.models_max = models_max;
+    // more slots may let a queued request load right away
+    sched->tick(lk);
+    cv.notify_all();
+}
+
+int server_models::get_models_max() {
+    std::lock_guard<std::mutex> lk(mutex);
+    return base_params.models_max;
+}
+
+void server_models::set_pinned_models(std::set<std::string> names) {
+    std::unique_lock<std::mutex> lk(mutex);
+    pinned_models = std::move(names);
+    // a model that is no longer pinned may be the victim a queued request is waiting for
+    sched->tick(lk);
+    cv.notify_all();
+}
+
+// the lazy reload runs on behalf of an unrelated request (need_reload is set after a download):
+// a failure must not fail that request, the previous mapping stays in use
+void server_models::load_models_lazy() {
+    try {
+        load_models();
+    } catch (const std::exception & e) {
+        SRV_ERR("reloading the model list failed, the list may be partially updated (GET /models?reload=1 retries): %s\n", e.what());
+        std::lock_guard<std::mutex> lk(mutex);
+        need_reload = false; // do not retry (and fail) on every request
     }
 }
 
@@ -1051,7 +1118,7 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
     std::unique_lock<std::mutex> lk(mutex);
     if (need_reload) {
         lk.unlock();
-        load_models();
+        load_models_lazy(); // provision-admin: a failing lazy reload must not fail this request
         lk.lock();
     }
 
@@ -1071,7 +1138,7 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     std::unique_lock<std::mutex> lk(mutex);
     if (need_reload) {
         lk.unlock();
-        load_models();
+        load_models_lazy(); // provision-admin: a failing lazy reload must not fail this request
         lk.lock();
     }
 
@@ -1084,17 +1151,27 @@ std::vector<server_model_meta> server_models::get_all_meta() {
 }
 
 void server_models::unload_lru() {
-    if (base_params.models_max <= 0) {
+    if (get_models_max() <= 0) { // provision-admin: models_max can change at runtime, read it under the lock
         return; // no limit
     }
     // remove one of the servers if we passed the models_max (least recently used - LRU)
     std::string lru_model_name;
+    bool over_limit = false; // provision-admin
     {
         std::unique_lock<std::mutex> lk(mutex);
         if (sched->has_capacity(lk)) {
             return;
         }
         lru_model_name = sched->pick_victim(lk);
+        // provision-admin: models_max lowered at runtime below the number of running models: one eviction does
+        // not free a slot, evict the next one after it (models already stopping free their slot by themselves)
+        size_t n_staying = 0;
+        for (const auto & m : mapping) {
+            if (m.second.meta.is_running() && !stopping_models.count(m.first)) {
+                n_staying++;
+            }
+        }
+        over_limit = n_staying > (size_t) base_params.models_max;
     }
     if (!lru_model_name.empty()) {
         SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
@@ -1105,6 +1182,9 @@ void server_models::unload_lru() {
             cv.wait(lk, [this, &lru_model_name]() {
                 return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
             });
+        }
+        if (over_limit) {
+            unload_lru(); // provision-admin: see over_limit
         }
     }
 }
@@ -1232,6 +1312,22 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
         if (it == mapping.end() || it->second.subproc != proc) {
             stopping_models.erase(name);
             return; // entry erased, or a newer instance took the name
+        }
+    }
+    // provision-admin: a download child that exits without reporting a result (crash / kill) would leave
+    // its entry in DOWNLOADING forever; fail it the way a reported failure does, so that a later
+    // unload / delete / re-download does not wait on it
+    if (mode == SERVER_CHILD_MODE_DOWNLOAD) {
+        bool died = false;
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            auto it = mapping.find(name);
+            died = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING;
+        }
+        if (died) {
+            SRV_WRN("download child for name=%s exited with status %d without reporting a result, marking the download as failed\n",
+                    name.c_str(), exit_code);
+            update_download_progress(name, {}, true, false);
         }
     }
     if (mode == SERVER_CHILD_MODE_DOWNLOAD) {
@@ -1953,7 +2049,7 @@ void server_models_routes::init_routes() {
             res_ok(res, {
                 // TODO: add support for this on web UI
                 {"role",                 "router"},
-                {"max_instances",        params.models_max},
+                {"max_instances",        models.get_models_max()}, // provision-admin: models_max can change at runtime
                 {"models_autoload",      params.models_autoload},
                 // this is a dummy response to make sure the UI doesn't break
                 {"model_alias", "llama-server"},

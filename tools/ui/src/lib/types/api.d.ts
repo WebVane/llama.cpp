@@ -2,6 +2,7 @@ import type { ChatMessagePromptProgress, ChatRole } from './chat';
 import type {
 	ContentPartType,
 	FileTypeAudio,
+	ServerModelSource,
 	ServerModelsSseEventType,
 	ServerModelStatus,
 	ServerRole
@@ -67,10 +68,16 @@ export interface ApiChatMessageData {
  * Model status object from /models endpoint
  */
 export interface ApiModelStatus {
-	/** Status value: loaded, unloaded, loading, sleeping, failed */
+	/** Status value: loaded, unloaded, loading, sleeping, downloading, downloaded */
 	value: ServerModelStatus;
 	/** Command line arguments used when loading (only for loaded models) */
 	args?: string[];
+	/** Effective preset of the model rendered as INI text */
+	preset?: string;
+	/** Exit code of the last instance, reported together with `failed` */
+	exit_code?: number;
+	/** True when the model is unloaded because its last instance exited with an error */
+	failed?: boolean;
 }
 
 /**
@@ -98,6 +105,10 @@ export interface ApiModelDataEntry {
 	aliases?: string[];
 	/** Informational tags for this model */
 	tags?: string[];
+	/** Where the router found the model: preset (models.ini), cache (Hugging Face) or models_dir */
+	source?: ServerModelSource;
+	/** True when DELETE /models can remove the model files (cache models only) */
+	can_remove?: boolean;
 	/** Modality capabilities, reported by the router for every model regardless of load state */
 	architecture?: ApiModelArchitecture;
 	/** Legacy meta field (may be present in older responses) */
@@ -136,6 +147,23 @@ export interface ApiModelsSseData {
 	status: ServerModelStatus;
 	progress?: ApiModelsSseProgress;
 	exit_code?: number;
+}
+
+/**
+ * Byte counters of one file of a running download, keyed by its URL in
+ * the download_progress payload.
+ */
+export interface ApiModelsSseDownloadFile {
+	done: number;
+	total: number;
+}
+
+/**
+ * Payload of a download_progress record on the /models/sse feed.
+ * download_finished and download_failed carry no payload at all.
+ */
+export interface ApiModelsSseDownloadData {
+	progress?: Record<string, ApiModelsSseDownloadFile>;
 }
 
 /**

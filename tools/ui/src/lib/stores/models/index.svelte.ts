@@ -242,6 +242,15 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 		return this.models.find((model) => model.id === modelId) ?? null;
 	}
 
+	findModelByName(modelName: string): ModelOption | null {
+		return (
+			this.models.find(
+				(model) =>
+					model.model === modelName || model.id === modelName || model.aliases?.includes(modelName)
+			) ?? null
+		);
+	}
+
 	/**
 	 * Model to fall back to when nothing is selected (ROUTER mode): the model the
 	 * server tagged as default (loaded or not, the router loads it on demand),
@@ -251,15 +260,6 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 		return (
 			this.findDefaultTaggedModel(options) ??
 			options.find((option) => this.isModelLoaded(option.model))
-		);
-	}
-
-	findModelByName(modelName: string): ModelOption | null {
-		return (
-			this.models.find(
-				(model) =>
-					model.model === modelName || model.id === modelName || model.aliases?.includes(modelName)
-			) ?? null
 		);
 	}
 
@@ -289,6 +289,15 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 
 	hasModel(modelName: string): boolean {
 		return this.models.some((model) => model.model === modelName);
+	}
+
+	/**
+	 * Transient row of a running or just finished download (ROUTER mode).
+	 */
+	isDownloadPlaceholder(modelId: string): boolean {
+		const model = this.routerModels.find((m) => m.id === modelId);
+
+		return !!model && ModelsService.isDownloadPlaceholder(model);
 	}
 
 	isFavorite(modelId: string): boolean {
@@ -425,6 +434,14 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 	}
 
 	/**
+	 * First model tagged as default by the server (`--tags default`, or
+	 * `tags = default` in a router preset), if any.
+	 */
+	private findDefaultTaggedModel(options: ModelOption[]): ModelOption | undefined {
+		return options.find((option) => option.tags?.includes(MODEL_DEFAULT_TAG));
+	}
+
+	/**
 	 * Filter to models visible in the UI (ui !== false).
 	 */
 	private getVisibleModels(): ModelOption[] {
@@ -441,14 +458,6 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 
 			return new Set();
 		}
-	}
-
-	/**
-	 * First model tagged as default by the server (`--tags default`, or
-	 * `tags = default` in a router preset), if any.
-	 */
-	private findDefaultTaggedModel(options: ModelOption[]): ModelOption | undefined {
-		return options.find((option) => option.tags?.includes(MODEL_DEFAULT_TAG));
 	}
 
 	/**
@@ -481,7 +490,11 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 				const response = await ModelsService.listRouter();
 
 				this.routerModels = response.data;
-				this.models = this.buildModelOptions(response);
+				// rows of a running download are placeholders, not models to pick in the
+				// chat selector; routerModels keeps them for the admin page
+				this.models = this.buildModelOptions(response).filter(
+					(option) => !this.isDownloadPlaceholder(option.id)
+				);
 
 				this.preselectDefaultTaggedModel();
 

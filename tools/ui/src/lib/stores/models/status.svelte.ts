@@ -30,7 +30,30 @@ export interface ModelStatusHost {
 	toDisplayName(id: string): string;
 }
 
+/**
+ * Optional limits for a load or unload started from the admin page. Chat
+ * call sites pass nothing and keep waiting on the feed as before.
+ */
+export interface ModelOperationOptions {
+	/** Abort the HTTP request after this many milliseconds. */
+	requestTimeoutMs?: number;
+	/** Stop waiting for the feed to confirm the new status after this many milliseconds. */
+	statusTimeoutMs?: number;
+}
+
+/** The feed did not confirm a load or unload within `statusTimeoutMs`. */
+export class ModelStatusTimeoutError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'ModelStatusTimeoutError';
+	}
+}
+
 export class ModelStatusManager {
+	// observers of the raw feed (the admin page: download progress and results)
+	private eventListeners: Array<(event: ApiModelsSseEvent) => void> = [];
+	// observers of feed (re)connections (the admin page: re-read what was missed)
+	private feedOpenListeners: Array<() => void> = [];
 	private loadingStates = new SvelteMap<string, boolean>();
 	private loadProgress = new SvelteMap<string, ModelLoadProgress>();
 	// /models/sse feed state, the single source of truth for status and load progress
@@ -38,7 +61,12 @@ export class ModelStatusManager {
 	private statusReaderActive = false;
 	private statusWaiters = new SvelteMap<
 		string,
-		{ target: ServerModelStatus; resolve: () => void; reject: (e: Error) => void }
+		{
+			target: ServerModelStatus;
+			resolve: () => void;
+			reject: (e: Error) => void;
+			timer: ReturnType<typeof setTimeout> | null;
+		}
 	>();
 
 	constructor(private host: ModelStatusHost) {}
@@ -60,7 +88,7 @@ export class ModelStatusManager {
 		return this.loadingStates.get(modelId) ?? false;
 	}
 
-	async load(modelId: string): Promise<void> {
+	async load(modelId: string, options: ModelOperationOptions = {}): Promise<void> {
 		if (this.host.isModelLoaded(modelId)) return;
 
 		if (this.loadingStates.get(modelId)) return;
@@ -71,23 +99,61 @@ export class ModelStatusManager {
 		// the feed drives completion, so it must be live before the request
 		this.subscribe();
 
-		const reachedLoaded = this.waitForStatus(modelId, ServerModelStatus.LOADED);
+		const reachedLoaded = this.waitForStatus(
+			modelId,
+			ServerModelStatus.LOADED,
+			options.statusTimeoutMs
+		);
 
 		reachedLoaded.catch(() => {});
 
 		try {
-			await ModelsService.load(modelId);
+			await ModelsService.load(
+				modelId,
+				undefined,
+				options.requestTimeoutMs ? { timeoutMs: options.requestTimeoutMs } : undefined
+			);
 			await reachedLoaded;
 			toast.success(`Model loaded: ${this.host.toDisplayName(modelId)}`);
 		} catch (error) {
 			this.rejectStatus(modelId, error instanceof Error ? error : new Error('load failed'));
 			this.host.error = error instanceof Error ? error.message : 'Failed to load model';
-			toast.error(`Failed to load model: ${this.host.toDisplayName(modelId)}`);
+			toast.error(
+				error instanceof ModelStatusTimeoutError
+					? error.message
+					: `Failed to load model: ${this.host.toDisplayName(modelId)}`
+			);
 
 			throw error;
 		} finally {
 			this.loadingStates.set(modelId, false);
 		}
+	}
+
+	/**
+	 * Observe every record of the /models/sse feed after the manager applied
+	 * it to the model rows. Used by the admin page for download progress and
+	 * results; returns the matching stop function.
+	 */
+	onEvent(listener: (event: ApiModelsSseEvent) => void): () => void {
+		this.eventListeners.push(listener);
+
+		return () => {
+			this.eventListeners = this.eventListeners.filter((current) => current !== listener);
+		};
+	}
+
+	/**
+	 * Observe every (re)connection of the /models/sse feed. Events sent while
+	 * the feed was down are lost, so an observer that mirrors server state
+	 * re-reads it; returns the matching stop function.
+	 */
+	onFeedOpen(listener: () => void): () => void {
+		this.feedOpenListeners.push(listener);
+
+		return () => {
+			this.feedOpenListeners = this.feedOpenListeners.filter((current) => current !== listener);
+		};
 	}
 
 	/**
@@ -104,7 +170,7 @@ export class ModelStatusManager {
 		void this.runStatusReader(this.statusAbort.signal);
 	}
 
-	async unload(modelId: string): Promise<void> {
+	async unload(modelId: string, options: ModelOperationOptions = {}): Promise<void> {
 		if (!this.host.isModelLoaded(modelId)) return;
 
 		if (this.loadingStates.get(modelId)) return;
@@ -114,18 +180,29 @@ export class ModelStatusManager {
 
 		this.subscribe();
 
-		const reachedUnloaded = this.waitForStatus(modelId, ServerModelStatus.UNLOADED);
+		const reachedUnloaded = this.waitForStatus(
+			modelId,
+			ServerModelStatus.UNLOADED,
+			options.statusTimeoutMs
+		);
 
 		reachedUnloaded.catch(() => {});
 
 		try {
-			await ModelsService.unload(modelId);
+			await ModelsService.unload(
+				modelId,
+				options.requestTimeoutMs ? { timeoutMs: options.requestTimeoutMs } : undefined
+			);
 			await reachedUnloaded;
 			toast.info(`Model unloaded: ${this.host.toDisplayName(modelId)}`);
 		} catch (error) {
 			this.rejectStatus(modelId, error instanceof Error ? error : new Error('unload failed'));
 			this.host.error = error instanceof Error ? error.message : 'Failed to unload model';
-			toast.error(`Failed to unload model: ${this.host.toDisplayName(modelId)}`);
+			toast.error(
+				error instanceof ModelStatusTimeoutError
+					? error.message
+					: `Failed to unload model: ${this.host.toDisplayName(modelId)}`
+			);
 
 			throw error;
 		} finally {
@@ -155,6 +232,12 @@ export class ModelStatusManager {
 
 		const status = data.status;
 
+		// a new instance starts, or the old one is gone: its cached props (n_ctx...)
+		// may no longer be true, e.g. after an admin restart with other settings
+		if (status === ServerModelStatus.LOADING || status === ServerModelStatus.UNLOADED) {
+			this.host.props.invalidate(model);
+		}
+
 		this.setRouterModelStatus(model, status);
 
 		if (status === ServerModelStatus.LOADING) {
@@ -183,7 +266,8 @@ export class ModelStatusManager {
 	/**
 	 * Route one feed record by event kind. Only the status_* events carry a
 	 * status payload, models_reload triggers a list refresh, model_remove drops
-	 * the row, download_* belong to the download surface, not here.
+	 * the row, download_* belong to the download surface (the admin page, which
+	 * observes the feed through onEvent), not here.
 	 */
 	private applyStatusEvent(event: ApiModelsSseEvent): void {
 		switch (event.event) {
@@ -201,8 +285,49 @@ export class ModelStatusManager {
 				this.removeRouterModel(event.model);
 
 				break;
+			case ServerModelsSseEventType.DOWNLOAD_FAILED:
+			case ServerModelsSseEventType.DOWNLOAD_FINISHED:
 			case ServerModelsSseEventType.DOWNLOAD_PROGRESS:
 				break;
+		}
+
+		for (const listener of this.eventListeners) {
+			try {
+				listener(event);
+			} catch (error) {
+				console.error('Model event listener failed:', error);
+			}
+		}
+	}
+
+	/**
+	 * The feed did not confirm the target status in time (only armed when a
+	 * caller passed statusTimeoutMs). The model list is the source of truth:
+	 * settle when the model got there anyway, otherwise give up so the caller
+	 * is not left waiting forever.
+	 */
+	private async expireStatus(modelId: string, target: ServerModelStatus): Promise<void> {
+		const armed = this.statusWaiters.get(modelId);
+
+		await this.host.fetchRouterModels();
+
+		// settled, or replaced by a newer operation, while the list was read
+		if (!armed || this.statusWaiters.get(modelId) !== armed) return;
+
+		const current = this.host.routerModels.find((m) => m.id === modelId)?.status.value;
+		const reached =
+			current === target ||
+			(target === ServerModelStatus.LOADED && current === ServerModelStatus.SLEEPING);
+
+		if (reached) {
+			this.settleStatus(modelId, target);
+		} else {
+			this.rejectStatus(
+				modelId,
+				new ModelStatusTimeoutError(
+					`Timed out waiting for model status: ${this.host.toDisplayName(modelId)}`
+				)
+			);
 		}
 	}
 
@@ -214,6 +339,9 @@ export class ModelStatusManager {
 
 		if (waiter) {
 			this.statusWaiters.delete(modelId);
+
+			if (waiter.timer) clearTimeout(waiter.timer);
+
 			waiter.reject(error);
 		}
 	}
@@ -233,7 +361,19 @@ export class ModelStatusManager {
 	 * Read the feed and reconnect until unsubscribed.
 	 */
 	private async runStatusReader(signal: AbortSignal): Promise<void> {
-		await ModelsService.watchModelEvents(signal, (event) => this.applyStatusEvent(event));
+		await ModelsService.watchModelEvents(
+			signal,
+			(event) => this.applyStatusEvent(event),
+			() => {
+				for (const listener of this.feedOpenListeners) {
+					try {
+						listener();
+					} catch (error) {
+						console.error('Model feed listener failed:', error);
+					}
+				}
+			}
+		);
 	}
 
 	/**
@@ -262,6 +402,9 @@ export class ModelStatusManager {
 
 		if (waiter && waiter.target === status) {
 			this.statusWaiters.delete(modelId);
+
+			if (waiter.timer) clearTimeout(waiter.timer);
+
 			waiter.resolve();
 		}
 	}
@@ -269,10 +412,20 @@ export class ModelStatusManager {
 	/**
 	 * Register an awaiter that resolves when the feed reports target status.
 	 * One operation runs per model at a time, so one awaiter per model is kept.
+	 * With a timeout the awaiter expires through expireStatus; without one it
+	 * waits on the feed for as long as it takes.
 	 */
-	private waitForStatus(modelId: string, target: ServerModelStatus): Promise<void> {
+	private waitForStatus(
+		modelId: string,
+		target: ServerModelStatus,
+		timeoutMs?: number
+	): Promise<void> {
 		return new Promise((resolve, reject) => {
-			this.statusWaiters.set(modelId, { reject, resolve, target });
+			const timer = timeoutMs
+				? setTimeout(() => void this.expireStatus(modelId, target), timeoutMs)
+				: null;
+
+			this.statusWaiters.set(modelId, { reject, resolve, target, timer });
 		});
 	}
 }

@@ -1,0 +1,4 @@
+# These files are installed on Linux hosts as they are (systemd unit, systemd
+# EnvironmentFile, nginx site): keep LF line endings in every checkout, also
+# with core.autocrlf on Windows.
+* text eol=lf

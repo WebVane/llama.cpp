@@ -1,5 +1,6 @@
 #include "license/Activation.h"
 
+#include "license/DurableWrite.h"
 #include "license/Jcs.h"
 #include "license/Keyring.h"
 #include "license/Uuid.h"
@@ -291,29 +292,13 @@ bool ActivationClient::save_lic_atomic(const std::filesystem::path& path,
     const auto suffix = std::to_string(rd()) + "." + std::to_string(rd());
     const auto tmp = path.parent_path() / (path.filename().string() + ".tmp." + suffix);
 
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out.write(raw_json.data(), static_cast<std::streamsize>(raw_json.size()));
-        if (!out.good()) {
-            out.close();
-            fs::remove(tmp, ec);
-            return false;
-        }
+    // every byte on disk (write, fsync, size, close checked) before the rename: a full disk must not leave
+    // a short .lic in place of the activated one
+    if (!durable_write_file(tmp, raw_json)) {
+        return false;
     }
-
-    fs::rename(tmp, path, ec);
-    if (ec) {
-        // Rename can fail on Windows when the target exists — fall back
-        // to remove + rename.
-        fs::remove(path, ec);
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            fs::remove(tmp, ec);
-            return false;
-        }
-    }
-    return true;
+    // A failed rename leaves the previous .lic in place (durable_replace never removes it first).
+    return durable_replace(tmp, path);
 }
 
 }  // namespace visio::license

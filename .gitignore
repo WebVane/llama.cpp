@@ -153,3 +153,8 @@ a.out.*
 AGENTS.local.md
 .pi/SYSTEM.md
 windows-installer/tools/svg2ico/node_modules/
+
+# provision-admin: model storage of docker-dual (downloads, uploads, dropped-in models)
+# and the folder of unfinished GGUF uploads in any models directory
+docker-dual/models-rw/
+**/.provision-upload/

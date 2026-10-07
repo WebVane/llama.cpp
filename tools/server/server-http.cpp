@@ -678,6 +678,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             {},
             req.is_connection_closed
         });
+        request->remote_addr = req.remote_addr; // provision-admin: client address for the /admin allow-list
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
@@ -729,12 +730,39 @@ void server_http_context::post(const std::string & path, const server_http_conte
             std::move(files),
             req.is_connection_closed
         });
+        request->remote_addr = req.remote_addr; // provision-admin: client address for the /admin allow-list
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {
         srv->Post(full_path, callback);
+    }
+}
+
+// provision-admin: see server-http.h
+void server_http_context::set_pre_body_handler(const std::string & path, const pre_body_handler_t & handler) const {
+    const std::string full_path = path_prefix + path;
+    for (const auto & srv : pimpl->servers) {
+        srv->set_pre_request_handler([full_path, handler](const httplib::Request & req, httplib::Response & res) {
+            if (req.method != "POST" || req.matched_route != full_path) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            server_http_req request{ get_params(req), get_headers(req), req.path, build_query_string(req), "", {}, req.is_connection_closed };
+            request.remote_addr = req.remote_addr;
+            std::shared_ptr<void> hold;
+            server_http_res_ptr refused = handler(request, hold);
+            if (hold) {
+                res.user_data.set("provision-admin-hold", hold); // released with the response, read body or not
+            }
+            if (!refused) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            res.status = refused->status;
+            set_headers(res, refused->headers);
+            res.set_content(refused->data, refused->content_type);
+            return httplib::Server::HandlerResponse::Handled;
+        });
     }
 }
 
@@ -750,6 +778,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
             {},
             req.is_connection_closed
         });
+        request->remote_addr = req.remote_addr; // provision-admin: client address for the /admin allow-list
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
@@ -908,6 +937,7 @@ void server_http_context::register_gcp_compat() const {
                         payload.dump(),
                         {},
                         req.should_stop,
+                        req.remote_addr, // provision-admin: same client address as the outer request
                     };
 
                     server_http_res_ptr internal_res = handlers.at(dispatch_path)(internal_req);

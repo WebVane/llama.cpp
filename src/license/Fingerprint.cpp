@@ -1,5 +1,6 @@
 #include "license/Fingerprint.h"
 
+#include "license/DurableWrite.h"
 #include "license/Sha256.h"
 
 #include <openssl/rand.h>
@@ -154,37 +155,15 @@ std::optional<std::string> read_or_create_persisted_state_id(
     const auto tmp = state_dir / ("machine-id.tmp." +
                                   std::to_string(rd()) + "." +
                                   std::to_string(rd()));
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return std::nullopt;
-        out.write(uuid->data(), static_cast<std::streamsize>(uuid->size()));
-        out.put('\n');   // trailing newline so `cat` output looks normal
-        if (!out.good()) {
-            out.close();
-            fs::remove(tmp, ec);
-            return std::nullopt;
-        }
+    // Written durably (write, fsync, size, close checked) with mode 0600 (operator-only read/write; POSIX
+    // only, on Windows the file inherits the ACLs of state_dir, typically already restrictive under
+    // %ProgramData%\ProvisionLLM), with a trailing newline so `cat` output looks normal. A short machine-id
+    // on a full disk would change the fingerprint and unbind the licence.
+    if (!durable_write_file(tmp, *uuid + "\n", /*owner_only*/ true)) {
+        return std::nullopt;
     }
-
-#if !defined(_WIN32)
-    // chmod 0600 — operator-only read/write.  POSIX only; on Windows
-    // the file inherits ACLs from state_dir (typically already
-    // restrictive under %ProgramData%\ProvisionLLM).  chmod failure is
-    // non-fatal — the file is already on disk with its content.
-    fs::permissions(tmp,
-                    fs::perms::owner_read | fs::perms::owner_write,
-                    fs::perm_options::replace, ec);
-#endif
-
-    fs::rename(tmp, path, ec);
-    if (ec) {
-        // Windows fallback: rename-onto-existing.
-        fs::remove(path, ec);
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            fs::remove(tmp, ec);
-            return std::nullopt;
-        }
+    if (!durable_replace(tmp, path)) {
+        return std::nullopt;
     }
     return uuid;
 }

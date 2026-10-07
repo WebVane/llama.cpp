@@ -49,7 +49,8 @@ export function useModelsSelector(opts: UseModelsSelectorOptions): UseModelsSele
 		modelsStore.models.filter((option) => {
 			const modelProps = modelsStore.props.getModelProps(option.model);
 
-			return modelProps?.ui !== false;
+			// a row that turned into a download placeholder is not a model to pick
+			return modelProps?.ui !== false && !modelsStore.isDownloadPlaceholder(option.id);
 		})
 	);
 	const loading = $derived(modelsStore.loading);

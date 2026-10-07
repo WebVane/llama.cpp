@@ -1,13 +1,13 @@
 /**
  * ModelsService - Stateless model management API layer
  *
- * Wraps the /models endpoints (list, load, unload) and the /models/sse
- * status feed in MODEL and ROUTER modes. No reactive state; consumed by
- * modelsStore and its status manager.
+ * Wraps the /models endpoints (list, load, unload, download, remove, reload)
+ * and the /models/sse status feed in MODEL and ROUTER modes. No reactive
+ * state; consumed by modelsStore, its status manager and the admin page.
  */
 
 import { base } from '$app/paths';
-import { API_MODELS, MODEL_ID } from '$lib/constants';
+import { API_MODELS, ERROR_MESSAGES, MODEL_ID } from '$lib/constants';
 import { ServerModelStatus } from '$lib/enums';
 import type { ParsedModelId } from '$lib/types/models';
 import {
@@ -17,10 +17,52 @@ import {
 	normalizeModelName,
 	splitSseRecords
 } from '$lib/utils';
+import type { ApiFetchOptions } from '$lib/utils/api-fetch';
 import { getAuthHeaders } from '$lib/utils/api-headers';
+
+/**
+ * Per-call options of the model management requests. Only the admin page
+ * passes them; without options a call behaves exactly as before.
+ */
+export interface ModelsRequestOptions {
+	/** Abort the HTTP request after this many milliseconds. */
+	timeoutMs?: number;
+}
 
 export class ModelsService {
 	private static readonly SSE_RECONNECT_MS = 1000;
+
+	/**
+	 * Start a Hugging Face download (ROUTER mode only).
+	 * Sends POST to `/models`. The server validates the repository first, then
+	 * answers; progress and the result arrive on the /models/sse feed under
+	 * the name as given here.
+	 *
+	 * @param model - `user/repo[:QUANT]`
+	 * @param options - Optional request timeout
+	 */
+	static async download(
+		model: string,
+		options?: ModelsRequestOptions
+	): Promise<ApiRouterModelsLoadResponse> {
+		return ModelsService.withTimeout(
+			(init) => apiPost<ApiRouterModelsLoadResponse>(API_MODELS.DOWNLOAD, { model }, init),
+			options
+		);
+	}
+
+	/**
+	 * Transient row of a running or just finished download: it is not a model
+	 * that can be selected or loaded.
+	 *
+	 * @param model - Model data entry from the API response
+	 */
+	static isDownloadPlaceholder(model: ApiModelDataEntry): boolean {
+		return (
+			model.status.value === ServerModelStatus.DOWNLOADING ||
+			model.status.value === ServerModelStatus.DOWNLOADED
+		);
+	}
 
 	/**
 	 * Check if a model is loaded based on its metadata.
@@ -78,16 +120,24 @@ export class ModelsService {
 	 *
 	 * @param modelId - Model identifier to load
 	 * @param extraArgs - Optional additional arguments to pass to the model instance
+	 * @param options - Optional request timeout (admin page only)
 	 * @returns Load response from the server
 	 */
-	static async load(modelId: string, extraArgs?: string[]): Promise<ApiRouterModelsLoadResponse> {
+	static async load(
+		modelId: string,
+		extraArgs?: string[],
+		options?: ModelsRequestOptions
+	): Promise<ApiRouterModelsLoadResponse> {
 		const payload: { model: string; extra_args?: string[] } = { model: modelId };
 
 		if (extraArgs && extraArgs.length > 0) {
 			payload.extra_args = extraArgs;
 		}
 
-		return apiPost<ApiRouterModelsLoadResponse>(API_MODELS.LOAD, payload);
+		return ModelsService.withTimeout(
+			(init) => apiPost<ApiRouterModelsLoadResponse>(API_MODELS.LOAD, payload, init),
+			options
+		);
 	}
 
 	/**
@@ -213,15 +263,58 @@ export class ModelsService {
 	}
 
 	/**
+	 * Re-scan the model sources (cache, models directory, preset file) and
+	 * return the fresh list (ROUTER mode only). Sends GET `/v1/models?reload=1`.
+	 *
+	 * @param options - Optional request timeout
+	 */
+	static async reload(options?: ModelsRequestOptions): Promise<ApiRouterModelsListResponse> {
+		return ModelsService.withTimeout(
+			(init) => apiFetch<ApiRouterModelsListResponse>(API_MODELS.RELOAD, init),
+			options
+		);
+	}
+
+	/**
+	 * Delete a cache model from disk (ROUTER mode only).
+	 * Sends DELETE to `/models?model=<id>`. The server stops a running
+	 * instance (or cancels a download) first; only `source == cache` models
+	 * can be removed.
+	 *
+	 * @param modelId - Model identifier to remove
+	 * @param options - Optional request timeout
+	 */
+	static async remove(
+		modelId: string,
+		options?: ModelsRequestOptions
+	): Promise<ApiRouterModelsUnloadResponse> {
+		const path = `${API_MODELS.REMOVE}?model=${encodeURIComponent(modelId)}`;
+
+		return ModelsService.withTimeout(
+			(init) => apiFetch<ApiRouterModelsUnloadResponse>(path, { ...init, method: 'DELETE' }),
+			options
+		);
+	}
+
+	/**
 	 * Unload a model (ROUTER mode only).
 	 * Sends POST request to `/models/unload`. Note: the endpoint returns success
 	 * before unloading completes — use polling to await actual unload status.
+	 * Called on a `downloading` entry it cancels the download, on a `loading`
+	 * one it stops the load.
 	 *
 	 * @param modelId - Model identifier to unload
+	 * @param options - Optional request timeout (admin page only)
 	 * @returns Unload response from the server
 	 */
-	static async unload(modelId: string): Promise<ApiRouterModelsUnloadResponse> {
-		return apiPost<ApiRouterModelsUnloadResponse>(API_MODELS.UNLOAD, { model: modelId });
+	static async unload(
+		modelId: string,
+		options?: ModelsRequestOptions
+	): Promise<ApiRouterModelsUnloadResponse> {
+		return ModelsService.withTimeout(
+			(init) => apiPost<ApiRouterModelsUnloadResponse>(API_MODELS.UNLOAD, { model: modelId }, init),
+			options
+		);
 	}
 
 	/**
@@ -229,10 +322,14 @@ export class ModelsService {
 	 * Reconnects on network drops until the signal aborts. Splits the byte
 	 * stream into SSE records on the blank line boundary; the payload rides in
 	 * the data lines as a JSON envelope with its own model, event and data fields.
+	 *
+	 * @param onOpen - Optional, called each time a connection is established
+	 * (events sent while the feed was down are not replayed)
 	 */
 	static async watchModelEvents(
 		signal: AbortSignal,
-		onEvent: (event: ApiModelsSseEvent) => void
+		onEvent: (event: ApiModelsSseEvent) => void,
+		onOpen?: () => void
 	): Promise<void> {
 		const decoder = new TextDecoder();
 
@@ -247,6 +344,8 @@ export class ModelsService {
 					const reader = response.body.getReader();
 
 					let buffer = '';
+
+					onOpen?.();
 
 					while (!signal.aborted) {
 						const { done, value } = await reader.read();
@@ -289,6 +388,30 @@ export class ModelsService {
 			return JSON.parse(payload) as ApiModelsSseEvent;
 		} catch {
 			return null;
+		}
+	}
+
+	/**
+	 * Run a request with an optional client-side timeout. Without a timeout
+	 * the request is issued exactly as before (no signal, no error mapping).
+	 */
+	private static async withTimeout<T>(
+		run: (init: ApiFetchOptions) => Promise<T>,
+		options?: ModelsRequestOptions
+	): Promise<T> {
+		if (!options?.timeoutMs) return run({});
+
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+
+		try {
+			return await run({ signal: controller.signal });
+		} catch (error) {
+			if (controller.signal.aborted) throw new Error(ERROR_MESSAGES.NETWORK.TIMEOUT);
+
+			throw error;
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 }

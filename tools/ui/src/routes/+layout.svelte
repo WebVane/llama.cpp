@@ -20,6 +20,7 @@
 	import { usePwa } from '$lib/hooks/use-pwa.svelte';
 	import { RouterService } from '$lib/services/router.service';
 	import {
+		adminStore,
 		chatStore,
 		conversationsStore,
 		deviceStore,
@@ -261,6 +262,19 @@
 		return () => {
 			modelsStore.status.unsubscribe();
 		};
+	});
+
+	// Admin panel probe: one GET /admin/status once the server is known to be a
+	// router. It decides whether the sidebar shows "Admin"; it is never retried
+	// automatically (the admin page has a Retry button).
+	$effect(() => {
+		if (!browser) return;
+
+		if (!serverStore.isRouterMode) return;
+
+		untrack(() => {
+			adminStore.probeOnce();
+		});
 	});
 
 	// Background MCP server health checks on app load.

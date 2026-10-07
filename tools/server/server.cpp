@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-admin.h" // provision-admin
 
 #include "arg.h"
 #include "build-info.h"
@@ -450,6 +451,7 @@ static inline server_http_context::handler_t license_gate(server_http_context::h
 #endif
 
 int llama_server(int argc, char ** argv) {
+    if (int rc = 0; server_admin_helper_main(argc, argv, rc)) { return rc; } // provision-admin: helper modes (device inventory, fit check)
     std::setlocale(LC_NUMERIC, "C");
 
 #ifndef _WIN32
@@ -573,6 +575,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
     }
 
     if (is_router_server) {
+        // provision-admin: read and scrub PROVISION_ADMIN*, load the saved settings (may override
+        // params.models_max); must run before server_models snapshots the environment for its children
+        server_admin_init(params);
+
         // setup server instances manager
         try {
             models_routes.emplace(params, argc, argv);
@@ -616,6 +622,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+
+        // provision-admin: the /admin/* routes, registered only when PROVISION_ADMIN is enabled
+        server_admin_register_routes(ctx_http, *models_routes);
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

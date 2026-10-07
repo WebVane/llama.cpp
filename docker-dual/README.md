@@ -21,7 +21,9 @@ docker-dual/
 ├── Dockerfile          # multi-stage CUDA build, target: llama-server
 ├── entrypoint.sh       # launches llama-server in router mode
 ├── models.ini          # router preset (chat + embeddings, per-model GPU)
-├── docker-compose.yml  # one-shot up
+├── docker-compose.yml  # one-shot up: server + nginx front door
+├── nginx/
+│   └── default.conf.template  # nginx config: transparent proxy, /admin allow-list
 └── README.md
 ```
 
@@ -29,6 +31,10 @@ docker-dual/
 
 - NVIDIA GPU (recent drivers). The shipped `models.ini` assumes **two** GPUs
   (chat on `CUDA1`, embeddings on `CUDA0`); see section 6 for single-GPU hosts.
+  The image is built for NVIDIA (CUDA) only. For AMD or Intel GPUs, or a
+  server without Docker, build `provision-server` from source and run it on
+  the host with the files in [`deploy/linux/`](../deploy/linux/), see
+  [`docs/provision-admin.md`](../docs/provision-admin.md#13-deployment-on-a-linux-host).
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - Docker 24+ with `compose` plugin
 - VRAM:
@@ -61,7 +67,11 @@ before building.
 ## 3. Build
 
 The build context is the **repository root** (we need `COPY . /src`). The
-`Dockerfile` lives in this subdirectory.
+`Dockerfile` lives in this subdirectory. The repository's `.dockerignore` keeps
+`docker-dual/models/`, `docker-dual/models-rw/` and every `.provision-upload/`
+folder out of the build context, so models stored next to the compose file
+(downloaded, uploaded or dropped in) are not sent to `docker build`; `.gitignore`
+keeps `docker-dual/models-rw/` and `.provision-upload/` out of git as well.
 
 ### a) docker compose (recommended)
 
@@ -154,10 +164,14 @@ docker run -d --name llama-dual-trial --gpus all \
   from an internal mirror instead (the build needs network access to the
   source). The baked weights add ~7 GB to the image.
 
-In CI the trial image is built by the `build_llama_dual_trial` job and
-pushed as a single rolling `:trial` tag (only the latest version is kept;
-the previous `:trial` image is reused as the build cache). The runner needs
-network egress to the weight source.
+In CI the licensed trial image is built by the `build_llama_dual_release`
+job and pushed as a single rolling `:release` tag (only the latest version
+is kept; the previous `:release` image is reused as the build cache). It
+bakes the public k3 key from `src/license/docs/vectors/keyring.json`, which
+matches the test License Server (`license.scan-dev.com`); a different
+License Server needs its own public key there. The unlicensed image comes
+from `build_llama_dual` as `:dev`. The runner needs network egress to the
+weight source.
 
 ## 4. Try it
 
@@ -192,7 +206,7 @@ All are environment variables on the container (override via
 | Env             | Default              | Effect                                            |
 |-----------------|----------------------|---------------------------------------------------|
 | `PORT`          | `8080`               | HTTP port (inside the container)                  |
-| `MODELS_MAX`    | `1`                  | Max simultaneously-loaded models. `2` keeps both. |
+| `MODELS_MAX`    | `1` (compose: `3`)   | Max simultaneously-loaded models. `2` keeps both. |
 | `MODELS_CONFIG` | `/config/models.ini` | Path to the router preset file                    |
 | `MODEL_DEVICES` | *(empty)*            | Per-model GPU override, `<section>=<dev>,...` (section 6) |
 | `CUDA_DEVICE_ORDER` | `PCI_BUS_ID`     | Makes `CUDAn` follow `nvidia-smi` order; leave as is |
@@ -266,8 +280,9 @@ each one can be pinned to its own GPU. Placement is decided in two steps:
 
 Notes:
 
-- `MODELS_MAX` must be `2` (the compose default) for both models to be
-  resident at the same time; with `1` they still swap even on two GPUs.
+- `MODELS_MAX` must be at least `2` (the compose default is `3`, see
+  section 8) for both models to be resident at the same time; with `1` they
+  still swap even on two GPUs.
 - A child process only touches the GPUs listed in its `device`, so a GPU
   that no model is assigned to stays untouched even if it is exposed.
 - List what the container actually sees:
@@ -285,7 +300,13 @@ Notes:
 - `MODEL_DEVICES` is applied once at startup by writing a patched copy to
   `/tmp/models.ini`; the router reads that copy, so `GET /v1/models?reload=1`
   will not see later edits to the mounted `models.ini` -- restart the container
-  (or leave `MODEL_DEVICES` empty and keep `device` in the file).
+  (or leave `MODEL_DEVICES` empty and keep `device` in the file). A
+  `models.ini` saved with Windows line endings (CRLF) is patched as well.
+- The admin panel (section 8) can set the GPU of every model without editing
+  `models.ini` (Admin -> Models -> Settings). `MODEL_DEVICES` wins over it and
+  the panel then shows that model's GPU as locked. The panel tells GPUs apart
+  by PCI bus id, so it notices when `CUDA0` is another card after a change of
+  `device_ids`.
 - The Web UI pre-selects the model tagged `default` (`tags = chat, default`
   here). If the server runs with `--no-models-autoload`, that model must also
   have `load-on-startup = true`, otherwise the first message fails with
@@ -299,6 +320,7 @@ version = 1
 [*]                       ; defaults inherited by every model
 ctx-size     = 8192
 n-gpu-layers = 99
+offline      = true       ; model processes never go to the network
 
 [qwen2.5-chat]            ; section name == value of "model" in requests
 model    = /models/Qwen2.5-7B-Instruct-Q5_K_M.gguf
@@ -312,6 +334,7 @@ model      = /models/gte-Qwen2-1.5B-instruct-Q8_0.gguf
 embeddings = true
 pooling    = last
 device     = CUDA0        ; embeddings live on the other GPU
+load-on-startup = true    ; preloaded too (needs MODELS_MAX >= 2)
 ```
 
 Keys are long CLI argument names without `--` (short forms like `c` /
@@ -320,8 +343,154 @@ Keys are long CLI argument names without `--` (short forms like `c` /
 full preset reference, including the preset-only `load-on-startup` and
 `stop-timeout` keys.
 
-## 8. Troubleshooting
+Two things to know about the shipped file:
 
+- `offline = true` in `[*]` makes every model process load from the files on
+  disk only. It does not affect downloads started with `POST /models` (the
+  download worker gets no preset) or models given by a local path. A section
+  that should fetch its own `hf-repo` on first load needs `offline = false`.
+- Both models have `load-on-startup = true`. The router refuses to start when
+  more models are preloaded than `MODELS_MAX` allows, so with a lower limit
+  (the image default is `1`) `entrypoint.sh` keeps the key for the first
+  sections only, logs a warning and starts the server from a patched copy
+  (`/tmp/models.startup.ini`): the chat model is preloaded, the embedding
+  model loads on first use.
+
+## 8. Admin panel and the nginx front door (docker compose)
+
+Full description, API reference and upgrade checklist:
+[`docs/provision-admin.md`](../docs/provision-admin.md). The short version:
+
+- `docker-compose.yml` now starts two containers. **nginx** is the only one
+  with a published port (`${PORT:-8096}`); it forwards every request to
+  `llama-dual` unchanged (streaming included). `llama-dual` itself is no
+  longer published. Copy `nginx/default.conf.template` along with the compose
+  file: without it `docker compose up` stops with "bind source path does not
+  exist".
+- The compose file enables the admin layer of the server (`PROVISION_ADMIN=1`):
+  an `/admin` API and an **Admin** page in the web UI for the model limit, the
+  GPU for newly added models, pinned models, storage and a download check,
+  per-model settings (GPU, context size, parallel requests, GPU layers, flash
+  attention, KV cache precision, micro-batch, role) with a fit check done by
+  llama.cpp itself, GPU memory cards, the reason and output tail of a model
+  that failed to start, a diagnostics panel, the upload of GGUF files from the
+  browser and the deletion of models in `./models-rw/local`. Loading,
+  unloading, downloading and deleting downloaded models keep using the public
+  model routes, exactly as before.
+- The live GPU memory comes from `nvidia-smi`, which the NVIDIA Container
+  Toolkit mounts into the container because the compose file sets
+  `NVIDIA_DRIVER_CAPABILITIES: "compute,utility"`. Keep `utility` in it.
+- `/admin` is closed for every address until you allow some. The value is a
+  list of nginx directives, each ending with a semicolon:
+
+  ```bash
+  # check first: a typo stops nginx, and with it the whole API
+  ADMIN_ALLOW_RULES="allow 10.64.0.11;" docker compose run --rm --no-deps nginx nginx -t
+  ADMIN_ALLOW_RULES="allow 10.64.0.11;" docker compose up -d
+  ```
+
+  Requests made on the Docker host itself (`curl http://localhost:8096/...`)
+  do not come from `127.0.0.1`: nginx sees the gateway address of the compose
+  network. Read the comments in `nginx/default.conf.template` before allowing
+  that address.
+- Changing settings also needs the admin key (`X-Admin-Key`). Set
+  `PROVISION_ADMIN_KEY`, or read the generated one:
+
+  ```bash
+  docker compose exec llama-dual cat /var/lib/provision-llm-admin/admin.key
+  ```
+
+- Downloaded models are kept on the host in `./models-rw/hf`; a `.gguf` file
+  dropped into `./models-rw/local` appears after a rescan. Create both before
+  the first start (`mkdir -p models-rw/hf models-rw/local`), so that you own
+  them: what Docker or the container creates can end up owned by root.
+- Models uploaded in the panel (**Add model** -> **Upload GGUF**: one file, a
+  split set, with or without its projector; it continues after a dropped
+  connection, a reload or a restart) land in `./models-rw/local` as well, and
+  only after the server has checked them. Unfinished uploads live in
+  `./models-rw/local/.provision-upload/`: leave that folder alone, the server
+  cleans it up. The server gives uploaded files the owner of `./models-rw/local`.
+  Without the `/models-rw` mount the panel shows the upload as unavailable. The
+  shipped nginx front door needs no change for uploads; a proxy of your own in
+  front of it may need a larger body limit for `/admin/`, see
+  [`docs/provision-admin.md`](../docs/provision-admin.md#169-behind-a-reverse-proxy).
+- Models in `./models-rw/local` (uploaded or dropped in) can be deleted in the
+  panel (**Delete files...**): only the files the model uses, other files in its
+  folder stay. **Remove projector** drops only the projector of a model.
+  Downloaded models keep their **Delete**.
+<!-- s3-recheck: UI labels "Upload GGUF", "Delete files...", "Remove projector"; owner of uploaded files in Docker. -->
+  Settings (`admin-state.json`), per-model settings (`admin-models.json`) and
+  the generated key live in the `llama-admin-state` volume.
+- Before every image update note the image digest (the CI tags are rolling,
+  `docker compose pull` leaves no older image behind) and back up the admin
+  state; `LLAMA_DUAL_IMAGE=<repo>@sha256:...` is the way back:
+
+  ```bash
+  docker image inspect --format '{{index .RepoDigests 0}}' \
+      "$(docker inspect --format '{{.Image}}' llama-dual)" | tee image-before-update.txt
+  docker compose exec -T llama-dual tar czf - -C /var/lib/provision-llm-admin . \
+      > admin-state-$(date +%F).tgz
+  ```
+
+  To drop all per-model settings: remove them per model in the panel
+  (**Remove custom settings**), or remove the file while the server is
+  stopped (a running server writes it again):
+
+  ```bash
+  docker compose stop llama-dual
+  docker compose run --rm --no-deps -T --entrypoint sh llama-dual -c \
+      'rm -f /var/lib/provision-llm-admin/admin-models.json*'
+  docker compose start llama-dual
+  ```
+
+  Details, and how to restore a backup:
+  [`docs/provision-admin.md`](../docs/provision-admin.md#14-upgrading-an-existing-docker-host).
+
+| Compose variable | Default | Effect |
+|------------------|---------|--------|
+| `ADMIN_ALLOW_RULES` | *(empty)* | nginx `allow` rules for `/admin`; empty = denied for everyone |
+| `PROVISION_ADMIN` | `1` | `0` switches the admin layer off (`/admin` answers 404) |
+| `PROVISION_ADMIN_KEY` | *(empty)* | Admin key; empty = generated on first start |
+| `PROVISION_ADMIN_DEFAULT_DEVICE` | `CUDA0` | GPU for models without a `device` of their own (downloaded / dropped in) until a value is saved in the panel; `MODEL_DEVICES="*=..."` wins |
+| `PROVISION_ADMIN_PINNED` | `qwen2.5-chat,gte-qwen2-embed` | Models that are never unloaded to make room, until a list is saved in the panel |
+| `PROVISION_ADMIN_GPU_PROBE` | `auto` | Source of the live GPU memory (`auto` = `nvidia-smi` here, `off` = memory as measured at start-up) |
+| `MODELS_MAX` | `3` | Both shipped models plus one slot for an added model |
+| `MODELS_RW_DIR` | `./models-rw` | Host directory mounted at `/models-rw`: downloads (`hf/`), uploads and dropped-in models (`local/`) |
+| `NGINX_IMAGE` | `nginx:1.27-alpine` | Image of the front door (use a mirror if Docker Hub is not reachable) |
+| `HF_TOKEN`, `MODEL_ENDPOINT` | *(empty)* | Hugging Face token / mirror endpoint for downloads |
+
+The admin layer is enabled by the compose file, not by the image: a plain
+`docker run` of the image, or an older compose file, behaves as before.
+
+## 9. Troubleshooting
+
+- **The published port does not answer and `docker compose ps` shows nginx
+  restarting** &mdash; the nginx configuration is invalid, almost always a
+  missing semicolon in `ADMIN_ALLOW_RULES`. `docker compose logs nginx` names
+  the line.
+- **Port 8096 answers "Welcome to nginx!" and `404` for every API route**
+  &mdash; nginx runs with its stock configuration: the template was not
+  rendered (an older compose file that mounts a directory, with
+  `nginx/default.conf.template` missing). Use the shipped compose file and
+  copy the template next to it.
+- **`502 Bad Gateway`** &mdash; nginx is up but `llama-dual` is down or still
+  starting; see `docker compose logs llama-dual`.
+- **`/admin/...` answers 403** &mdash; the client address is not in
+  `ADMIN_ALLOW_RULES`. `docker compose logs nginx` shows the address nginx
+  saw (`access forbidden by rule, client: ...`).
+- **The Upload tab of "Add model" is disabled** &mdash; the server has no
+  writable models directory: `/models-rw` is not mounted (an older compose
+  file), `./models-rw/local` is missing, or it is not writable. The tab names
+  the reason; fix it and run `docker compose up -d` again.
+- **An upload stops with "Disk full"** &mdash; the filesystem of
+  `./models-rw` is full (it often also holds the admin state volume and the
+  Docker images). Free space, then press **Resume**; or **Cancel**, which frees
+  what was received.
+- **The admin panel shows no live GPU memory** &mdash; `nvidia-smi` is
+  missing inside the container: `NVIDIA_DRIVER_CAPABILITIES` must contain
+  `utility` (check with `docker compose exec llama-dual sh -c 'echo
+  $NVIDIA_DRIVER_CAPABILITIES; command -v nvidia-smi'`). Admin -> Settings ->
+  Diagnostics shows what the server found.
 - **`models preset not found at /config/models.ini`** &mdash; the file was not
   baked in or the bind mount points at a missing path. Rebuild or check the
   `-v` you passed.

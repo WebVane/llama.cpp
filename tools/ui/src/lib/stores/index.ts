@@ -61,3 +61,6 @@ export { deviceStore } from './device.svelte';
 
 // LICENSE (provision-server license subsystem: status + activation)
 export { licenseStore } from './license.svelte';
+
+// ADMIN (provision-server admin panel: probe, admin key, settings, model management)
+export { adminStore } from './admin.svelte';

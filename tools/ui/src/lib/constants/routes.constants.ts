@@ -9,6 +9,8 @@ export const URL_PARAMS = {
 } as const;
 
 export const ROUTES = {
+	/** Admin panel — model management and router settings (provision-server). */
+	ADMIN: '#/admin',
 	/** Chat base — for dynamic chat URLs use RouterService. */
 	CHAT: '#/chat',
 	/** MCP servers. */

@@ -10,6 +10,7 @@
 
 #include "license/Activation.h"
 #include "license/Base64Url.h"
+#include "license/DurableWrite.h"
 #include "license/Fingerprint.h"
 #include "license/Jcs.h"
 #include "license/Keyring.h"
@@ -324,6 +325,146 @@ static void test_request_counter() {
 }
 
 // ---------------------------------------------------------------------------
+// durable writes: a full disk never leaves a short counter / ledger / .lic in place
+// ---------------------------------------------------------------------------
+
+static size_t count_temp_files(const fs::path & dir) {
+    size_t n = 0;
+    std::error_code ec;
+    for (const auto & e : fs::directory_iterator(dir, ec)) {
+        if (e.path().filename().string().find(".tmp") != std::string::npos) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static void test_counter_full_disk() {
+    const auto root = make_sandbox("counter-full-disk");
+    const auto path = root / "counter.dat";
+    const auto ledger = fs::path(path.string() + ".ledger");
+    const std::string lic_hash(64, 'c');
+    const auto now = t_inside();
+
+    {
+        RequestCounter c(path, lic_hash, 10, /*hard_limit*/ true);
+        CHECK(c.load(now) == CounterLoad::FreshState);
+        CHECK(c.consume(now));
+        const std::string before = slurp(path);
+        CHECK(!before.empty());
+        // the write stops after `cut` bytes, as on a full disk: refused, nothing charged, the file untouched
+        for (size_t cut : { (size_t) 0, (size_t) 1, (size_t) 7, before.size() - 1 }) {
+            durable_write_test_fail(0, 1, cut);
+            CHECK(!c.consume(now + 1s));
+            CHECK(c.snapshot().used == 1);
+            CHECK(slurp(path) == before);
+        }
+        durable_write_test_fail(0, 0, 0);
+        CHECK(count_temp_files(root) == 0); // no temp file is left behind
+    }
+    // the next start reads a valid counter: never "tampered" because the disk was full
+    {
+        RequestCounter c(path, lic_hash, 10, true);
+        CHECK(c.load(now + 2s) == CounterLoad::Ok);
+        CHECK(c.snapshot().used == 1);
+        CHECK(c.consume(now + 3s));
+        CHECK(c.snapshot().used == 2);
+    }
+    // the ledger write fails after a good counter write: the counter counts, the previous ledger stays valid
+    {
+        RequestCounter c(path, lic_hash, 10, true);
+        CHECK(c.load(now + 4s) == CounterLoad::Ok);
+        const std::string ledger_before = slurp(ledger);
+        CHECK(!ledger_before.empty());
+        durable_write_test_fail(1, 1, 3);
+        CHECK(c.consume(now + 5s));
+        CHECK(c.snapshot().used == 3);
+        CHECK(slurp(ledger) == ledger_before);
+        durable_write_test_fail(0, 0, 0);
+        CHECK(count_temp_files(root) == 0);
+    }
+    {
+        // the ledger that stayed is still verified and used: counter.dat lost, the licence keeps its tally of 2
+        std::error_code ec;
+        fs::remove(path, ec);
+        RequestCounter c(path, lic_hash, 10, true);
+        CHECK(c.load(now + 6s) == CounterLoad::FreshState);
+        CHECK(c.restore_from_ledger(now + 6s));
+        CHECK(c.snapshot().used == 2);
+    }
+    // reset() (activation) on a full disk: refused, the previous counter stays
+    {
+        RequestCounter c(path, lic_hash, 10, true);
+        CHECK(c.load(now + 7s) == CounterLoad::Ok);
+        const std::string before = slurp(path);
+        durable_write_test_fail(0, 1, 4);
+        CHECK(!c.reset(now + 8s));
+        CHECK(slurp(path) == before);
+        durable_write_test_fail(0, 0, 0);
+    }
+    // the installed .lic: a full disk keeps the previous one
+    {
+        const auto lic = root / "license.lic";
+        CHECK(ActivationClient::save_lic_atomic(lic, "{\"a\":1}"));
+        durable_write_test_fail(0, 1, 2);
+        CHECK(!ActivationClient::save_lic_atomic(lic, "{\"a\":2,\"b\":3}"));
+        CHECK(slurp(lic) == "{\"a\":1}");
+        durable_write_test_fail(0, 0, 0);
+        CHECK(ActivationClient::save_lic_atomic(lic, "{\"a\":2}"));
+        CHECK(slurp(lic) == "{\"a\":2}");
+        CHECK(count_temp_files(root) == 0);
+    }
+    // the primitives themselves: a short write is reported and nothing is renamed
+    {
+        const auto target = root / "plain.txt";
+        const auto tmp    = root / "plain.txt.tmp";
+        CHECK(durable_write_file(tmp, "hello") && durable_replace(tmp, target));
+        CHECK(slurp(target) == "hello");
+        durable_write_test_fail(0, 1, 3);
+        CHECK(!durable_write_file(tmp, "goodbye"));
+        CHECK(!fs::exists(tmp));
+        CHECK(slurp(target) == "hello");
+        durable_write_test_fail(0, 0, 0);
+        // a rename that fails (ENOSPC on a full btrfs, a quota, EIO) keeps the previous file: it is never
+        // removed before the new one is in place
+        CHECK(durable_write_file(tmp, "goodbye"));
+        durable_replace_test_fail(1);
+        CHECK(!durable_replace(tmp, target));
+        CHECK(!fs::exists(tmp));
+        CHECK(slurp(target) == "hello");
+        durable_replace_test_fail(0);
+    }
+    // the same through the counter and the .lic: a failed rename refuses the write, the previous file stays
+    {
+        RequestCounter c(path, lic_hash, 10, true);
+        CHECK(c.load(now + 9s) == CounterLoad::Ok);
+        const std::string before = slurp(path);
+        const int64_t used = c.snapshot().used;
+        durable_replace_test_fail(1);
+        CHECK(!c.consume(now + 10s));
+        CHECK(c.snapshot().used == used);
+        CHECK(slurp(path) == before);
+        durable_replace_test_fail(0);
+        CHECK(count_temp_files(root) == 0);
+
+        const auto lic = root / "license.lic";
+        const std::string lic_before = slurp(lic);
+        durable_replace_test_fail(1);
+        CHECK(!ActivationClient::save_lic_atomic(lic, "{\"a\":3}"));
+        CHECK(slurp(lic) == lic_before);
+        durable_replace_test_fail(0);
+        CHECK(count_temp_files(root) == 0);
+    }
+    // the next start still reads the counter: a failed rename never reset it
+    {
+        RequestCounter c(path, lic_hash, 10, true);
+        CHECK(c.load(now + 11s) == CounterLoad::Ok);
+    }
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// ---------------------------------------------------------------------------
 // activation client (mocked transport)
 // ---------------------------------------------------------------------------
 
@@ -543,6 +684,7 @@ int main() {
     test_verify_golden();
     test_fingerprint();
     test_request_counter();
+    test_counter_full_disk();
     test_activation_client();
     test_facade_trial_then_activation();
 

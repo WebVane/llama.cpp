@@ -43,12 +43,19 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    # provision-admin: fork-owned admin layer (/admin/* routes)
+    server-admin.cpp
+    server-admin.h
+    server-admin-internal.h
+    server-admin-upload.cpp
+    server-admin-upload.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE vendor::hash) # provision-admin: SHA-256 of uploaded files
 
 add_dependencies(${TARGET} llama-ui-assets)
 

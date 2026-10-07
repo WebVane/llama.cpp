@@ -133,6 +133,9 @@ private:
     // models asked to stop, still counted as running until the monitor records their exit
     std::set<std::string> stopping_models;
 
+    // provision-admin: models that are never picked as an eviction victim, see set_pinned_models()
+    std::set<std::string> pinned_models;
+
     // set to true while load_models() is executing a reload; load() will wait until clear
     bool is_reloading = false;
 
@@ -229,6 +232,9 @@ private:
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
 
+    // provision-admin: load_models() for the lazy reload in get_meta() / get_all_meta(), never throws
+    void load_models_lazy();
+
 public:
     // conv_id -> model tracker for the resumable stream routes, owns its lock
     conv_model_tracker conv_models;
@@ -247,6 +253,13 @@ public:
 
     // lazy-load startup_models, to be called after main() setup phase
     void load_startup_models();
+
+    // provision-admin: runtime settings pushed by the admin layer (server-admin.cpp), thread-safe
+    // a new models_max applies to every later scheduling decision; lowering it does not unload anything by itself
+    void set_models_max(int models_max);
+    int  get_models_max();
+    // pinned models are never chosen as an eviction victim
+    void set_pinned_models(std::set<std::string> names);
 
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);

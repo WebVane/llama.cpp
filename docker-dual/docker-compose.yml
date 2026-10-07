@@ -1,20 +1,38 @@
 # Production compose for llama-dual.  Pulls a prebuilt image from the
 # Nexus registry (built by .gitlab-ci.yml on master/dev pushes) and runs
-# it with two GGUF files mounted from the host.
+# it with two GGUF files mounted from the host.  An nginx container in
+# front of it is the only published port: it forwards everything unchanged
+# and keeps the admin API (/admin) behind an address allow-list.
 #
 # Quick start
 # -----------
 #   1. docker login nexus.scan-dev.com:6001          # once per host
-#   2. mkdir -p ../models                            # next to this file
+#   2. mkdir -p models models-rw/hf models-rw/local  # next to this file
 #      # then drop Qwen2.5-7B-Instruct-Q5_K_M.gguf and
-#      # gte-Qwen2-1.5B-instruct-Q8_0.gguf into ../models
-#   3. docker compose pull                           # fetch latest image
+#      # gte-Qwen2-1.5B-instruct-Q8_0.gguf into ./models.  Create models-rw/*
+#      # yourself (what Docker or the container creates can end up owned by
+#      # root), and copy nginx/default.conf.template along with this file.
+#   3. docker compose pull                           # fetch the images
 #   4. docker compose up -d
-#   5. curl -fsS http://localhost:8080/v1/models | jq .
+#   5. curl -fsS http://localhost:8096/v1/models | jq .
 #
-# Override at the shell to retag/repoint without editing this file:
-#   LLAMA_DUAL_IMAGE=nexus.scan-dev.com:6001/llama_dual:dev \
+# Image tags pushed by CI (one rolling tag each):
+#   :dev      — build_llama_dual, no license subsystem (default below)
+#   :release  — build_llama_dual_release, licensed trial: 50 requests, then
+#               activation against the License Server (k3 key)
+# Pick the licensed one at the shell without editing this file:
+#   LLAMA_DUAL_IMAGE=nexus.scan-dev.com:6001/llama_dual:release \
 #       docker compose up -d
+# A rolling tag keeps no older version: before `docker compose pull`, note
+# the digest of the image that runs now, it is the only way back:
+#   docker image inspect --format '{{index .RepoDigests 0}}' \
+#       "$(docker inspect --format '{{.Image}}' llama-dual)"
+#   # rollback: LLAMA_DUAL_IMAGE=<that repo@sha256:...> docker compose up -d
+# (docs/provision-admin.md, "Upgrading an existing Docker host").
+#
+# The image is built for NVIDIA GPUs (CUDA) only.  Other GPUs (AMD, Intel,
+# Vulkan) or no GPU: build provision-server from source and run it on the
+# host, see deploy/linux/ and docs/provision-admin.md.
 #
 # GPU placement
 # -------------
@@ -37,29 +55,77 @@
 #   Check what the container sees:
 #        docker compose run --rm llama-dual --list-devices
 #
+#   The admin panel can also set the GPU of a single model (Admin -> Models
+#   -> Settings).  MODEL_DEVICES wins over that, and the panel shows such a
+#   model's GPU as locked.  The panel tells GPUs apart by PCI bus id, so a
+#   changed `device_ids` list (CUDA0 is now another card) is reported there.
+#
+# Admin panel
+# -----------
+# Full description: docs/provision-admin.md.  In short:
+#
+#   - PROVISION_ADMIN=1 (default here) adds the /admin API and the "Admin"
+#     page of the web UI: max loaded models, GPU for new models, pinned
+#     models, download check, per-model settings (GPU, context size, ...)
+#     with a fit check, GPU memory, load-failure reasons and diagnostics.
+#     PROVISION_ADMIN=0 switches all of it off.
+#   - /admin is closed for everyone until you name the admin addresses.
+#     nginx directives, each ending with a semicolon:
+#
+#        ADMIN_ALLOW_RULES="allow 10.64.0.11; allow 10.64.0.0/24;" \
+#            docker compose up -d
+#
+#     Check the syntax first -- a typo stops nginx and with it the whole API:
+#
+#        ADMIN_ALLOW_RULES="allow 10.64.0.11;" \
+#            docker compose run --rm --no-deps nginx nginx -t
+#
+#     Requests made on the Docker host itself (curl http://localhost:8096)
+#     do not come from 127.0.0.1: nginx sees the gateway address of this
+#     stack's network (read the comments in nginx/default.conf.template
+#     before allowing it).
+#   - Changing settings also needs the admin key (X-Admin-Key header, asked
+#     for by the web UI).  Set PROVISION_ADMIN_KEY, or leave it empty and read
+#     the generated one:
+#
+#        docker compose exec llama-dual cat /var/lib/provision-llm-admin/admin.key
+#
+#   - Models downloaded from the admin panel go to ./models-rw/hf on the
+#     host; a .gguf dropped into ./models-rw/local shows up after "Rescan".
+#
 # Local dev build (skip Nexus, build from this checkout):
 #   Uncomment the `build:` block below and run `docker compose up -d --build`.
 
 services:
   llama-dual:
-    image: ${LLAMA_DUAL_IMAGE:-nexus.scan-dev.com:6001/llama_dual:latest}
+    image: ${LLAMA_DUAL_IMAGE:-nexus.scan-dev.com:6001/llama_dual:dev}
     container_name: llama-dual
     # Stable hostname: an online license is bound to (machine-id, hostname);
     # Docker's random per-container hostname would invalidate it on every
     # recreate.  Only matters for TRIAL / licensed images, harmless otherwise.
     hostname: llama-dual
     restart: unless-stopped
-    ports:
-      - "${PORT:-8096}:8080"
+    # Not published: clients reach the server through the nginx service
+    # below (host port ${PORT:-8096}), which is what keeps /admin restricted.
+    expose:
+      - "8080"
+    # Unloading models and stopping a running download takes longer than
+    # Docker's default 10 s before SIGKILL.
+    stop_grace_period: 30s
     environment:
       PORT: "8080"
       # License subsystem (TRIAL images): optional activation code applied on
       # first start (idempotent, the persisted .lic wins afterwards).  Codes
       # can also be entered in the web UI (Settings -> License) at any time.
       PROVISION_LICENSE_ACTIVATION_CODE: "${PROVISION_LICENSE_ACTIVATION_CODE:-}"
+      # Max simultaneously loaded models.
+      # 3 = both shipped models resident (preloaded and pinned, see
+      #     PROVISION_ADMIN_PINNED below) + one slot for a model added later
+      # 2 = keep both resident; loading a third model unloads one of them
       # 1 = swap models between requests (~+1-5 s on switch, half VRAM)
-      # 2 = keep both resident (required to actually use two GPUs at once)
-      MODELS_MAX: "${MODELS_MAX:-2}"
+      # Once "Max loaded models" has been saved in the admin panel, the saved
+      # value is used instead of this one.
+      MODELS_MAX: "${MODELS_MAX:-3}"
       MODELS_CONFIG: "/config/models.ini"
       # Per-model GPU override, see "GPU placement" above.  Empty = use the
       # `device` keys from models.ini as-is.
@@ -68,8 +134,48 @@ services:
       # the CUDA default "fastest first", so CUDA0/CUDA1 are stable on
       # hosts with mixed GPU models.
       CUDA_DEVICE_ORDER: "PCI_BUS_ID"
-      # Surface CUDA OOMs etc. in logs instead of cryptic crashes.
+      # What the NVIDIA Container Toolkit mounts into the container: "compute"
+      # is CUDA itself, "utility" is nvidia-smi, from which the admin panel
+      # reads the live GPU memory.  The CUDA base image sets the same value;
+      # it is spelled out here so that a change elsewhere (for example in the
+      # `capabilities` list below) cannot silently drop nvidia-smi.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      # Not read by this server build (no code looks at GGML_LOG_LEVEL); kept
+      # so that an existing .env entry does no harm.  Errors such as a CUDA
+      # out-of-memory are logged at error level anyway, and the admin panel
+      # shows the reason when a model fails to start.  More log output:
+      # LLAMA_ARG_LOG_VERBOSITY.
       GGML_LOG_LEVEL: "${GGML_LOG_LEVEL:-INFO}"
+      # --- Admin panel (docs/provision-admin.md) ---------------------------
+      # 1 = enable the /admin API and the Admin page; anything else = off
+      # (the server then behaves exactly as before, /admin answers 404).
+      PROVISION_ADMIN: "${PROVISION_ADMIN:-1}"
+      # Admin key for changing settings (X-Admin-Key).  Empty = the server
+      # generates one on first start and keeps it in the admin state volume
+      # (/var/lib/provision-llm-admin/admin.key).
+      PROVISION_ADMIN_KEY: "${PROVISION_ADMIN_KEY:-}"
+      PROVISION_ADMIN_STATE_DIR: "/var/lib/provision-llm-admin"
+      # The next two are start-up defaults: once a value has been saved in
+      # the admin panel, the saved value is used instead.
+      # GPU for models that have no `device` of their own, i.e. downloaded or
+      # dropped-in ones (models.ini sections keep theirs).  Set it to an empty
+      # value to leave such models on all visible GPUs.  MODEL_DEVICES="*=..."
+      # takes precedence and locks the setting in the panel.
+      PROVISION_ADMIN_DEFAULT_DEVICE: "${PROVISION_ADMIN_DEFAULT_DEVICE-CUDA0}"
+      # Models that are never unloaded to make room for another one.  One
+      # slot always stays free of pins: with a limit of N loaded models only
+      # the first N-1 names take effect.  An empty value pins nothing.
+      PROVISION_ADMIN_PINNED: "${PROVISION_ADMIN_PINNED-qwen2.5-chat,gte-qwen2-embed}"
+      # Where the admin panel reads the live GPU memory from.  auto = look for
+      # nvidia-smi / amd-smi / rocm-smi on PATH (here: nvidia-smi, mounted by
+      # the NVIDIA Container Toolkit, see NVIDIA_DRIVER_CAPABILITIES above);
+      # off = do not run a vendor tool (memory as measured at start-up or at
+      # the last "Re-detect GPUs").  Other values: docs/provision-admin.md.
+      PROVISION_ADMIN_GPU_PROBE: "${PROVISION_ADMIN_GPU_PROBE:-auto}"
+      # Hugging Face access for model downloads: token for gated/private
+      # repositories, endpoint of an internal mirror.  Both optional.
+      HF_TOKEN: "${HF_TOKEN:-}"
+      MODEL_ENDPOINT: "${MODEL_ENDPOINT:-}"
     volumes:
       # GGUF files live on the host; ro because the server never writes here.
       - ./models:/models:ro
@@ -77,6 +183,16 @@ services:
       - ./models.ini:/config/models.ini:ro
       # License state (.lic, request counter) for TRIAL / licensed images.
       - llama-license-state:/var/lib/provision-llm
+      # Writable model storage, kept on the host so it survives image updates:
+      #   hf/     models downloaded from the admin panel (Hugging Face cache)
+      #   local/  drop a .gguf here and press "Rescan" in the admin panel
+      # Needs a filesystem with enough free space for the models you add.
+      # Create both subdirectories on the host before the first start
+      # (mkdir -p models-rw/hf models-rw/local), so that you own them.
+      - "${MODELS_RW_DIR:-./models-rw}:/models-rw"
+      # Admin settings (admin-state.json), per-model settings
+      # (admin-models.json) and the generated admin key.
+      - llama-admin-state:/var/lib/provision-llm-admin
     deploy:
       resources:
         reservations:
@@ -105,8 +221,67 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  # Front door: the only container with a published port.  Forwards every
+  # request to llama-dual unchanged (streaming included); /admin (and the
+  # server's /cors-proxy) is forwarded only for the addresses in
+  # ADMIN_ALLOW_RULES.  The configuration is rendered from
+  # nginx/default.conf.template when the container starts, so a changed
+  # ADMIN_ALLOW_RULES needs `docker compose up -d` (recreates nginx only).
+  nginx:
+    # Any recent official nginx image works.  If the host cannot pull from
+    # Docker Hub, mirror it and point NGINX_IMAGE at the mirror.
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    container_name: llama-dual-nginx
+    restart: unless-stopped
+    depends_on:
+      - llama-dual
+    ports:
+      - "${PORT:-8096}:80"
+    environment:
+      # nginx `allow` directives for /admin, e.g.
+      #   "allow 10.64.0.11; allow 10.64.0.0/24;"
+      # Empty = /admin is denied for everyone.
+      ADMIN_ALLOW_RULES: "${ADMIN_ALLOW_RULES:-}"
+      # Substitute only this variable in the template (nginx's own $variables
+      # must stay as they are).
+      NGINX_ENVSUBST_FILTER: "ADMIN_ALLOW_RULES"
+    volumes:
+      # Long syntax on purpose: if the file is missing, `up` / `run` stop with
+      # "bind source path does not exist".  The short form would create an
+      # empty ./nginx directory instead, and nginx would start with its stock
+      # configuration ("Welcome to nginx!", 404 for every API route).
+      - type: bind
+        source: ./nginx/default.conf.template
+        target: /etc/nginx/templates/default.conf.template
+        read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
 volumes:
   # License state (signed .lic, request counter, persisted machine-id) —
   # must survive container recreation, otherwise every restart needs a
   # new activation and eventually exhausts the licence's server slots.
   llama-license-state:
+  # Admin panel state: saved settings (admin-state.json), per-model settings
+  # (admin-models.json) and the generated admin key.  Back it up before an
+  # image update (docs/provision-admin.md, "Upgrading an existing Docker
+  # host").  Removing it resets all settings to the compose and models.ini
+  # defaults and issues a new key:  docker compose down;  docker volume rm
+  # <project>_llama-admin-state;  docker compose up -d.  Never `down -v`:
+  # that also deletes llama-license-state.  A reset that keeps the volume:
+  # docs/provision-admin.md, section "Storage".
+  llama-admin-state:
+
+# Optional: pin the subnet of this stack's network.  Requests made on the
+# Docker host itself reach nginx from the network's gateway address; with a
+# fixed subnet that address is known in advance and stays the same after
+# `docker compose down`.  Pick a range that is free on the host.
+# networks:
+#   default:
+#     ipam:
+#       config:
+#         - subnet: 172.30.96.0/24
+#           gateway: 172.30.96.1

@@ -27,26 +27,25 @@ variables:
   # docker-dual/Dockerfile and add 120a-real back here.
   CUDA_ARCH: "61-real;75-virtual;80-virtual;86-real;89-real"
 
-  # Registry image tag (branch/sha/latest suffix is appended per-job below).
+  # Registry image name; each job pushes one rolling tag (:dev / :release).
   RELEASE_IMG: "${REGISTRY}/llama_dual"
 
-  # Number of inference requests the trial image serves before locking out
-  # (see build_llama_dual_trial below and docker-dual/Dockerfile).
+  # Number of inference requests the :release image serves before it asks
+  # for activation (see build_llama_dual_release below and docker-dual/Dockerfile).
   TRIAL_LIMIT: "50"
 
 stages:
   - build
 
 # =========================================================================
-# Build llama-dual image on master OR dev.  Builds llama-server with CUDA
-# support and bakes docker-dual/models.ini into /config/models.ini.  The
-# resulting image expects GGUF files to be mounted into /models at runtime
-# (see docker-dual/README.md).
+# :dev — llama-dual image WITHOUT the license subsystem (unrestricted),
+# built on master OR dev.  Builds llama-server with CUDA support and bakes
+# docker-dual/models.ini into /config/models.ini.  The image expects GGUF
+# files mounted into /models at runtime (see docker-dual/README.md).
 #
-# Tag policy (CI_COMMIT_REF_SLUG = "master" or "dev"):
-#   :<short-sha>          — every build (immutable pointer)
-#   :<branch-slug>        — :master or :dev (rolling pointer for the branch)
-#   :latest               — master only (production rollout target)
+# Single rolling tag :dev, overwritten by every build (a push to either
+# branch replaces it).  The previous :dev is pulled as the BuildKit cache
+# donor for incremental rebuilds.
 # =========================================================================
 build_llama_dual:
   stage: build
@@ -58,61 +57,42 @@ build_llama_dual:
   - echo "REGISTRY=[$REGISTRY] RELEASE_IMG=[$RELEASE_IMG] CUDA_ARCH=[$CUDA_ARCH]"
   - docker login -u admin -p $NEXUS_PASS nexus.scan-dev.com:6001
   script:
-  # 1. Pull previous build of this branch as a cache donor for an
-  #    incremental rebuild.  Ignored if absent (first build on a branch).
-  - docker pull $RELEASE_IMG:$CI_COMMIT_REF_SLUG || true
+  # 1. Pull the previous :dev as a cache donor (ignored if absent).
+  - docker pull $RELEASE_IMG:dev || true
   # 2. Build from the repository root using the dual-model Dockerfile.
   - |
     docker build -f docker-dual/Dockerfile \
-      --cache-from $RELEASE_IMG:$CI_COMMIT_REF_SLUG \
+      --cache-from $RELEASE_IMG:dev \
       --build-arg BUILDKIT_INLINE_CACHE=1 \
       --build-arg CUDA_ARCH="$CUDA_ARCH" \
-      -t $RELEASE_IMG:$CI_COMMIT_SHORT_SHA \
-      -t $RELEASE_IMG:$CI_COMMIT_REF_SLUG \
+      -t $RELEASE_IMG:dev \
       .
-  # 3. Push :<sha> and :<branch-slug> always; :latest only on master so
-  #    a dev push doesn't accidentally overwrite the production-rollout tag.
-  - docker push $RELEASE_IMG:$CI_COMMIT_SHORT_SHA
-  - docker push $RELEASE_IMG:$CI_COMMIT_REF_SLUG
-  - |
-    if [ "$CI_COMMIT_BRANCH" = "master" ]; then
-      docker tag  $RELEASE_IMG:$CI_COMMIT_SHORT_SHA $RELEASE_IMG:latest
-      docker push $RELEASE_IMG:latest
-    fi
+  # 3. Push the single rolling tag.
+  - docker push $RELEASE_IMG:dev
   after_script:
-  - echo "=== llama-dual pushed ==="
-  - echo "  $RELEASE_IMG:$CI_COMMIT_SHORT_SHA"
-  - echo "  $RELEASE_IMG:$CI_COMMIT_REF_SLUG"
-  - |
-    if [ "$CI_COMMIT_BRANCH" = "master" ]; then
-      echo "  $RELEASE_IMG:latest"
-    fi
+  - echo "=== llama-dual pushed - $RELEASE_IMG:dev ==="
   - docker images $RELEASE_IMG --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | head -n 5
 
 # =========================================================================
-# Build the TRIAL llama-dual image: same as build_llama_dual but the server
-# is compiled with the license subsystem and the trial fallback
-# (-DLLAMA_SERVER_TRIAL=ON): TRIAL_LIMIT inference requests per install,
-# then HTTP 403 until the product ("LLM" on the License Server) is
+# :release — llama-dual image WITH the license subsystem and the trial
+# fallback (-DLLAMA_SERVER_TRIAL=ON): TRIAL_LIMIT inference requests per
+# install, then HTTP 403 until the product ("LLM" on the License Server) is
 # activated — see docker-dual/Dockerfile and src/license/README.md.
 #
-# Single rolling image only: one tag, :trial, overwritten every build (we
-# keep only the latest trial version — no per-commit / per-branch tags).
-# The previous :trial is pulled as the BuildKit cache donor for incremental
-# rebuilds.
+# The trusted keyring is the PUBLIC k3 key from
+# src/license/docs/vectors/keyring.json, i.e. the key the test License
+# Server (license.scan-dev.com) signs with.  It is fed to docker build as a
+# BuildKit secret.  A different License Server needs its own public key
+# here.  Optional overrides: PROVISION_LICENSE_PRODUCT (default LLM) and
+# PROVISION_LICENSE_ACTIVATION_URL (default https://license.scan-dev.com).
+#
+# Single rolling tag :release, overwritten by every build (a push to either
+# branch replaces it).  The previous :release is the BuildKit cache donor.
 #
 # License state (.lic + request counter) lives in /var/lib/provision-llm in
 # the container; mount a volume there to persist it across recreation.
-#
-# The trusted keyring comes from the PROVISION_LICENSE_KEYRING_JSON CI
-# variable (Settings -> CI/CD -> Variables, Protected + Masked; the same
-# variable the OCR pipeline uses).  It is fed to docker build as a BuildKit
-# secret: the bytes never enter the image layers, only the generated
-# keyring_baked.cpp inside the build stage.  Optional overrides:
-# PROVISION_LICENSE_PRODUCT (default LLM) and
-# PROVISION_LICENSE_ACTIVATION_URL (default https://license.scan-dev.com).
 # =========================================================================
-build_llama_dual_trial:
+build_llama_dual_release:
   stage: build
   image: docker:24.0.9
   timeout: 2h
@@ -122,36 +102,15 @@ build_llama_dual_trial:
   - echo "REGISTRY=[$REGISTRY] RELEASE_IMG=[$RELEASE_IMG] CUDA_ARCH=[$CUDA_ARCH] TRIAL_LIMIT=[$TRIAL_LIMIT]"
   - docker login -u admin -p $NEXUS_PASS nexus.scan-dev.com:6001
   script:
-  # 1. Pull the previous :trial image as a cache donor (ignored if absent).
-  - docker pull $RELEASE_IMG:trial || true
-  # 2. Materialise the keyring for the build secret.  Branch policy (same as
-  #    the OCR pipeline):
-  #      * dev    -> the PUBLIC k3 test pubkey from src/license/docs/vectors
-  #                  (works with the test License Server; NOT for production),
-  #                  image tagged :trial-dev so it never replaces :trial.
-  #      * master -> PROVISION_LICENSE_KEYRING_JSON (Protected + Masked CI
-  #                  variable).  Missing = FATAL: a :trial image with an
-  #                  empty keyring could never be activated by a customer.
+  # 1. Pull the previous :release as a cache donor (ignored if absent).
+  - docker pull $RELEASE_IMG:release || true
+  # 2. Materialise the k3 keyring for the build secret.
+  - cp src/license/docs/vectors/keyring.json license_keyring.json
+  - echo "[license] baking the public k3 key ($(wc -c < license_keyring.json) bytes) - test License Server"
+  # 3. Build the licensed trial variant (TRIAL=1) and tag it :release.
   - |
-    if [ "$CI_COMMIT_BRANCH" = "dev" ]; then
-      cp src/license/docs/vectors/keyring.json license_keyring.json
-      TRIAL_TAG=trial-dev
-      echo "[license] DEV branch - baking the public k3 TEST pubkey, image tag :$TRIAL_TAG"
-    elif [ -n "$PROVISION_LICENSE_KEYRING_JSON" ]; then
-      printf '%s' "$PROVISION_LICENSE_KEYRING_JSON" > license_keyring.json
-      TRIAL_TAG=trial
-      echo "[license] keyring materialised ($(wc -c < license_keyring.json) bytes)"
-    else
-      echo "FATAL: PROVISION_LICENSE_KEYRING_JSON is empty - refusing to build a :trial image that cannot verify any .lic."
-      echo "Set it in Settings -> CI/CD -> Variables (Protected + Masked) and make sure this branch is protected."
-      exit 1
-    fi
-    echo "TRIAL_TAG=$TRIAL_TAG" > trial_tag.env
-  # 3. Build the trial variant (TRIAL=1) and tag it :trial (master) / :trial-dev (dev).
-  - |
-    . ./trial_tag.env
-    DOCKER_BUILDKIT=1 docker build -f docker-dual/Dockerfile \
-      --cache-from $RELEASE_IMG:$TRIAL_TAG \
+    docker build -f docker-dual/Dockerfile \
+      --cache-from $RELEASE_IMG:release \
       --build-arg BUILDKIT_INLINE_CACHE=1 \
       --build-arg CUDA_ARCH="$CUDA_ARCH" \
       --build-arg TRIAL=1 \
@@ -159,13 +118,11 @@ build_llama_dual_trial:
       --build-arg LICENSE_PRODUCT="${PROVISION_LICENSE_PRODUCT:-LLM}" \
       --build-arg LICENSE_ACTIVATION_URL="${PROVISION_LICENSE_ACTIVATION_URL:-https://license.scan-dev.com}" \
       --secret id=license_keyring,src=license_keyring.json \
-      -t $RELEASE_IMG:$TRIAL_TAG \
+      -t $RELEASE_IMG:release \
       .
-  # 4. Push the single rolling tag, overwriting the previous trial image.
-  - |
-    . ./trial_tag.env
-    docker push $RELEASE_IMG:$TRIAL_TAG
+  # 4. Push the single rolling tag.
+  - docker push $RELEASE_IMG:release
   after_script:
-  - rm -f license_keyring.json trial_tag.env
-  - echo "=== llama-dual TRIAL pushed - see the tag printed above ==="
+  - rm -f license_keyring.json
+  - echo "=== llama-dual pushed - $RELEASE_IMG:release ==="
   - docker images $RELEASE_IMG --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | head -n 5

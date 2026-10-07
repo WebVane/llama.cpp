@@ -1,0 +1,71 @@
+# systemd unit: Provision LLM Engine (provision-server in router mode) on a
+# Linux host, without Docker.  Works with any GPU backend the binary was built
+# with (CUDA, HIP/ROCm, Vulkan, SYCL) and without a GPU.
+#
+# Full walk-through (build, directories, permissions, first start, upgrade):
+# docs/provision-admin.md, section "Deployment on a Linux host".  In short:
+#
+#   sudo useradd --system --user-group --home-dir /var/lib/provision-llm --shell /usr/sbin/nologin provision-llm
+#   sudo install -m 0644 provision-llm.service /etc/systemd/system/
+#   sudo install -D -m 0640 -o root -g provision-llm provision-llm.env.example /etc/provision-llm/provision-llm.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now provision-llm
+#   journalctl -u provision-llm -f
+#
+# Settings belong in /etc/provision-llm/provision-llm.env, not here.  For a
+# local change of this file use a drop-in (`systemctl edit provision-llm`),
+# so that an updated copy of the unit does not overwrite it.
+
+[Unit]
+Description=Provision LLM Engine (provision-server, router mode)
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated account without a login.  GPU access: NVIDIA device nodes are
+# usually open to everyone; AMD (/dev/kfd, /dev/dri/renderD*) and Intel
+# (/dev/dri/renderD*) need the groups "render" and/or "video" -- add the
+# account to the ones that exist on this host (usermod -aG, see the docs)
+# instead of listing them here: a group that does not exist would stop the
+# unit from starting.
+User=provision-llm
+Group=provision-llm
+# Created by systemd (owner provision-llm, mode 0700) before the start:
+#   /var/lib/provision-llm        license state, and HOME of the account
+#   /var/lib/provision-llm-admin  admin state (settings, per-model settings,
+#                                 generated admin key) = the server's default
+#                                 PROVISION_ADMIN_STATE_DIR
+StateDirectory=provision-llm provision-llm-admin
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/provision-llm
+# The binary and the ggml / backend libraries live side by side in
+# /opt/provision-llm (the same layout as /app in the Docker image).
+Environment=LD_LIBRARY_PATH=/opt/provision-llm
+# Every admin and router setting, see provision-llm.env.example.
+EnvironmentFile=/etc/provision-llm/provision-llm.env
+# ${VAR} is replaced by exactly one argument, $VAR (no braces) by zero or more
+# words split at blanks, so PROVISION_LLM_ARGS may be empty.
+ExecStart=/opt/provision-llm/provision-server --host ${PROVISION_LLM_HOST} --port ${PROVISION_LLM_PORT} --models-max ${PROVISION_LLM_MODELS_MAX} $PROVISION_LLM_ARGS
+# The router stops its model processes itself (as under Docker, where only the
+# server gets the signal): SIGTERM goes to the router first, anything still
+# running after TimeoutStopSec is killed.
+KillMode=mixed
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+# Files the server creates (downloaded models, admin state) are not readable
+# for other accounts; members of the group provision-llm can read them.
+UMask=0027
+# Hardening that GPU drivers tolerate.  Deliberately NOT set:
+#   PrivateDevices=   hides /dev/nvidia*, /dev/kfd and /dev/dri
+#   NoNewPrivileges=  stops the setuid nvidia-modprobe that creates
+#                     /dev/nvidia-uvm on hosts without nvidia-persistenced
+#   MemoryDenyWriteExecute=  breaks the CUDA / ROCm JIT compilers
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

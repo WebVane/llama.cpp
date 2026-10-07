@@ -3,7 +3,7 @@
   "info": {
     "title": "Provision LLM Engine API",
     "version": "1.0.0",
-    "description": "OpenAI-compatible + native endpoints exposed by the Provision LLM Engine (llama-server). Served by the server itself, so \"Try it out\" runs same-origin (no CORS setup needed). In router mode, send a known model id in the `model` field (e.g. `qwen2.5-chat`, `gte-qwen2-embed`).\n\n**Trial builds:** endpoints tagged _counted_ consume one unit of the trial request budget; once it is exhausted they return HTTP 403 with `X-Trial-Limit` / `X-Trial-Used` headers. Endpoints tagged _exempt_ (health, metadata, tokenize, models, slots) never consume the budget. Non-trial builds ignore the counter entirely.\n\nMany routes have aliases (legacy / non-`v1` forms); the canonical path is documented and its aliases are listed in the route description."
+    "description": "OpenAI-compatible + native endpoints exposed by the Provision LLM Engine (llama-server). Served by the server itself, so \"Try it out\" runs same-origin (no CORS setup needed). In router mode, send a known model id in the `model` field (e.g. `qwen2.5-chat`, `gte-qwen2-embed`).\n\n**Licensed builds** (image `:release`): endpoints tagged _counted_ are metered by the license subsystem. A request is charged one unit per result it produces (a `prompt` / `input` / `documents` array or `n` > 1 counts per element) and only when a 2xx result is delivered; errors and requests the client abandons are not charged. The trial allows 50 requests per install; after that, or with no / an expired license, counted endpoints return HTTP 403 with an `error.license` block and `X-License-Mode` / `X-License-Used` / `X-License-Limit` headers until the product is activated via `POST /license/activate`. Endpoints tagged _exempt_ (health, metadata, tokenize, models, slots, `/license/*`) never consume the budget. Unlicensed builds (`:dev`) have no counter and answer 404 on `/license/*`.\n\nMany routes have aliases (legacy / non-`v1` forms); the canonical path is documented and its aliases are listed in the route description.\n\n**Admin API** (`/admin/*`, tag _Admin_): present only when the server runs in router mode with `PROVISION_ADMIN=1` (otherwise these paths answer 404). In the Docker deployment, and with the host nginx site of `deploy/linux/`, the nginx front door forwards `/admin` (and `/cors-proxy`) only for allow-listed client addresses and answers 403 to everyone else. Every endpoint except the `GET /admin/status` probe also needs the admin key in the `X-Admin-Key` header (use **Authorize**). Loading, unloading, downloading and deleting downloaded models keep using the public model routes (`/models`, `/models/load`, `/models/unload`); the settings, the upload of GGUF files (`/admin/models/upload*`) and the deletion of models of the models directory (`/admin/models/delete`) are protected by the admin key. Admin endpoints never consume the license budget."
   },
   "servers": [
     { "url": "/", "description": "This server" }
@@ -11,7 +11,9 @@
   "tags": [
     { "name": "OpenAI", "description": "OpenAI-compatible routes" },
     { "name": "Anthropic", "description": "Anthropic Messages-compatible routes" },
-    { "name": "Server", "description": "Native llama-server / router routes" }
+    { "name": "Server", "description": "Native llama-server / router routes" },
+    { "name": "License", "description": "License status and online activation (licensed builds only, image `:release`)" },
+    { "name": "Admin", "description": "Admin API: runtime settings, per-model settings with a fit check, GPU memory, model output tails, diagnostics, storage, download pre-flight, resumable GGUF upload and deletion of models of the models directory (router mode with `PROVISION_ADMIN=1` only; behind the nginx allow-list in the Docker and host deployments, or the server's own address allow-list `PROVISION_ADMIN_ALLOW_FROM` on a host without nginx)" }
   ],
   "paths": {
     "/v1/chat/completions": {
@@ -523,27 +525,1872 @@
           "400": { "description": "Invalid slot or action" }
         }
       }
-    }
-  },
-  "components": {
-    "responses": {
-      "TrialLimitReached": {
-        "description": "Trial request budget exhausted. Returned by counted endpoints once the limit is reached.",
-        "headers": {
-          "X-Trial-Limit": { "schema": { "type": "integer" }, "description": "Configured request limit" },
-          "X-Trial-Used": { "schema": { "type": "integer" }, "description": "Requests already consumed" }
+    },
+    "/license/status": {
+      "get": {
+        "tags": ["License"],
+        "summary": "License status (exempt)",
+        "description": "Read-only snapshot of the license: mode, validity, request budget, expiry. Public endpoint (no API key), never consumes the budget; the web UI polls it. Deliberately contains nothing that identifies the machine or the signing key. Licensed builds only (unlicensed `:dev` answers 404).",
+        "responses": {
+          "200": {
+            "description": "Current license state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LicenseStatus" },
+                "examples": {
+                  "trial": { "summary": "Trial, 12 of 50 used", "value": { "mode": "trial", "status": "valid", "used": 12, "limit": 50, "reason": "" } },
+                  "exhausted": { "summary": "Trial used up", "value": { "mode": "trial", "status": "none", "used": 50, "limit": 50, "reason": "request_limit_reached" } },
+                  "online": { "summary": "Activated, unlimited tariff", "value": { "mode": "online", "status": "valid", "used": 0, "limit": -1, "reason": "", "product": "LLM", "tariff": "TEST", "expiresAt": "2027-09-23T22:59:59Z" } }
+                }
+              }
+            }
+          },
+          "404": { "description": "Build without the license subsystem" }
+        }
+      }
+    },
+    "/license/activate": {
+      "post": {
+        "tags": ["License"],
+        "summary": "Activate the product online (exempt)",
+        "description": "Sends the activation code together with this machine's fingerprint to the License Server, stores the signed `.lic` it returns and switches to a licensed mode without a restart. Idempotent: the same code on the same machine returns the same licence and keeps its request tally. Concurrent calls are serialised. Subject to `--api-key` when one is set. Never consumes the budget. Licensed builds only.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LicenseActivateRequest" },
+              "example": { "activationCode": "XXXX-XXXX-XXXX" }
+            }
+          }
         },
-        "content": {
-          "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
-            "example": {
-              "error": { "code": 403, "message": "Trial limit reached", "type": "permission_error" }
+        "responses": {
+          "200": {
+            "description": "Activated; the body is the new license status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LicenseActivateResponse" },
+                "example": { "mode": "online", "status": "valid", "used": 0, "limit": -1, "reason": "", "product": "LLM", "tariff": "TEST", "expiresAt": "2027-09-23T22:59:59Z", "activated": true, "detail": "loaded online license, limit=0" }
+              }
+            }
+          },
+          "400": {
+            "description": "`activationCode` missing or not printable ASCII of at most 256 characters",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": { "description": "Build without the license subsystem" },
+          "502": {
+            "description": "Activation refused or the License Server was not reachable (invalid code, no free server slot, licence for another product, network error). The current license state is unchanged; the reason is in `detail` / `message`.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LicenseActivateResponse" },
+                "example": { "mode": "trial", "status": "none", "used": 50, "limit": 50, "reason": "request_limit_reached", "activated": false, "detail": "activation failed (status=1; detail=...)", "message": "activation failed (status=1; detail=...)" }
+              }
             }
           }
         }
       }
     },
+    "/admin/status": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Admin probe and status (exempt)",
+        "description": "Works **without** a key: the answer then only says that the admin API exists and whether a key is configured, which is what the web UI needs to decide whether to show the Admin page. With a valid `X-Admin-Key` the full status is returned (a wrong key is not an error here, it gives the short answer with `authorized: false`). Subject to `--api-key` when one is set. **Exempt** from the trial budget.",
+        "security": [{}, { "AdminKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Short probe answer (no valid key) or full status (valid key)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminStatus" },
+                "examples": {
+                  "probe": { "summary": "No key / wrong key", "value": { "admin": true, "authorized": false, "key_configured": true } },
+                  "authorized": { "summary": "Valid key", "value": { "admin": true, "authorized": true, "key_configured": true, "version": 1, "key_source": "generated", "features": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete"], "models": { "max": 3, "running": 2, "total": 5 }, "state": { "dir": "/var/lib/provision-llm-admin", "writable": true, "error": "", "model_settings": { "file": "/var/lib/provision-llm-admin/admin-models.json", "error": "", "read_only": false, "backup_loaded": false, "entries": 1 } }, "download": { "available": true, "offline": false }, "upload": { "available": true, "reason": null, "message": null }, "dirs": { "cache": "/models-rw/hf", "models_dir": "/models-rw/local", "preset": "/config/models.ini" }, "license_build": false, "ip_allowlist": false, "warnings": [] } }
+                }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" }
+        }
+      }
+    },
+    "/admin/settings": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Read the admin settings (exempt)",
+        "description": "Effective settings plus what the settings form needs: limits, the devices mentioned by the model presets, the GPUs of this server (`build_devices`) and the model list with the pinned flag. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Current settings",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminSettings" },
+                "example": { "models_max": 3, "default_device": "CUDA0", "default_device_locked": false, "pinned": ["qwen2.5-chat", "gte-qwen2-embed"], "limits": { "models_max_min": 1, "models_max_max": 16 }, "known_devices": ["CUDA0", "CUDA1"], "build_devices": ["CUDA0", "CUDA1"], "warnings": [], "models": [{ "id": "qwen2.5-chat", "source": "preset", "status": "loaded", "pinned": true }, { "id": "gte-qwen2-embed", "source": "preset", "status": "loaded", "pinned": true }] }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      },
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Change the admin settings (exempt)",
+        "description": "Send any subset of the three settings; fields that are left out keep their value. The request is validated as a whole: on any error nothing is saved. On success the settings are stored in the admin state directory, applied immediately and returned.\n\n- `models_max`: applies to every later scheduling decision. Raising it takes effect at once; lowering it does not unload anything by itself.\n- `pinned`: a pinned model is never unloaded to make room for another one. At least one slot must stay free: `pinned` must be shorter than `models_max`.\n- `default_device`: GPU for models that have no `device` of their own (downloaded or dropped-in models; sections of `models.ini` are not touched by it, they get a GPU of their own through `POST /admin/models/settings`). A name this server does not have is not applied (`warnings`: `default_device_not_present`). Changing it rebuilds the model list, which unloads a **running** model whose arguments changed. Rejected with 409 while `MODEL_DEVICES` contains a `*=` entry.\n\n**Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminSettingsUpdate" },
+              "examples": {
+                "max": { "summary": "Allow four loaded models", "value": { "models_max": 4 } },
+                "pin": { "summary": "Pin only the chat model", "value": { "pinned": ["qwen2.5-chat"] } },
+                "device": { "summary": "Put new models on the second GPU", "value": { "default_device": "CUDA1" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved and applied; the body is the new settings",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminSettings" } } }
+          },
+          "400": {
+            "description": "Validation failed, nothing was saved (`error.type` = `invalid_request_error`): `models_max` outside `limits`, malformed `default_device`, unknown model id in `pinned`, or `pinned` not shorter than `models_max`",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 400, "message": "models_max must be an integer between 1 and 16", "type": "invalid_request_error" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`default_device` is locked by `MODEL_DEVICES` (`error.type` = `default_device_locked`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/storage": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Model storage and free space (exempt)",
+        "description": "The directories the server keeps models and admin state in, with the free space of the filesystem each one lives on, and unfinished downloads found in the model cache. The `models_dir` entry is absent when the server runs without `--models-dir`. `uploads` lists the unfinished GGUF uploads (`/admin/models/upload`) with what they take on disk, `upload_staging` their folder and the trash of deleted models; this call also runs the clean-up of that folder. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Storage overview",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminStorage" },
+                "example": { "dirs": [{ "kind": "cache", "path": "/models-rw/hf", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 }, { "kind": "models_dir", "path": "/models-rw/local", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 }, { "kind": "state", "path": "/var/lib/provision-llm-admin", "exists": true, "writable": true, "total_bytes": 100000000000, "free_bytes": 60000000000 }], "partial_downloads": [], "uploads": [{ "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "substate": null, "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 1258291200, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T10:20:00Z", "error": null, "blocked": null, "expires_at": "2026-10-09T10:20:00Z", "bytes": 1258291200 }], "upload_staging": { "path": "/models-rw/local/.provision-upload", "bytes": 1258291200, "trash_bytes": 0 } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/download/check": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Pre-flight check for a model download (exempt)",
+        "description": "Advisory only: asks the configured Hugging Face endpoint which files `POST /models` would fetch for this model, adds up their size and compares it with the free space of the model cache. It downloads nothing and never blocks a download; problems are reported as codes in `warnings`. The answer is always 200 for a well-formed request, also when Hugging Face cannot be reached (network budget: about 10 s). The download itself is started with the public `POST /models {\"model\": ...}`. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminDownloadCheckRequest" },
+              "example": { "model": "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Result of the check",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminDownloadCheck" },
+                "examples": {
+                  "ok": { "summary": "Fits", "value": { "model": "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", "repo": "bartowski/Qwen2.5-7B-Instruct-GGUF", "quant": "Q4_K_M", "hf_reachable": true, "exists": true, "already_present": false, "files": [{ "name": "Qwen2.5-7B-Instruct-Q4_K_M.gguf", "bytes": 4683073536 }], "total_bytes": 4683073536, "free_bytes": 120000000000, "enough_space": true, "warnings": [] } },
+                  "unreachable": { "summary": "Hugging Face not reachable", "value": { "model": "user/repo:Q4_K_M", "repo": "user/repo", "quant": "Q4_K_M", "hf_reachable": false, "exists": false, "already_present": false, "files": [], "total_bytes": 0, "free_bytes": 120000000000, "enough_space": true, "warnings": ["hf_unreachable"] } }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`model` missing or not of the form `user/repo[:quant]`",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/settings": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Per-model settings of all models, or of one (exempt)",
+        "description": "Without `model`: every model of the list with its custom settings (`overrides`), the effective value and origin of every whitelisted key (`fields`), locks, the trial / commit state and the last failure, plus the saved settings of models that are no longer in the list (`unattached`) and the state of `admin-models.json`. Model facts are included when they are already known (they are read in the background). With `?model=<id>`: that one row (plus `state`), with the facts read from its file if needed; for an id that is only in `unattached`, its saved entry (`exists: false`). **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "parameters": [
+          { "name": "model", "in": "query", "required": false, "schema": { "type": "string" }, "description": "One model id (as `GET /v1/models` lists it); the answer is then that model's row" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-model settings",
+            "content": {
+              "application/json": {
+                "schema": { "anyOf": [{ "$ref": "#/components/schemas/AdminModelSettingsList" }, { "$ref": "#/components/schemas/AdminModelRow" }, { "$ref": "#/components/schemas/AdminUnattachedEntry" }] },
+                "examples": {
+                  "all": { "summary": "All models", "value": {"schema": [{"key": "ctx-size", "group": "placement", "default": null, "type": "int", "min": 256, "max": 1048576}, {"key": "cache-type-k", "group": "advanced", "default": "f16", "type": "enum", "values": ["f16", "bf16", "q8_0", "q4_0"], "pair": "cache-type-v"}], "build_devices": ["CUDA0", "CUDA1"], "models": [{"id": "qwen2.5-chat", "source": "preset", "status": "loaded", "exists": true, "hidden": false, "overrides": {"ctx-size": "32768"}, "kept": {}, "fields": {"ctx-size": {"effective": "32768", "default": null, "origin": "admin", "inherited": "8192", "inherited_origin": "models_ini", "override": "32768", "locked": null, "active": true, "inactive_reason": null}, "device": {"effective": "CUDA1", "default": null, "origin": "models_ini", "inherited": "CUDA1", "inherited_origin": "models_ini", "override": null, "locked": null, "active": false, "inactive_reason": null}}, "phase": "committed", "failures": 0, "last_good": {"ctx-size": "32768"}, "updated": "2026-10-06T10:00:00Z", "reverted": null, "reverted_at_startup": false, "last_failure": null, "last_run": {"status": "loaded", "port": 39123, "running": true, "failed": false, "exit_code": 0, "reason": null}, "device_moved": null, "device_missing": null, "apply_error": "", "context": {"slots": 4, "unified": true, "pool": 32768, "per_slot_cap": null, "n_ctx_train": 32768, "max_per_request": 32768, "per_request_all_busy": 8192}, "facts_status": "ready", "facts": {"arch": "qwen2", "n_layer": 28, "n_ctx_train": 32768, "quant": "Q5_K_M", "files": [{"name": "Qwen2.5-7B-Instruct-Q5_K_M.gguf", "bytes": 5444000000}]}, "warnings": []}], "unattached": [{"id": "user/old-repo:Q4_K_M", "kind": "orphaned", "overrides": {"device": "CUDA0"}, "phase": "committed", "failures": 0, "updated": "2026-10-01T09:00:00Z", "exists": false}], "state": {"file": "/var/lib/provision-llm-admin/admin-models.json", "error": "", "read_only": false, "backup_loaded": false, "problems": []}, "warnings": []} },
+                  "orphaned": { "summary": "?model= of saved settings whose model is gone", "value": {"id": "user/old-repo:Q4_K_M", "kind": "orphaned", "overrides": {"device": "CUDA0"}, "phase": "committed", "failures": 0, "updated": "2026-10-01T09:00:00Z", "reverted": null, "exists": false, "state": { "file": "/var/lib/provision-llm-admin/admin-models.json", "error": "", "read_only": false, "backup_loaded": false, "problems": [] }} },
+                  "one": { "summary": "?model=qwen2.5-chat", "value": {"id": "qwen2.5-chat", "source": "preset", "status": "loaded", "exists": true, "hidden": false, "overrides": {"ctx-size": "32768"}, "kept": {}, "fields": {"ctx-size": {"effective": "32768", "default": null, "origin": "admin", "inherited": "8192", "inherited_origin": "models_ini", "override": "32768", "locked": null, "active": true, "inactive_reason": null}, "device": {"effective": "CUDA1", "default": null, "origin": "models_ini", "inherited": "CUDA1", "inherited_origin": "models_ini", "override": null, "locked": null, "active": false, "inactive_reason": null}}, "phase": "committed", "failures": 0, "last_good": {"ctx-size": "32768"}, "updated": "2026-10-06T10:00:00Z", "reverted": null, "reverted_at_startup": false, "last_failure": null, "last_run": {"status": "loaded", "port": 39123, "running": true, "failed": false, "exit_code": 0, "reason": null}, "device_moved": null, "device_missing": null, "apply_error": "", "context": {"slots": 4, "unified": true, "pool": 32768, "per_slot_cap": null, "n_ctx_train": 32768, "max_per_request": 32768, "per_request_all_busy": 8192}, "facts_status": "ready", "facts": {"arch": "qwen2", "n_layer": 28, "n_ctx_train": 32768, "quant": "Q5_K_M", "files": [{"name": "Qwen2.5-7B-Instruct-Q5_K_M.gguf", "bytes": 5444000000}]}, "warnings": [], "state": {"file": "/var/lib/provision-llm-admin/admin-models.json", "error": "", "read_only": false, "backup_loaded": false, "problems": []}} }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminModelNotFound" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      },
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Change one model's settings, optionally restart it (exempt)",
+        "description": "Sets custom settings of one model (a value) or removes them (`null`); keys that are not given stay as they are. `reset: true` removes all custom settings of the model (also for an entry in `unattached`). Only the whitelisted keys of `AdminModelSettingsInput` are accepted; `cache-type-k` and `cache-type-v` must be equal; a quantized KV cache needs flash attention other than `off`. A value equal to the built-in default with nothing inherited counts as \"not set\", so it never changes anything.\n\n- Model **running** and the change needs a restart: refused with 409 `restart_required` unless `restart: true`; nothing is saved. With `restart: true` the model is stopped first (at most its stop timeout + 10 s, else 504 `stop_timeout` and nothing is saved), then the settings are saved, the model list is rebuilt (like a rescan: models that were loaded and are down afterwards are loaded again, `restarted_also` / `not_restarted`) and the model is started again.\n- Model **not running**: saved; with `restart: true` also loaded right away (\"Save and load\").\n- New settings are first tried (`phase` `trial`); after two failed starts in a row the server goes back to the last settings that worked (`reverted`).\n\nThe POST holds the request until the restart has begun (up to the stop timeout + 10 s); follow the load on `GET /models/sse`. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminModelSettingsUpdate" },
+              "examples": {
+                "context": { "summary": "Larger context, restart the running model", "value": { "model": "qwen2.5-chat", "settings": { "ctx-size": 32768 }, "restart": true } },
+                "perslot": { "summary": "32k per request on 4 slots with a q8_0 KV cache", "value": { "model": "qwen2.5-chat", "settings": { "ctx-size": 131072, "kv-unified-per-slot": 32768, "parallel": 4, "cache-type-k": "q8_0", "cache-type-v": "q8_0" }, "restart": true } },
+                "gpu": { "summary": "Move a stopped model to the second GPU", "value": { "model": "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M", "settings": { "device": "CUDA1" } } },
+                "remove": { "summary": "Remove one custom value", "value": { "model": "qwen2.5-chat", "settings": { "ctx-size": null }, "restart": true } },
+                "reset": { "summary": "Remove all custom settings", "value": { "model": "qwen2.5-chat", "reset": true, "restart": true } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved (or nothing to change: `result.changed` false). `load_error`: saved, but the model could not be started now (e.g. `model limit reached`), it starts on its next request. A failed rebuild of the model list is answered with 500 instead",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminModelSettingsResult" },
+                "example": { "model": { "id": "qwen2.5-chat", "source": "preset", "status": "loading", "overrides": { "ctx-size": "32768" }, "phase": "trial", "failures": 0 }, "result": { "changed": true, "reloaded": true, "restarted": true, "was_running": true, "restarted_also": [], "not_restarted": [], "load_error": "", "reload_error": "" }, "previous": { "ctx-size": null }, "warnings": [] }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed, nothing was saved (`error.type` = `invalid_request_error`, `error.param` names the key): unknown key, wrong type or range, a GPU this server does not have, `cache-type-k` != `cache-type-v`, quantized KV cache with flash attention `off`, limits (256 models, id 256 bytes, value 128 bytes)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 400, "message": "ctx-size must be an integer between 256 and 1048576", "type": "invalid_request_error", "param": "ctx-size" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminModelNotFound" },
+          "409": {
+            "description": "`error.type`: `field_locked` (the key is set by `MODEL_DEVICES` or on the router command line; `null` is still accepted), `restart_required` (the model is running, the change needs a restart and `restart` was not set; nothing saved), `model_settings_read_only` (`admin-models.json` is damaged or from a newer version; see `GET /admin/status` `state.model_settings`)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 409, "message": "qwen2.5-chat is running: send \"restart\": true to restart it with the new settings", "type": "restart_required" } }
+              }
+            }
+          },
+          "500": {
+            "description": "`server_error`: the settings file could not be written (nothing was applied; a model that was stopped for the restart is started again with its old settings), or rebuilding the model list failed: then `error.reload_error` says why, the previous settings are restored in memory and in the file, and `restarted` / `restart_error` / `restarted_also` / `not_restarted` say what happened to the models",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminReloadError" },
+                "example": {"error": {"code": 500, "message": "reloading the model list failed, the previous settings are restored: failed to parse server config file: /config/models.ini", "type": "server_error", "reload_error": "failed to parse server config file: /config/models.ini", "restarted": true}}
+              }
+            }
+          },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" },
+          "504": {
+            "description": "The running model did not stop within its stop timeout + 10 s (typically a GPU fault); nothing was saved (`stop_timeout`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/admin/models/settings/check": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Will these settings fit? Dry run by llama.cpp (exempt)",
+        "description": "Runs a short helper process of the server binary with the arguments the model would get with these (unsaved) settings. It uses llama.cpp's own fit machinery: the model and its context are built without allocating the weights, and the need per GPU (model, context, compute) and on the host is reported. The verdict per GPU compares the need plus a 1 GiB margin with the memory `available` there (free now, from the vendor tool or the helper, plus the model's own use if it is running and would be restarted); `verdict` is the worst of them. A model that uses no GPU (a CPU-only server, or `device` `none`) gets the verdict `cpu_only`. One check at a time (409 `check_busy`; 409 `check_stuck` while a stopped helper has not exited), at most 30 s. A result is reused (`cached`) for at most 60 s, while the model's effective arguments, the GPU inventory and the model's state (running or not) are unchanged and the live free memory of its GPUs moved by less than 256 MiB: llama.cpp's fit adapts the values left on auto to the memory free at that moment. `checked_while_running` marks a dry run made while the model was running (its fit saw the model's own memory as used). Nothing is saved. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminFitCheckRequest" },
+              "example": { "model": "qwen2.5-chat", "settings": { "ctx-size": 65536 } }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Result of the check; `ok: false` with `error` when llama.cpp could not set the model up",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminFitCheck" },
+                "examples": {
+                  "no": { "summary": "Does not fit next to what runs on the GPU", "value": {"ok": true, "model": "qwen2.5-chat", "checked_at": "2026-10-06T10:00:05Z", "cached": false, "checked_while_running": false, "verdict": "no", "margin": 1073741824, "devices": [{"device": "CUDA1", "description": "NVIDIA GeForce GTX 1080 Ti", "need": {"model": 5444000000, "context": 3758096384, "compute": 305000000, "total": 9507096384}, "free": 2400000000, "total": 11811160064, "free_source": "vendor_tool", "own_usage": 0, "own_usage_source": null, "available": 2400000000, "settling": false, "verdict": "no"}], "host": {"model": 560000000, "context": 0, "compute": 0}, "host_bytes": 560000000, "error": null, "warnings": []} },
+                  "cpu": { "summary": "A model that uses no GPU (device none, or a CPU-only server)", "value": {"ok": true, "model": "qwen2.5-chat", "checked_at": "2026-10-06T10:00:09Z", "cached": false, "checked_while_running": false, "verdict": "cpu_only", "margin": 1073741824, "devices": [], "host": {"model": 4683073536, "context": 469762048, "compute": 304087040, "free": 30000000000, "total": 34359738368}, "host_bytes": 5456922624, "args": ["/app/llama-server", "--device", "none", "--model", "/models/Qwen2.5-7B-Instruct-Q5_K_M.gguf", "--ctx-size", "8192"], "duration_ms": 2100, "n_ctx": 8192, "n_ctx_train": 32768, "n_layer": 28, "n_gpu_layers": 0, "fit": "success", "error": null, "warnings": []} },
+                  "invalid": { "summary": "Impossible combination", "value": {"ok": false, "model": "qwen2.5-chat", "checked_at": "2026-10-06T10:00:07Z", "cached": false, "verdict": "unknown", "margin": 1073741824, "devices": [], "host": null, "host_bytes": null, "error": {"code": "invalid_settings", "message": "A setting is not valid for this model or this server", "line": "llama_init_from_model: V cache quantization requires flash_attn"}, "warnings": []} }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid settings (as for `POST /admin/models/settings`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminModelNotFound" },
+          "409": {
+            "description": "`check_busy`: another check is running. `check_stuck`: the previous check's helper was stopped but has not exited (stuck in the GPU driver); no new one is started while it lives",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/log": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Output tail and failure reason of a model process (exempt)",
+        "description": "The last lines (at most 200 / 64 KiB, colour codes removed) of the output of the model's latest process, the failure reason classified from the last error line, and the last failed start, which is kept until a later failure replaces it (a retry started by a client request does not wipe it). An empty tail gives empty `lines`. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "parameters": [
+          { "name": "model", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Model id" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Output tail",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminModelLog" },
+                "example": {"model": "gte-qwen2-embed", "status": "unloaded", "instance": {"port": 41235, "running": false, "started": "2026-10-06T10:02:01Z", "started_ms": 1791280921348, "lines_total": 412}, "reason": {"code": "out_of_memory", "message": "Out of GPU memory: the model, its context (KV cache) or its compute buffers do not fit", "hint": "lower the context size, use KV cache precision q8_0, offload fewer GPU layers or choose another GPU", "line": "llama_kv_cache: failed to allocate buffer for kv cache", "hints": []}, "lines": ["llama_kv_cache: failed to allocate buffer for kv cache"], "truncated": true, "last_failure": {"time": "2026-10-06T10:02:11Z", "time_ms": 1791280931502, "reason": {"code": "out_of_memory", "message": "Out of GPU memory: the model, its context (KV cache) or its compute buffers do not fit", "hint": "lower the context size, use KV cache precision q8_0, offload fewer GPU layers or choose another GPU", "line": "llama_kv_cache: failed to allocate buffer for kv cache", "hints": []}, "port": 41235, "exit_code": 1, "before_loaded": true, "lines": ["llama_kv_cache: failed to allocate buffer for kv cache"], "truncated": true, "failures": 1, "settings_reverted": false}}
+              }
+            }
+          },
+          "400": {
+            "description": "`model` missing",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminModelNotFound" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/gpus": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "GPU memory cards (exempt)",
+        "description": "Every GPU of the server with total / used / free memory and the models placed on it. GPUs come from the inventory the server takes at start-up (and on `POST /admin/gpus/rescan`) in a helper process: names, backend, PCI bus id, memory. Live memory comes from the vendor tool of each GPU vendor found (`nvidia-smi`, `amd-smi` or `rocm-smi`, see `PROVISION_ADMIN_GPU_PROBE`), matched to the GPUs by PCI bus id; without one the inventory values are shown with their age. The router itself creates no GPU context. In `auto` mode `amd-smi` / `rocm-smi` are also looked for in `$ROCM_PATH/bin` and `/opt/rocm/bin`. One vendor-tool run at a time, at most 15 s each; a request waits for it at most 5 s (then `timeout`; the late answer is used by the next request), and a tool still running after its 15 s is reported as `probe_stuck`. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "parameters": [
+          { "name": "refresh", "in": "query", "required": false, "schema": { "type": "string", "enum": ["1"] }, "description": "`1` = ask the vendor tool again instead of using the last few seconds' result" }
+        ],
+        "responses": {
+          "200": {
+            "description": "GPU cards",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminGpus" },
+                "examples": {
+                  "nvidia": { "summary": "Two NVIDIA GPUs, nvidia-smi matched by PCI bus id", "value": {"build_devices": ["CUDA0", "CUDA1"], "gpu_backend": {"state": "ok", "message": "2 GPU device(s) found", "libraries": ["libggml-cuda.so"], "backends": [{"name": "CUDA", "devices": 2}]}, "inventory": {"ok": true, "source": "helper", "error": "", "message": "", "time": "2026-10-06T09:58:00Z", "age_ms": 120000, "duration_ms": 2300, "devices": [{"name": "CUDA0", "backend": "CUDA", "vendor": "nvidia", "description": "NVIDIA GeForce GTX 1080 Ti", "type": "gpu", "device_id": "0000:01:00.0", "pci_bus_id": "0000:01:00.0", "memory_free": 11500000000, "memory_total": 11811160064}, {"name": "CUDA1", "backend": "CUDA", "vendor": "nvidia", "description": "NVIDIA GeForce GTX 1080 Ti", "type": "gpu", "device_id": "0000:02:00.0", "pci_bus_id": "0000:02:00.0", "memory_free": 11500000000, "memory_total": 11811160064}], "backends": ["CUDA"]}, "probe": {"mode": "auto", "source": "nvidia-smi", "ok": true, "error": "", "message": "", "age_ms": 820, "stale": false, "mapping": "pci", "tools": [{"tool": "nvidia-smi", "path": "/usr/bin/nvidia-smi", "ok": true, "error": "", "message": "", "age_ms": 820, "rows": 2}]}, "margin": 1073741824, "settle_ms": 1500, "gpus": [{"device": "CUDA0", "backend": "CUDA", "vendor": "nvidia", "type": "gpu", "description": "NVIDIA GeForce GTX 1080 Ti", "pci_bus_id": "0000:01:00.0", "mapping": "pci", "tool": "nvidia-smi", "index": 0, "uuid": "GPU-0a1b2c3d", "name": "NVIDIA GeForce GTX 1080 Ti", "unsupported": false, "total": 11811160064, "used": 3100000000, "free": 8711160064, "memory_source": "vendor_tool", "memory_age_ms": 820, "settling": false, "same_gpu_as": [], "models": [{"id": "gte-qwen2-embed", "status": "loaded", "all_gpus": false, "pinned": true, "facts_status": "ready", "memory": {"bytes": 2400000000, "source": "reported", "by": "model"}}]}], "unmatched": [], "warnings": []} },
+                  "cpu": { "summary": "CPU-only build", "value": {"build_devices": [], "gpu_backend": {"state": "cpu_only", "message": "this server build has no GPU backend: models run on the CPU", "libraries": [], "backends": []}, "inventory": {"ok": true, "source": "helper", "error": "", "message": "", "time": "2026-10-06T09:58:00Z", "age_ms": 120000, "duration_ms": 300, "devices": [], "backends": []}, "probe": {"mode": "auto", "source": "none", "ok": false, "error": "unsupported", "message": "this server build has no GPU backend, GPU memory is not used", "age_ms": null, "stale": false, "mapping": "none", "tools": []}, "margin": 1073741824, "settle_ms": 1500, "gpus": [], "unmatched": [], "warnings": []} }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/gpus/rescan": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Re-detect GPUs (exempt)",
+        "description": "Runs the GPU inventory helper again (after a driver update, a GPU added or removed) and answers like `GET /admin/gpus`. The helper creates a short-lived context on every GPU, so it briefly needs a little memory on each, also where models are running. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "responses": {
+          "200": {
+            "description": "The GPU cards after the new inventory",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminGpus" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`rescan_busy`: an inventory is already running. `rescan_stuck`: the previous inventory helper was stopped but has not exited (stuck in the GPU driver)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/diagnostics": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "What the server found on this machine (exempt)",
+        "description": "Deployment (Docker or host), server version, GPU backend libraries next to the binary, GPU inventory result and time, vendor tool (path, version, last error), how memory is matched to GPUs, whether the router itself stays off the GPUs, state directory (path, writable, persistent), admin key source, whether requests arrive through a proxy, the server's own `/admin` address allow-list (`ip_allowlist`: on or off, its entries, the trusted proxies, and the address this very request was seen from), `MODEL_DEVICES`. Every item has a status (`ok`, `warning`, `error`, `info`) and a one-line hint. While a fit check or inventory helper hangs (stopped, not exited), an item `stuck_helpers` (status `error`) is added at the end. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Diagnostics",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminDiagnostics" },
+                "example": {"generated_at": "2026-10-06T10:05:00Z", "items": [{"id": "deployment", "label": "Deployment", "status": "ok", "value": "container", "hint": "running in a container (Docker / Podman / Kubernetes)"}, {"id": "vendor_tool", "label": "GPU memory tool", "status": "warning", "value": {"mode": "auto", "setting": "auto", "tools": [], "error": "not_found"}, "hint": "nvidia-smi was not found on PATH; nvidia-smi is not available inside the container: add NVIDIA_DRIVER_CAPABILITIES=compute,utility"}, {"id": "proxy", "label": "Requests through a reverse proxy", "status": "ok", "value": true, "hint": "X-Forwarded-For seen"}, {"id": "ip_allowlist", "label": "Admin address allow-list", "status": "ok", "value": {"enabled": true, "entries": ["10.64.0.0/24", "::1"], "trusted_proxies": ["127.0.0.1"], "seen_from": "10.64.0.7", "peer": "127.0.0.1", "via_forwarded_for": true, "note": ""}, "hint": "only these addresses reach /admin; X-Forwarded-For is used only from the trusted proxies"}]}
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/upload": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Uploads: availability, limits and the uploads of this server, or one upload (exempt)",
+        "description": "Without `id`: whether GGUF files can be uploaded on this server (`available`; else `reason`: `no_models_dir`, `models_dir_missing`, `not_writable`, `staging_unusable`, `staging_other_filesystem`, and `message`), the fixed `limits`, every upload of this server (from every browser and admin, finished ones for 24 h, so a client that lost its files can offer to continue), `staging_bytes`, and whether the placement of an upload can be saved (`settings_writable`).\n\nWith `?id=<upload id>`: one upload with everything a client needs to continue it. Per file: `offset` (the bytes the server accepted; the next chunk starts here), `durable_offset` (on disk at the last checkpoint; after a restart of the server `offset` goes back to it), `complete`, `dropped`, `role`, `sha256`, `head_crc32` (CRC-32 of the first MiB, to compare with a file picked again), `final_name`, `header` (the header check of that file) and `error` (why the file cannot be used). The upload: `state` `receiving`, `checking` (`substate` `queued`, `hashing` with `progress`, `classifying`, `load_check`), `ready` (`blocked_by` `manual`, `name_taken`, `publish_error`, `check_failed`, `sha256_mismatch`, `settings_not_saved`, `settings_invalid`; details in `blocked`), `publishing`, `published` (`result`), `rejected` (`error`), `cancelled`, `expired`; plus `checks`, `plan`, `facts`, `warnings`, `last_activity`, `expires_at` (72 h without progress, counted while the server runs), `idle_ms` and `last_client_idle_ms`.\n\nThe upload routes never answer 404 for an upload (the server replaces the body of every 404); an unknown or removed upload is 410 `upload_gone`. **Exempt** from the trial budget.",
+        "x-s3-recheck": "aligned with tools/server/server-admin-upload.cpp while it was being written: re-check every field, and the shapes of plan / facts / result",
+        "security": [{ "AdminKey": [] }],
+        "parameters": [
+          { "name": "id", "in": "query", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" }, "description": "One upload (32 hexadecimal characters, from the create answer or the `sessions` list)" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Without `id`: availability, limits and uploads. With `id`: that upload",
+            "content": {
+              "application/json": {
+                "schema": { "anyOf": [{ "$ref": "#/components/schemas/AdminUploadOverview" }, { "$ref": "#/components/schemas/AdminUploadSession" }] },
+                "examples": {
+                  "overview": { "summary": "Without id", "value": {"available": true, "reason": null, "message": null, "limits": {"chunk_max": 16777216, "chunk_default": 8388608, "chunk_min": 245760, "max_sessions": 4, "max_writers": 4, "max_files": 256, "ttl_h": 72, "ttl_s": 259200, "max_header_bytes": 67108864}, "sessions": [{"id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "substate": null, "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 1258291200, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T10:20:00Z", "error": null, "blocked": null, "expires_at": "2026-10-09T10:20:00Z"}], "staging_bytes": 1258291200, "models_dir": "/models-rw/local", "settings_writable": true, "settings_error": null} },
+                  "unavailable": { "summary": "No models directory", "value": {"available": false, "reason": "no_models_dir", "message": "this server has no --models-dir: uploads need one (Docker: mount /models-rw; host: add --models-dir to PROVISION_LLM_ARGS), then restart", "limits": {"chunk_max": 16777216, "chunk_default": 8388608, "chunk_min": 245760, "max_sessions": 4, "max_writers": 4, "max_files": 256, "ttl_h": 72, "ttl_s": 259200, "max_header_bytes": 67108864}, "sessions": [], "staging_bytes": 0, "models_dir": null, "settings_writable": true, "settings_error": null} },
+                  "session": { "summary": "?id= of an upload being hashed", "value": {"id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "checking", "substate": "hashing", "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 3341008960, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T11:02:00Z", "error": null, "blocked": null, "expires_at": null, "files": [{"index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856, "offset": 2489757856, "durable_offset": 2489757856, "complete": true, "dropped": false, "role": "model", "sha256": null, "sha256_expected": null, "head_crc32": "4a3b2c1d", "final_name": null, "header": {"state": "ok", "arch": "gemma3", "type": "model", "message": "gemma3, 3.9B parameters, Q4_K_M, trained context 131072"}, "error": null}, {"index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104, "offset": 851251104, "durable_offset": 851251104, "complete": true, "dropped": false, "role": "projector", "sha256": null, "sha256_expected": null, "head_crc32": "9e8f7a6b", "final_name": null, "header": {"state": "ok", "arch": "clip", "type": "mmproj", "message": "projector: vision"}, "error": null}], "settings": {"device": "CUDA1", "ctx-size": "16384"}, "settings_mode": "replace", "plan": null, "facts": null, "result": null, "warnings": [], "idle_ms": 0, "last_client_idle_ms": 1500, "recovered": false, "recovered_without_record": false, "record_persisted": true, "chunk_max": 16777216, "chunk_default": 8388608, "progress": {"done_bytes": 1610612736, "total_bytes": 3341008960}, "checks": [{"step": "header", "file": 0, "status": "ok", "message": "gemma3, 3.9B parameters, Q4_K_M, trained context 131072"}, {"step": "header", "file": 1, "status": "ok", "message": "projector: vision"}]} }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`id` is not 32 hexadecimal characters (`invalid_request_error`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "410": { "$ref": "#/components/responses/AdminUploadGone" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      },
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Create the upload of one model, or check it (dry run) (exempt)",
+        "description": "One upload is one model: a single GGUF file, or a complete split set, plus at most one projector (`mmproj`). Draft models are not supported (400 `unsupported_file`).\n\n- `name` becomes the model id: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; refused without regard to case: containing `mmproj` or `.gguf`, starting with `mtp-` / `dspark-` / `dflash-` / `eagle3-`, containing `-NNNNN-of-NNNNN`, ending in `.`, Windows reserved names (400 `invalid_name` with `reason`). It must be unique, without regard to case, among the ids and aliases of the model list, the entries of the models directory as the scanner names them, and the other unfinished uploads (409 `name_taken` with `by`); checked again at update and right before publishing.\n- `files`: 1 to 256, each at least 24 bytes; `name` is only shown and used for matching after a reload, never as a path; an optional `sha256` (64 hex characters) is compared after the last byte (a mismatch makes the upload wait as `ready` / `sha256_mismatch`).\n- `settings`: per-model settings (as `POST /admin/models/settings`, including the lock rules: 409 `field_locked`), saved as the model's per-model settings right before its files become visible, so its first start uses them. `settings_mode` `replace` (default) drops saved settings of an earlier model with this id, `keep` uses them again (`existing_settings` shows them).\n- `auto_publish` (default true): publish as soon as the checks pass.\n- `dry_run`: check only, nothing is created (200, `upload.id` null).\n\n`warnings` never block (disk space is warn-only): `not_enough_space`, `larger_than_disk`, `shares_disk_with_state`, `record_not_persisted`. The files are then sent with `POST /admin/models/upload/chunk`. **Exempt** from the trial budget.",
+        "x-s3-recheck": "the create answer (upload = the full upload view; existing_settings only when present; the shape of locks) and the by values of name_taken",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminUploadCreateRequest" },
+              "examples": {
+                "single": { "summary": "One file with a placement", "value": { "name": "qwen3-8b", "files": [{ "name": "Qwen3-8B-Q4_K_M.gguf", "size": 5027783488, "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785" }], "settings": { "device": "CUDA1", "ctx-size": 16384 } } },
+                "multimodal": { "summary": "A model with its projector, dry run", "value": { "name": "gemma-3-4b", "files": [{ "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856, "last_modified": 1759744800000 }, { "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104 }], "dry_run": true } },
+                "split": { "summary": "A split set, published by hand", "value": { "name": "big-model", "files": [{ "name": "Big-Model-Q4_K_M-00001-of-00002.gguf", "size": 39728447488 }, { "name": "Big-Model-Q4_K_M-00002-of-00002.gguf", "size": 2873393152 }], "auto_publish": false } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dry run: what would be created; `upload.id` is null",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminUploadCreated" },
+                "example": {"upload": {"id": null, "name": "gemma-3-4b", "chunk_max": 16777216, "chunk_default": 8388608, "files": [{"index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856}, {"index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104}], "settings": {}}, "disk": {"free_bytes": 120000000000, "total_bytes": 480000000000, "needed_bytes": 3341008960, "other_uploads_bytes": 0, "shares_disk_with": []}, "warnings": [], "locks": {}}
+              }
+            }
+          },
+          "201": {
+            "description": "Created: send the files with `POST /admin/models/upload/chunk`",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminUploadCreated" },
+                "example": {"upload": {"id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "substate": null, "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 0, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T10:00:00Z", "error": null, "blocked": null, "expires_at": "2026-10-09T10:00:00Z", "files": [{"index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856, "offset": 0, "durable_offset": 0, "complete": false, "dropped": false, "role": null, "sha256": null, "sha256_expected": null, "head_crc32": null, "final_name": null, "header": {"state": "none"}, "error": null}, {"index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104, "offset": 0, "durable_offset": 0, "complete": false, "dropped": false, "role": null, "sha256": null, "sha256_expected": null, "head_crc32": null, "final_name": null, "header": {"state": "none"}, "error": null}], "settings": {"device": "CUDA1", "ctx-size": "16384"}, "settings_mode": "replace", "plan": null, "facts": null, "result": null, "warnings": [], "idle_ms": 0, "last_client_idle_ms": null, "recovered": false, "recovered_without_record": false, "record_persisted": true, "chunk_max": 16777216, "chunk_default": 8388608, "progress": null, "checks": []}, "disk": {"free_bytes": 120000000000, "total_bytes": 480000000000, "needed_bytes": 3341008960, "other_uploads_bytes": 0, "shares_disk_with": ["admin_state"]}, "warnings": ["shares_disk_with_state"], "locks": {}}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request_error` (`param`): a field missing or out of its rules (number or size of the files, the format of `sha256`, a setting). `invalid_name` (`reason`: `empty`, `too_long`, `charset`, `mmproj`, `gguf`, `draft_prefix`, `shard_suffix`, `trailing_dot`, `reserved`). `unsupported_file`: a draft model",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 400, "message": "the name must not contain \"mmproj\"", "type": "invalid_name", "reason": "mmproj" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`upload_unavailable` (`reason`, see `GET`); `name_taken` (`by`); `field_locked` (`param`); `too_many_uploads` (4 unfinished uploads; `sessions` lists them)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 409, "message": "the name 'qwen2.5-chat' is taken by a model", "type": "name_taken", "by": "model" } }
+              }
+            }
+          },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/upload/chunk": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Append one chunk of a file of an upload (exempt)",
+        "description": "The body is the raw bytes `offset .. offset + length - 1` of file `file` (at most `chunk_max`, 16 MiB; `Content-Type: application/octet-stream`; a `Content-Length` is required, no chunked transfer encoding). The server handles a chunk only once it has the whole body, so its offset moves by whole chunks only and sending a chunk again is always safe:\n\n- `offset` equal to the server's offset: appended.\n- `offset` before it: the part the server already has is compared byte for byte with what it stored (409 `content_mismatch` when it differs: not the same file); the rest is appended. Sending the first MiB and up to 1 MiB before the offset after a reload proves that a file picked again is the same.\n- `offset` after it: 409 `offset_mismatch` with the server's `offset`.\n\n`X-Upload-Client` names the sender (a random id per browser tab, kept for the tab session); a chunk from another sender within 30 s of the last one is 409 `other_client_active` unless `takeover=1`. `X-Chunk-CRC32` (optional) is checked before the bytes are stored (400 `crc_mismatch`). The first chunk of a file shows whether it is GGUF (422 `not_gguf`) and starts the header check; a file it finds unusable gets 422 `file_rejected` (only that file: drop it with `update` or cancel), a model it cannot accept rejects the upload within seconds (unsupported architecture, projector as the model, inconsistent split set).\n\nAnswered before the body is read: no or a wrong key, an address the allow-list refuses, no `Content-Length` (411), a `Content-Length` above `chunk_max` (413 `chunk_too_large`, JSON; a 413 without this JSON comes from a proxy: send smaller chunks), an upload that is busy or over, another sender, a chunk of this upload already on its way (409 `chunk_in_progress`), too many chunks at once (429 `upload_slots_busy`). Every answer of 400 or above closes the connection; a client that is still sending may see a reset connection and then asks `GET /admin/models/upload?id=` where to continue. Also expect upstream's 503 while the server starts and 401 from `--api-key`. **Exempt** from the trial budget.",
+        "x-s3-recheck": "the early-refusal set of the pre-body hook (spec B.5c) and the 422 file_rejected path",
+        "security": [{ "AdminKey": [] }],
+        "parameters": [
+          { "name": "id", "in": "query", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" }, "description": "The upload" },
+          { "name": "file", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 255 }, "description": "`index` of the file in the upload" },
+          { "name": "offset", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64", "minimum": 0 }, "description": "Byte offset of the first byte of the body in the file" },
+          { "name": "takeover", "in": "query", "required": false, "schema": { "type": "string", "enum": ["1"] }, "description": "`1` = make this sender the one that writes, although another one wrote within the last 30 s" },
+          { "name": "X-Upload-Client", "in": "header", "required": true, "schema": { "type": "string", "maxLength": 128 }, "description": "Random id of the sending browser tab or script" },
+          { "name": "X-Chunk-CRC32", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-fA-F]{8}$" }, "description": "CRC-32 (IEEE, as in zip and gzip) of the body, 8 hexadecimal digits" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": { "type": "string", "format": "binary", "maxLength": 16777216 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored (or compared, when the whole chunk was already there)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminUploadChunkResult" },
+                "example": { "offset": 16777216, "durable_offset": 0, "file_complete": false, "state": "receiving", "file": 0, "received_bytes": 16777216, "total_bytes": 3341008960, "file_error": null }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request_error` (`param`: `id`, `file`, `offset`, `X-Chunk-CRC32`), `beyond_declared_size` (the chunk reaches beyond the declared size of the file), `crc_mismatch` (`X-Chunk-CRC32` does not match the body)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`offset_mismatch` (`offset`: where the server is), `content_mismatch` (the bytes sent again differ: not the same file), `chunk_in_progress` (another chunk of this upload is on its way), `other_client_active` (`idle_ms`; another sender wrote within 30 s: send `takeover=1`), `upload_busy` (`state`: the upload is being checked or published, or waits as ready), `file_dropped` (the file was dropped from the upload)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 409, "message": "this file has 8388608 bytes so far: continue at that offset", "type": "offset_mismatch", "offset": 8388608 } }
+              }
+            }
+          },
+          "410": { "$ref": "#/components/responses/AdminUploadGone" },
+          "411": {
+            "description": "`length_required`: the chunk has no `Content-Length` (chunked transfer encoding is not accepted)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "413": {
+            "description": "`chunk_too_large` (`chunk_max`): the body is larger than `chunk_max`. Only this JSON answer comes from the server; a 413 without it comes from a proxy in front of it",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 413, "message": "a chunk may hold at most 16777216 bytes", "type": "chunk_too_large", "chunk_max": 16777216 } }
+              }
+            }
+          },
+          "415": {
+            "description": "`unsupported_media_type`: the body is not `application/octet-stream`",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "422": {
+            "description": "`not_gguf` (`file`): the file does not start with `GGUF` and version 2 or 3; `file_rejected` (`file`, `code`): the check found the file unusable. Only that file is affected; the rest of the upload stays",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "429": {
+            "description": "`upload_slots_busy` (`retry_after_s`): 4 chunks are being received already",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "500": {
+            "description": "`write_failed`: an error while writing other than a full disk; the chunk is discarded, the upload is kept",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" },
+          "507": {
+            "description": "`disk_full` (`free_bytes`, `offset`, `durable_offset`): the disk is full or a quota is reached; the chunk is discarded, the upload is kept. Free space, then continue from `offset`",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 507, "message": "the disk is full: free space, then resume the upload (or cancel it to free its space)", "type": "disk_full", "free_bytes": 0, "offset": 25165824, "durable_offset": 25165824 } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/models/upload/update": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Change an upload: name, settings, expected SHA-256, drop files (exempt)",
+        "description": "Only while the upload is `receiving` or `ready`. A new `name` is checked as at create (409 `name_taken`); nothing is uploaded again, which is how an upload waiting as `ready` / `name_taken` is renamed. `settings` replaces the settings of the upload; `settings_mode` and `auto_publish` as at create. `files` sets (or with an empty string removes) the expected SHA-256 of files by `index`; `drop_files` takes files out of the upload (for example one that is not GGUF) and deletes their data at once; when the files that are left are all complete the checks start. 409 `upload_busy` while it is being checked or published, 410 once it is over. **Exempt** from the trial budget.",
+        "x-s3-recheck": "files[] / drop_files and the answer shape",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminUploadUpdateRequest" },
+              "examples": {
+                "rename": { "summary": "Rename (name taken meanwhile)", "value": { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b-vision" } },
+                "sha": { "summary": "Correct the expected SHA-256 of file 0", "value": { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "files": [{ "index": 0, "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785" }] } },
+                "drop": { "summary": "Drop a wrongly picked file", "value": { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "drop_files": [1] } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The upload after the change",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminUploadAnswer" } } }
+          },
+          "400": {
+            "description": "`invalid_request_error` (`param`: e.g. `files`, `drop_files`), `invalid_name` (`reason`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`name_taken` (`by`), `field_locked` (`param`), `upload_busy` (`state`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "410": { "$ref": "#/components/responses/AdminUploadGone" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/upload/publish": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Publish an upload that waits as ready, or run its checks again (exempt)",
+        "description": "For an upload in `ready`: `manual` (auto_publish off), after a rename (`name_taken`), after a `publish_error`. For `check_failed` and `sha256_mismatch` the checks run again; `ignore_sha256_mismatch: true` accepts a SHA-256 that differs from the expected one (publish anyway). `without_settings: true` publishes without the upload's settings (`settings_not_saved`; the model then starts with its inherited values). Publishing: the name is checked again, the settings are saved as the model's per-model settings, the files become visible with one rename that never replaces anything, and the model list is rebuilt; the model then appears not loaded. Answers 202 at once (`publishing` or `checking`): follow it with `GET /admin/models/upload?id=`. An upload that is already published answers 200; one that is publishing or checking answers with its state. **Exempt** from the trial budget.",
+        "x-s3-recheck": "ignore_sha256_mismatch / without_settings and the answer shape",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminUploadPublishRequest" },
+              "examples": {
+                "publish": { "summary": "Publish", "value": { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a" } },
+                "anyway": { "summary": "Publish anyway with a differing SHA-256", "value": { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "ignore_sha256_mismatch": true } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Already published",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminUploadAnswer" } } }
+          },
+          "202": {
+            "description": "Publishing (or the checks) started; poll `GET /admin/models/upload?id=`",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminUploadAnswer" } } }
+          },
+          "400": {
+            "description": "`invalid_request_error` (`param`: `id`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`upload_busy` (`state`: still receiving)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "410": { "$ref": "#/components/responses/AdminUploadGone" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/upload/cancel": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Cancel an upload and delete its data (exempt)",
+        "description": "Ends an upload that is not published yet and deletes its data at once (`freed_bytes`). An upload that is already over answers 200 with `cancelled` false or true and `freed_bytes` 0. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminUploadIdRequest" },
+              "example": { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Cancelled",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminUploadAnswer" } } }
+          },
+          "400": {
+            "description": "`invalid_request_error` (`param`: `id`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`upload_busy` (`state`: being published)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "410": { "$ref": "#/components/responses/AdminUploadGone" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
+        }
+      }
+    },
+    "/admin/models/delete": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Delete a model of the models directory, or only its projector (exempt)",
+        "description": "For models with source `models_dir` (uploaded or dropped in by hand); downloaded models keep `DELETE /models`, sections of `models.ini` are changed in `models.ini` (409 `not_deletable`). Only the files the model uses are deleted: its GGUF file or every shard of a split model, its projector and its draft model. Other entries of its folder stay (`kept`); the folder is removed only when it is empty afterwards. `projector_only` (Remove projector) deletes only the projector file; the model stays.\n\n- `dry_run`: only report (`files`, `n_files`, `total_bytes`; `kept`, at most 100 listed; `running`, `pinned`, `has_settings`, `warnings`).\n- A running model is refused (409 `model_running`) unless `stop`; then it is stopped first with a deadline of its stop timeout + 10 s (504 `stop_timeout`, nothing deleted).\n- `remove_settings` (default true) also removes the model's saved per-model settings, its pin and what the server cached about it.\n\nThe files are moved into a trash folder inside the models directory first (out of the model list at once), the model list is rebuilt, and the trash is deleted in the background (`trash_left`). An unknown id is 409 `not_deletable` with `reason` `not_found` (never 404). **Exempt** from the trial budget.",
+        "x-s3-recheck": "aligned with up_handle_delete in server-admin-upload.cpp while it was being written: re-check every field and reason",
+        "security": [{ "AdminKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdminModelDeleteRequest" },
+              "examples": {
+                "dry": { "summary": "What would be deleted", "value": { "model": "gemma-3-4b", "dry_run": true } },
+                "delete": { "summary": "Delete, stopping the model if it runs", "value": { "model": "gemma-3-4b", "stop": true } },
+                "projector": { "summary": "Remove only the projector", "value": { "model": "gemma-3-4b", "projector_only": true, "stop": true } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The dry run, or what was deleted",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminModelDeleteResult" },
+                "examples": {
+                  "dry": { "summary": "Dry run", "value": {"model": "gemma-3-4b", "source": "models_dir", "projector_only": false, "files": [{"path": "gemma-3-4b/gemma-3-4b.gguf", "bytes": 2489757856, "role": "model"}, {"path": "gemma-3-4b/mmproj-gemma-3-4b.gguf", "bytes": 851251104, "role": "projector"}], "n_files": 2, "total_bytes": 3341008960, "kept": [{"path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file"}], "n_kept": 1, "kept_bytes": 5120, "folder": "gemma-3-4b", "folder_removed": false, "running": false, "status": "unloaded", "pinned": false, "has_settings": true, "warnings": []} },
+                  "deleted": { "summary": "Deleted", "value": {"model": "gemma-3-4b", "deleted": true, "freed_bytes": 3341008960, "files": [{"path": "gemma-3-4b/gemma-3-4b.gguf", "bytes": 2489757856, "role": "model"}, {"path": "gemma-3-4b/mmproj-gemma-3-4b.gguf", "bytes": 851251104, "role": "projector"}], "kept": [{"path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file"}], "folder_removed": false, "settings_removed": true, "pin_removed": false, "trash_left": true, "reload_error": null} }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request_error` (`param`)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "409": {
+            "description": "`model_running` (send `stop: true`), `not_deletable` (`reason`: `not_found`, `cache`, `preset`, `no_projector`, `outside_models_dir`, `symlink`, `missing`, `other_filesystem`, `no_models_dir`, `no_file`)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 409, "message": "model 'gemma-3-4b' is running: send \"stop\": true to stop it first", "type": "model_running" } }
+              }
+            }
+          },
+          "500": {
+            "description": "`server_error`: the trash folder could not be created or the model's folder could not be opened",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" },
+          "504": {
+            "description": "`stop_timeout`: the running model did not stop within its stop timeout + 10 s; nothing was deleted",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "AdminKey": { "type": "apiKey", "in": "header", "name": "X-Admin-Key", "description": "Admin key: `PROVISION_ADMIN_KEY`, the first line of `PROVISION_ADMIN_KEY_FILE`, or the key the server generated into `<admin state dir>/admin.key`" }
+    },
+    "responses": {
+      "TrialLimitReached": {
+        "description": "Refused by the license gate (licensed builds only): the trial budget or the licence's request limit is used up, a batch does not fit into what is left, or there is no valid / an expired license. Nothing is charged for a refused request.",
+        "headers": {
+          "X-License-Mode": { "schema": { "type": "string", "enum": ["trial", "online", "offline", "none"] }, "description": "Current license mode" },
+          "X-License-Used": { "schema": { "type": "integer" }, "description": "Requests already consumed" },
+          "X-License-Limit": { "schema": { "type": "integer" }, "description": "Request limit (0 = no license loaded)" },
+          "X-Trial-Limit": { "schema": { "type": "integer" }, "description": "Trial mode only: same as X-License-Limit" },
+          "X-Trial-Used": { "schema": { "type": "integer" }, "description": "Trial mode only: same as X-License-Used" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": {
+              "error": {
+                "code": 403,
+                "message": "Trial limit reached: this evaluation build allows 50 inference requests and all of them are used. Activate a license to continue (Settings -> License in the web UI, or POST /license/activate).",
+                "type": "permission_error",
+                "license": { "mode": "trial", "reason": "request_limit_reached", "used": 50, "limit": 50 }
+              }
+            }
+          }
+        }
+      },
+      "AdminKeyRequired": {
+        "description": "The `X-Admin-Key` header is missing or wrong",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": { "code": 401, "message": "a valid X-Admin-Key header is required", "type": "admin_key_required" } }
+          }
+        }
+      },
+      "AdminKeyUnavailable": {
+        "description": "The server has no admin key: none is configured and the admin state directory is not writable, so none could be generated",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": { "code": 503, "message": "no admin key is available: set PROVISION_ADMIN_KEY or make the admin state directory writable", "type": "admin_key_unavailable" } }
+          }
+        }
+      },
+      "AdminAddressNotAllowed": {
+        "description": "`admin_forbidden`: the client address is not on the `/admin` allow-list. Answered by the nginx front door (Docker: `ADMIN_ALLOW_RULES`; host: the `geo` allow-list of `deploy/linux/nginx-provision-llm.conf`), where the request never reaches the server, or by the server's own allow-list (`PROVISION_ADMIN_ALLOW_FROM`, off by default; `X-Forwarded-For` is used only from the reverse proxies in `PROVISION_ADMIN_TRUSTED_PROXIES`), whose message names the address the server saw. The server's allow-list applies to every `/admin` route, the status probe included, before the key check; while one of its entries cannot be read, every `/admin` request is refused (fail closed)",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "examples": {
+              "nginx": { "summary": "nginx allow-list", "value": { "error": { "code": 403, "message": "The admin API is not available from this address", "type": "admin_forbidden" } } },
+              "server": { "summary": "Server allow-list (PROVISION_ADMIN_ALLOW_FROM)", "value": { "error": { "code": 403, "message": "The admin API is not available from this address; the server sees the request coming from 10.64.1.7", "type": "admin_forbidden" } } },
+              "locked": { "summary": "Server allow-list with an invalid entry", "value": { "error": { "code": 403, "message": "The admin API is locked: the address allow-list of the server has an invalid entry (see the server log); the request comes from 10.64.0.7", "type": "admin_forbidden" } } }
+            }
+          }
+        }
+      },
+      "AdminDisabled": {
+        "description": "The admin layer is not enabled (`PROVISION_ADMIN` unset) or the server is not running in router mode"
+      },
+      "AdminUploadGone": {
+        "description": "`upload_gone` (`state`): the upload is unknown, expired, cancelled, rejected or published (its data is gone or published)",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": { "code": 410, "message": "this upload is expired", "type": "upload_gone", "state": "expired" } }
+          }
+        }
+      },
+      "AdminModelNotFound": {
+        "description": "No model with this id and no saved settings for it (`not_found_error`). The server replaces the body of every 404 with its generic `File Not Found` answer. Also answered when the admin layer is not enabled or the server is not running in router mode",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": { "code": 404, "message": "File Not Found", "type": "not_found_error" } }
+          }
+        }
+      }
+    },
     "schemas": {
+      "LicenseStatus": {
+        "type": "object",
+        "required": ["mode", "status", "used", "limit"],
+        "properties": {
+          "mode": { "type": "string", "enum": ["trial", "online", "offline", "none"], "description": "`none` = no usable license: counted endpoints answer 403 until activation" },
+          "status": { "type": "string", "enum": ["valid", "expired", "none"], "description": "`valid` = counted endpoints are served right now" },
+          "used": { "type": "integer", "description": "Requests consumed (trial: per install, never resets; licence with a limit: in the current 30-day window)" },
+          "limit": { "type": "integer", "description": "Request limit; -1 = unlimited licence, 0 = no license loaded" },
+          "reason": { "type": "string", "description": "Why requests are refused (e.g. `request_limit_reached`, `no_license`, `expired`); empty when valid" },
+          "product": { "type": "string", "example": "LLM", "description": "From the loaded .lic" },
+          "tariff": { "type": "string", "example": "TEST", "description": "From the loaded .lic" },
+          "expiresAt": { "type": "string", "format": "date-time", "description": "Licence expiry (loaded .lic only)" },
+          "windowResetsAt": { "type": "string", "format": "date-time", "description": "When the 30-day request window resets (licence with a request limit only)" }
+        }
+      },
+      "LicenseActivateRequest": {
+        "type": "object",
+        "required": ["activationCode"],
+        "properties": {
+          "activationCode": { "type": "string", "maxLength": 256, "example": "XXXX-XXXX-XXXX", "description": "Code issued by the License Server" }
+        }
+      },
+      "LicenseActivateResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/LicenseStatus" },
+          {
+            "type": "object",
+            "required": ["activated", "detail"],
+            "properties": {
+              "activated": { "type": "boolean" },
+              "detail": { "type": "string", "description": "Outcome in words (reason on failure)" },
+              "message": { "type": "string", "description": "Failure only: same as detail" }
+            }
+          }
+        ]
+      },
+      "AdminStatus": {
+        "type": "object",
+        "required": ["admin", "authorized", "key_configured"],
+        "description": "Without a valid key only the three required fields are present",
+        "properties": {
+          "admin": { "type": "boolean", "description": "Always true: the admin layer is enabled" },
+          "authorized": { "type": "boolean", "description": "The request carried a valid `X-Admin-Key`" },
+          "key_configured": { "type": "boolean", "description": "false = the server has no admin key (protected endpoints answer 503)" },
+          "version": { "type": "integer", "example": 1, "description": "Version of the admin state format" },
+          "key_source": { "type": "string", "enum": ["env", "file", "generated"], "description": "Where the key comes from: `PROVISION_ADMIN_KEY`, `PROVISION_ADMIN_KEY_FILE`, or `<state dir>/admin.key`" },
+          "features": { "type": "array", "items": { "type": "string" }, "example": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete"], "description": "Optional parts this server has: `model_settings` (`/admin/models/settings`), `gpus` (`/admin/gpus`), `model_log` (`/admin/models/log`), `diagnostics` (`/admin/diagnostics`), `fit_check` (`/admin/models/settings/check`), `upload` (`/admin/models/upload*`), `delete` (`/admin/models/delete`). Clients show those parts only when listed; an older server has no `features`" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`default_device_not_present`: GPU for new models names a GPU this server does not have (it is not applied)" },
+          "models": {
+            "type": "object",
+            "properties": {
+              "max": { "type": "integer", "description": "Effective limit of simultaneously loaded models" },
+              "running": { "type": "integer", "description": "Models that hold a slot right now" },
+              "total": { "type": "integer", "description": "Models known to the router" }
+            }
+          },
+          "state": {
+            "type": "object",
+            "properties": {
+              "dir": { "type": "string", "example": "/var/lib/provision-llm-admin" },
+              "writable": { "type": "boolean" },
+              "error": { "type": "string", "description": "Why the saved settings could not be read at startup (the startup defaults are used until settings are saved again); empty when fine" },
+              "model_settings": { "$ref": "#/components/schemas/AdminModelSettingsState" }
+            }
+          },
+          "download": {
+            "type": "object",
+            "properties": {
+              "available": { "type": "boolean", "description": "The binary can make HTTPS downloads and the router is not in `--offline` mode" },
+              "offline": { "type": "boolean", "description": "The router itself runs with `--offline`" }
+            }
+          },
+          "upload": { "$ref": "#/components/schemas/AdminUploadAvailability" },
+          "dirs": {
+            "type": "object",
+            "properties": {
+              "cache": { "type": "string", "example": "/models-rw/hf", "description": "Model cache: where `POST /models` downloads to" },
+              "models_dir": { "type": "string", "example": "/models-rw/local", "description": "`--models-dir` (empty when not set)" },
+              "preset": { "type": "string", "example": "/config/models.ini", "description": "`--models-preset` file the router reads" }
+            }
+          },
+          "license_build": { "type": "boolean", "description": "Build with the license subsystem (image `:release`)" },
+          "ip_allowlist": { "type": "boolean", "description": "The server's own `/admin` address allow-list (`PROVISION_ADMIN_ALLOW_FROM`) is on; the details are in `GET /admin/diagnostics`, item `ip_allowlist`" }
+        }
+      },
+      "AdminModelRef": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "example": "qwen2.5-chat" },
+          "source": { "type": "string", "enum": ["preset", "cache", "models_dir"], "description": "`preset` = section of models.ini, `cache` = downloaded, `models_dir` = file dropped into the models directory" },
+          "status": { "type": "string", "enum": ["unloaded", "loading", "loaded", "sleeping", "downloading", "downloaded"] },
+          "pinned": { "type": "boolean" }
+        }
+      },
+      "AdminSettings": {
+        "type": "object",
+        "required": ["models_max", "default_device", "default_device_locked", "pinned", "limits", "known_devices", "models"],
+        "properties": {
+          "models_max": { "type": "integer", "example": 3, "description": "Max simultaneously loaded models (saved value, else `--models-max`)" },
+          "default_device": { "type": "string", "example": "CUDA0", "description": "GPU for models without a `device` of their own; empty = not set. While locked this is the `*=` value of `MODEL_DEVICES`" },
+          "default_device_locked": { "type": "boolean", "description": "true = `MODEL_DEVICES` has a `*=` entry, the setting cannot be changed here" },
+          "pinned": { "type": "array", "items": { "type": "string" }, "example": ["qwen2.5-chat", "gte-qwen2-embed"], "description": "Pinned models in effect that are in the model list: never unloaded to make room for another one. At most `models_max - 1` pins take effect; a start-up list (`PROVISION_ADMIN_PINNED`) is cut by position" },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "models_max_min": { "type": "integer", "example": 1 },
+              "models_max_max": { "type": "integer", "example": 16 }
+            }
+          },
+          "known_devices": { "type": "array", "items": { "type": "string" }, "example": ["CUDA0", "CUDA1"], "description": "Hint list: devices mentioned by the model presets plus the current `default_device` (the router itself never touches a GPU)" },
+          "models": { "type": "array", "items": { "$ref": "#/components/schemas/AdminModelRef" } },
+          "pinned_ignored": { "type": "array", "items": { "type": "string" }, "description": "Configured pins that are not in effect because one slot must stay evictable" },
+          "pinned_unknown": { "type": "array", "items": { "type": "string" }, "description": "Configured pins that are not in the model list (yet); one among the first `models_max - 1` is protected as soon as it appears" },
+          "build_devices": { "type": "array", "items": { "type": "string" }, "example": ["CUDA0", "CUDA1"], "description": "GPUs of this server's backends (empty for a CPU-only build); the device choices are made from this list" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`default_device_not_present`: `default_device` names a GPU this server does not have, it is not applied" }
+        }
+      },
+      "AdminSettingsUpdate": {
+        "type": "object",
+        "description": "Any subset of the settings",
+        "properties": {
+          "models_max": { "type": "integer", "minimum": 1, "maximum": 16, "example": 3 },
+          "default_device": { "type": "string", "example": "CUDA0", "description": "Empty string = clear, `none` = CPU only, or device names separated by `,` or `;` (each like `CUDA0`)" },
+          "pinned": { "type": "array", "items": { "type": "string" }, "example": ["qwen2.5-chat"], "description": "Ids from the model list; duplicates are removed; must be shorter than `models_max`. A request without `pinned` is checked against the pins in effect" }
+        }
+      },
+      "AdminStorage": {
+        "type": "object",
+        "properties": {
+          "dirs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": { "type": "string", "enum": ["cache", "models_dir", "state"] },
+                "path": { "type": "string" },
+                "exists": { "type": "boolean" },
+                "writable": { "type": "boolean" },
+                "total_bytes": { "type": "integer", "format": "int64", "description": "Size of the filesystem the directory is on" },
+                "free_bytes": { "type": "integer", "format": "int64", "description": "Free space of that filesystem" }
+              }
+            }
+          },
+          "partial_downloads": {
+            "type": "array",
+            "description": "Unfinished download files (`*.downloadInProgress`) left in the model cache",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string" },
+                "bytes": { "type": "integer", "format": "int64" }
+              }
+            }
+          },
+          "uploads": {
+            "type": "array",
+            "description": "Unfinished GGUF uploads (`/admin/models/upload`), each as in the list of `GET /admin/models/upload` plus `bytes`, what it takes on disk now; absent on servers without the `upload` feature",
+            "items": {
+              "allOf": [
+                { "$ref": "#/components/schemas/AdminUploadSummary" },
+                { "type": "object", "properties": { "bytes": { "type": "integer", "format": "int64" } } }
+              ]
+            }
+          },
+          "upload_staging": {
+            "type": "object",
+            "description": "The folder of the unfinished uploads (`.provision-upload` in the models directory)",
+            "properties": {
+              "path": { "type": "string", "nullable": true },
+              "bytes": { "type": "integer", "format": "int64", "description": "What the unfinished uploads take together" },
+              "trash_bytes": { "type": "integer", "format": "int64", "description": "Files of deleted models that still wait in the trash" }
+            }
+          }
+        }
+      },
+      "AdminDownloadCheckRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+          "model": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*(:[A-Za-z0-9._-]+)?$", "example": "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", "description": "Hugging Face repository with an optional quantization tag: `user/repo[:quant]`" }
+        }
+      },
+      "AdminDownloadCheck": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "The model as requested" },
+          "repo": { "type": "string" },
+          "quant": { "type": "string", "description": "Quantization tag from the request; empty when none was given" },
+          "hf_reachable": { "type": "boolean", "description": "The Hugging Face endpoint answered" },
+          "exists": { "type": "boolean", "description": "The repository exists and is readable with the server's token" },
+          "already_present": { "type": "boolean", "description": "The model is already in the model list / cache" },
+          "files": {
+            "type": "array",
+            "description": "Files the download would fetch (only `preset.ini` for a preset repository)",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "bytes": { "type": "integer", "format": "int64" }
+              }
+            }
+          },
+          "total_bytes": { "type": "integer", "format": "int64" },
+          "free_bytes": { "type": "integer", "format": "int64", "description": "Free space of the filesystem that holds the model cache" },
+          "enough_space": { "type": "boolean", "description": "`total_bytes <= free_bytes` (no reserve is kept; a warning only)" },
+          "warnings": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["hf_unreachable", "repo_not_found", "no_gguf_for_quant", "quant_not_specified", "not_enough_space", "already_present", "offline_mode", "size_unknown", "preset_repository"] },
+            "description": "`repo_not_found` also covers gated / private repositories the server has no access to. `preset_repository`: the repository holds a preset (`preset.ini`), only that file is downloaded and no model appears in the list; `no_gguf_for_quant` and `quant_not_specified` are then not reported"
+          }
+        }
+      },
+      "AdminModelSettingsInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Per-model settings (keys are the `models.ini` names). A value sets a custom setting, `null` removes it; keys that are not given stay as they are. Numbers and booleans may also be sent as strings. The same object is the `settings` of an export file (`provision-llm-model-settings`)",
+        "properties": {
+          "device": { "type": "string", "nullable": true, "example": "CUDA0", "description": "`none` (CPU only) or 1-4 GPU names of this server (`build_devices`) joined by `,`; compared without regard to case" },
+          "ctx-size": { "anyOf": [{ "type": "integer", "minimum": 256, "maximum": 1048576, "nullable": true }, { "type": "string", "nullable": true }], "description": "KV cache pool of the model in tokens, shared by its slots" },
+          "kv-unified-per-slot": { "anyOf": [{ "type": "integer", "minimum": 256, "maximum": 1048576, "nullable": true }, { "type": "string", "nullable": true }], "description": "Upper limit of one request in tokens (\"per request x slots\" mode: `ctx-size` = slots x this)" },
+          "parallel": { "anyOf": [{ "type": "integer", "minimum": -1, "maximum": 16, "nullable": true }, { "type": "string", "nullable": true }], "description": "Parallel requests (slots): 1-16, or -1 = auto (4, the built-in default). 0 is refused. An explicit value also makes the KV cache one shared pool unless models.ini sets kv-unified" },
+          "n-gpu-layers": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 999, "nullable": true }, { "type": "string", "nullable": true }], "description": "`auto` (built-in default), `all` or 0-999" },
+          "flash-attn": { "type": "string", "enum": ["on", "off", "auto", null], "nullable": true, "description": "Built-in default `auto`" },
+          "cache-type-k": { "type": "string", "enum": ["f16", "bf16", "q8_0", "q4_0", null], "nullable": true, "description": "Must equal `cache-type-v`; a quantized type needs `flash-attn` other than `off`. Built-in default `f16`" },
+          "cache-type-v": { "type": "string", "enum": ["f16", "bf16", "q8_0", "q4_0", null], "nullable": true, "description": "Must equal `cache-type-k`" },
+          "ubatch-size": { "anyOf": [{ "type": "integer", "minimum": 32, "maximum": 8192, "nullable": true }, { "type": "string", "nullable": true }], "description": "Micro-batch (built-in default 512); for embedding / reranking models with mean, cls or rank pooling also the longest accepted input" },
+          "embeddings": { "anyOf": [{ "type": "boolean", "nullable": true }, { "type": "string", "enum": ["true", "false", null], "nullable": true }] },
+          "pooling": { "type": "string", "enum": ["none", "mean", "cls", "last", "rank", null], "nullable": true },
+          "reranking": { "anyOf": [{ "type": "boolean", "nullable": true }, { "type": "string", "enum": ["true", "false", null], "nullable": true }] }
+        }
+      },
+      "AdminModelField": {
+        "type": "object",
+        "description": "One whitelisted key of one model",
+        "properties": {
+          "effective": { "type": "string", "nullable": true, "description": "Value the model process gets (canonical spelling); null = not set anywhere, the built-in `default` applies" },
+          "default": { "type": "string", "nullable": true, "description": "Built-in default, when the server knows one" },
+          "origin": { "type": "string", "enum": ["admin", "models_ini", "default_device", "model_devices", "router_cli", "default"], "description": "Where the effective value comes from" },
+          "inherited": { "type": "string", "nullable": true, "description": "Value without the custom setting (models.ini section or `[*]`, or GPU for new models)" },
+          "inherited_origin": { "type": "string", "enum": ["models_ini", "default_device", "default"] },
+          "override": { "type": "string", "nullable": true, "description": "The custom value saved in the panel; null = none" },
+          "locked": {
+            "type": "object",
+            "nullable": true,
+            "description": "Set when the key cannot be changed here",
+            "properties": {
+              "by": { "type": "string", "enum": ["model_devices", "router_cli"] },
+              "value": { "type": "string" }
+            }
+          },
+          "active": { "type": "boolean", "description": "A custom value is saved and applied (false: none saved, or a lock / a missing device overrides it, see `inactive_reason`)" },
+          "inactive_reason": { "type": "string", "nullable": true, "description": "Why a saved custom value is not applied, e.g. `router_cli`, `model_devices`, `device_missing`" }
+        }
+      },
+      "AdminFailureReason": {
+        "type": "object",
+        "nullable": true,
+        "description": "Why a model process failed (null when there is nothing to report)",
+        "properties": {
+          "code": { "type": "string", "enum": ["out_of_memory", "invalid_device", "invalid_settings", "model_load_failed", "unknown", "none"], "description": "Classified from the last error lines of the output (the last line naming a specific cause wins). `none`: no error line, the process was stopped or killed" },
+          "message": { "type": "string", "description": "The reason in words" },
+          "hint": { "type": "string", "description": "What to try" },
+          "line": { "type": "string", "description": "The output line the reason comes from" },
+          "hints": { "type": "array", "items": { "type": "string" }, "description": "`memory_tight`: llama.cpp's fit warned that memory is short (`failed to fit params ...`); only a hint, the load often works" }
+        }
+      },
+      "AdminFailure": {
+        "type": "object",
+        "nullable": true,
+        "description": "The last failed start of a model; replaced only by a later failure (a retry by a client request does not wipe it)",
+        "properties": {
+          "time": { "type": "string", "format": "date-time" },
+          "time_ms": { "type": "integer", "format": "int64", "description": "When the failure was recorded, in milliseconds since the epoch" },
+          "reason": { "$ref": "#/components/schemas/AdminFailureReason" },
+          "port": { "type": "integer" },
+          "exit_code": { "type": "integer" },
+          "before_loaded": { "type": "boolean", "description": "The process ended before the model was loaded" },
+          "lines": { "type": "array", "items": { "type": "string" }, "description": "Output tail of that process" },
+          "truncated": { "type": "boolean" },
+          "failures": { "type": "integer", "description": "Failed starts in a row with the same settings" },
+          "settings_reverted": { "type": "boolean", "description": "This failure made the server go back to the last good settings" }
+        }
+      },
+      "AdminModelRow": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "example": "qwen2.5-chat" },
+          "source": { "type": "string", "enum": ["preset", "cache", "models_dir"] },
+          "status": { "type": "string", "enum": ["unloaded", "loading", "loaded", "sleeping", "downloading", "downloaded"] },
+          "exists": { "type": "boolean", "description": "false for saved settings of a model that is not in the list" },
+          "hidden": { "type": "boolean", "description": "true for a model that `GET /v1/models` does not list but that is accepted when requested (such a row comes only from `?model=`; the list shows its saved settings under `unattached`, kind `hidden`)" },
+          "overrides": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Custom settings saved in the panel (canonical spelling)" },
+          "kept": { "type": "object", "description": "Values of the model's entry in `admin-models.json` that the server does not use (an unknown key or an invalid value, e.g. written by a newer version or by hand); written back unchanged" },
+          "fields": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/AdminModelField" }, "description": "Every whitelisted key with its effective value, origin and lock" },
+          "phase": { "type": "string", "nullable": true, "enum": ["pending", "trial", "failed", "committed", null], "description": "State of the saved settings: `pending` saved, not tried; `trial` a start with them is under way; `committed` the model reached loaded with them (they become `last_good`); `failed` the process ended before loaded. null = no custom settings" },
+          "failures": { "type": "integer", "description": "Failed starts in a row with the current settings; at 2 the server reverts to `last_good`" },
+          "last_good": { "type": "object", "nullable": true, "additionalProperties": { "type": "string" }, "description": "The custom settings the model last reached loaded with" },
+          "updated": { "type": "string", "format": "date-time", "nullable": true },
+          "reverted": {
+            "type": "object",
+            "nullable": true,
+            "description": "Set when the server replaced the settings with `last_good` (two failed starts in a row, or at start-up)",
+            "properties": {
+              "reason": { "type": "string", "example": "out_of_memory", "description": "The failure reason, or `startup`" },
+              "message": { "type": "string" },
+              "time": { "type": "string", "format": "date-time" },
+              "settings": { "type": "object", "additionalProperties": { "type": "string" }, "description": "The settings that failed" },
+              "failures": { "type": "integer" }
+            }
+          },
+          "reverted_at_startup": { "type": "boolean", "description": "The entry was still in `trial` / `failed` at start-up, so the model started with its last good settings" },
+          "last_failure": { "$ref": "#/components/schemas/AdminFailure" },
+          "last_run": {
+            "type": "object",
+            "properties": {
+              "status": { "type": "string" },
+              "port": { "type": "integer" },
+              "running": { "type": "boolean" },
+              "failed": { "type": "boolean" },
+              "exit_code": { "type": "integer" },
+              "reason": { "$ref": "#/components/schemas/AdminFailureReason" }
+            }
+          },
+          "device_moved": {
+            "type": "object",
+            "nullable": true,
+            "description": "The saved GPU name now belongs to a GPU with another PCI bus id than when it was saved; the value is still applied",
+            "properties": {
+              "device": { "type": "string", "example": "CUDA0" },
+              "saved_pci": { "type": "string", "example": "0000:01:00.0" },
+              "current_pci": { "type": "string", "example": "0000:02:00.0" },
+              "now_named": { "type": "string", "nullable": true, "description": "The name the saved GPU has now, if it is still there" }
+            }
+          },
+          "device_missing": {
+            "type": "object",
+            "nullable": true,
+            "description": "The saved GPU is not on this server; the value is not applied and the model uses its inherited GPU",
+            "properties": {
+              "devices": { "type": "array", "items": { "type": "string" } },
+              "message": { "type": "string" }
+            }
+          },
+          "apply_error": { "type": "string", "description": "Why saved values are not applied (e.g. a hand-edited file); empty when fine" },
+          "context": {
+            "type": "object",
+            "description": "What the context settings mean for one request, from the effective values",
+            "properties": {
+              "slots": { "type": "integer" },
+              "unified": { "type": "boolean", "description": "One KV pool shared by all slots" },
+              "pool": { "type": "integer", "nullable": true, "description": "KV pool in tokens (ctx-size rounded up to 256)" },
+              "per_slot_cap": { "type": "integer", "nullable": true, "description": "`kv-unified-per-slot`" },
+              "n_ctx_train": { "type": "integer", "nullable": true },
+              "max_per_request": { "type": "integer", "nullable": true, "description": "min(pool or pool per slot, per-slot cap, trained context)" },
+              "per_request_all_busy": { "type": "integer", "nullable": true, "description": "Tokens per request when every slot is busy (about pool / slots)" }
+            }
+          },
+          "facts_status": { "type": "string", "enum": ["ready", "pending", "error", "unsupported"], "description": "Model facts read from the GGUF file: `pending` = being read in the background" },
+          "facts": { "type": "object", "nullable": true, "description": "Facts from the model file: `arch`, `n_layer`, `n_ctx_train`, `n_embd`, head counts and sizes, `quant`, `files`, the tensor sizes the rough estimate uses, `kv_bytes_per_token` per KV cache type (`f16`, `bf16`, `q8_0`, `q4_0`; null when the type is not possible for the model, e.g. `q8_0` / `q4_0` with a head size that is not a multiple of 32, or a recurrent / MLA model), `kv_estimate` (`exact`, `approximate`, `unsupported`) and `kv_note` (why). With `facts_status` `error`: `error`, e.g. `the GGUF metadata of ... is not plausible (...)`, a `split.count` that does not match the file name, or a missing part of a split model" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "Codes such as `model_devices_not_applied` (MODEL_DEVICES names the model but its section does not carry that device), `device_moved`, `device_missing`, `default_device_not_present`, `pool_overcommit`, `ctx_above_train`, `ubatch_above_ctx`, `kv_per_slot_no_effect`, `pooling_without_embeddings`, `apply_error`" }
+        }
+      },
+      "AdminModelSettingsList": {
+        "type": "object",
+        "required": ["models"],
+        "properties": {
+          "schema": {
+            "type": "array",
+            "description": "The whitelist with type, range, allowed values, built-in default and group of every key, for forms",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": { "type": "string", "example": "ctx-size" },
+                "group": { "type": "string", "enum": ["placement", "advanced", "role"] },
+                "default": { "type": "string", "nullable": true, "description": "Built-in default; null when the model decides (e.g. its trained context)" },
+                "type": { "type": "string", "enum": ["device", "int", "ngl", "enum", "bool"] },
+                "min": { "type": "integer" },
+                "max": { "type": "integer" },
+                "values": { "type": "array", "items": { "type": "string" }, "description": "`enum`: the allowed values; `ngl`: the words allowed besides a number" },
+                "auto": { "type": "integer", "description": "The number that means auto (`-1` for `parallel`)" },
+                "pair": { "type": "string", "description": "The key this one must be equal to (`cache-type-k` / `cache-type-v`)" }
+              }
+            }
+          },
+          "build_devices": { "type": "array", "items": { "type": "string" }, "example": ["CUDA0", "CUDA1"], "description": "GPUs of this server; empty for a CPU-only build" },
+          "models": { "type": "array", "items": { "$ref": "#/components/schemas/AdminModelRow" } },
+          "unattached": {
+            "type": "array",
+            "description": "Saved settings of models that are not in the list; kept until removed with `reset`",
+            "items": { "$ref": "#/components/schemas/AdminUnattachedEntry" }
+          },
+          "state": { "$ref": "#/components/schemas/AdminModelSettingsState" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`default_device_not_present`, `model_devices_unknown_section:<name>` (a MODEL_DEVICES entry that names no models.ini section)" }
+        }
+      },
+      "AdminUnattachedEntry": {
+        "type": "object",
+        "description": "Saved settings of a model that is not in the list (also the answer of `GET /admin/models/settings?model=<id>` for such an id, then with `state`)",
+        "required": ["id", "kind", "exists"],
+        "properties": {
+          "id": { "type": "string", "example": "user/old-repo:Q4_K_M" },
+          "kind": { "type": "string", "enum": ["orphaned", "hidden", "unreadable"], "description": "`orphaned`: the model is gone (deleted, renamed); `hidden`: a cache entry the list does not show; `unreadable`: an entry of the file that could not be read (kept as it is, see `raw`)" },
+          "overrides": { "type": "object", "additionalProperties": { "type": "string" } },
+          "phase": { "type": "string", "nullable": true },
+          "failures": { "type": "integer" },
+          "updated": { "type": "string", "format": "date-time", "nullable": true },
+          "reverted": { "type": "object", "nullable": true, "description": "As in `AdminModelRow`" },
+          "raw": { "description": "`unreadable` only: the entry as it is in the file" },
+          "exists": { "type": "boolean", "enum": [false] },
+          "state": { "$ref": "#/components/schemas/AdminModelSettingsState" }
+        }
+      },
+      "AdminModelSettingsState": {
+        "type": "object",
+        "description": "The per-model settings file",
+        "properties": {
+          "file": { "type": "string", "example": "/var/lib/provision-llm-admin/admin-models.json" },
+          "error": { "type": "string", "description": "Why the file could not be read; empty when fine" },
+          "read_only": { "type": "boolean", "description": "true = the file is damaged or from a newer version; saving answers 409 `model_settings_read_only`" },
+          "backup_loaded": { "type": "boolean", "description": "The file could not be read and its `.bak` was used" },
+          "problems": { "type": "array", "items": { "type": "string" }, "description": "Entries or values that were skipped while reading" },
+          "entries": { "type": "integer", "description": "Models with saved settings" }
+        }
+      },
+      "AdminModelSettingsUpdate": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+          "model": { "type": "string", "example": "qwen2.5-chat", "description": "Model id, or the id of an entry in `unattached`" },
+          "settings": { "$ref": "#/components/schemas/AdminModelSettingsInput" },
+          "reset": { "type": "boolean", "default": false, "description": "Remove all custom settings of the model" },
+          "restart": { "type": "boolean", "default": false, "description": "Running model: restart it with the new settings (without it the change is refused with 409). Stopped model: load it right away" }
+        }
+      },
+      "AdminModelSettingsResult": {
+        "type": "object",
+        "properties": {
+          "model": { "$ref": "#/components/schemas/AdminModelRow" },
+          "result": {
+            "type": "object",
+            "properties": {
+              "changed": { "type": "boolean", "description": "false = the effective values did not change; nothing was reloaded or restarted" },
+              "reloaded": { "type": "boolean", "description": "The model list was rebuilt" },
+              "restarted": { "type": "boolean", "description": "The model was (re)started" },
+              "was_running": { "type": "boolean" },
+              "restarted_also": { "type": "array", "items": { "type": "string" }, "description": "Other models that were loaded before, went down when the model list was rebuilt, and were loaded again" },
+              "not_restarted": {
+                "type": "array",
+                "description": "Other models that went down and could not be loaded again",
+                "items": { "type": "object", "properties": { "id": { "type": "string" }, "error": { "type": "string" } } }
+              },
+              "load_error": { "type": "string", "description": "Saved, but the model could not be started now (e.g. `model limit reached`); it starts on its next request. Empty when fine" },
+              "reload_error": { "type": "string", "description": "Always empty in a 200 answer: a failed rebuild of the model list is a 500 (`error.reload_error`) and the previous settings are restored" }
+            }
+          },
+          "previous": { "$ref": "#/components/schemas/AdminModelSettingsInput" },
+          "warnings": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AdminReloadError": {
+        "type": "object",
+        "description": "The error answer of `POST /admin/models/settings` when the settings could not be applied",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer", "example": 500 },
+              "message": { "type": "string" },
+              "type": { "type": "string", "example": "server_error" },
+              "reload_error": { "type": "string", "description": "Why the model list could not be rebuilt (missing when the settings file could not be written)" },
+              "restarted": { "type": "boolean", "description": "Only when the model was running and had been stopped for the restart: true = it runs again with its previous settings, false = see `restart_error`" },
+              "restart_error": { "type": "string" },
+              "restarted_also": { "type": "array", "items": { "type": "string" }, "description": "Only when not empty: other models that were loaded before and were loaded again" },
+              "not_restarted": {
+                "type": "array",
+                "description": "Only when not empty: other models that were loaded before and could not be loaded again",
+                "items": { "type": "object", "properties": { "id": { "type": "string" }, "error": { "type": "string" } } }
+              }
+            }
+          }
+        }
+      },
+      "AdminFitCheckRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+          "model": { "type": "string", "example": "qwen2.5-chat" },
+          "settings": { "$ref": "#/components/schemas/AdminModelSettingsInput" }
+        }
+      },
+      "AdminFitCheck": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "description": "false = llama.cpp could not set the model up with these settings, see `error`" },
+          "model": { "type": "string" },
+          "checked_at": { "type": "string", "format": "date-time" },
+          "cached": { "type": "boolean", "description": "The result of an earlier check: same model, effective arguments, GPU inventory and running state, at most 60 s old, and the live free memory of its GPUs moved by less than 256 MiB" },
+          "checked_while_running": { "type": "boolean", "description": "The dry run was made while the model was running: its fit saw the model's own memory as used (missing in an answer with `ok: false`)" },
+          "verdict": { "type": "string", "enum": ["fits", "tight", "no", "unknown", "cpu_only"], "description": "The worst verdict of all devices (`no`, then `unknown`, then `tight`); `cpu_only`: the model uses no GPU (a CPU-only server, or `device` `none`), `devices` is empty and `host` has its memory" },
+          "margin": { "type": "integer", "format": "int64", "example": 1073741824 },
+          "devices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "device": { "type": "string", "example": "CUDA1" },
+                "description": { "type": "string" },
+                "need": {
+                  "type": "object",
+                  "description": "Bytes the model would need on this GPU",
+                  "properties": {
+                    "model": { "type": "integer", "format": "int64" },
+                    "context": { "type": "integer", "format": "int64" },
+                    "compute": { "type": "integer", "format": "int64" },
+                    "total": { "type": "integer", "format": "int64" }
+                  }
+                },
+                "free": { "type": "integer", "format": "int64", "description": "Free memory of the GPU now" },
+                "total": { "type": "integer", "format": "int64" },
+                "free_source": { "type": "string", "enum": ["vendor_tool", "helper"], "description": "`helper` = the check's own reading" },
+                "own_usage": { "type": "integer", "format": "int64", "description": "What the model uses there now, counted as available when it is running and would be restarted" },
+                "own_usage_source": { "type": "string", "nullable": true },
+                "available": { "type": "integer", "format": "int64", "description": "free + own_usage" },
+                "settling": { "type": "boolean", "description": "A model on this GPU is loading or stopping: verdict `unknown`" },
+                "verdict": { "type": "string", "enum": ["fits", "tight", "no", "unknown"], "description": "`fits`: need + margin <= available; `tight`: need <= available < need + margin; `no`: need > available; `unknown`: memory not known or settling" }
+              }
+            }
+          },
+          "host": { "type": "object", "nullable": true, "description": "Host memory the model would need (model, context, compute)" },
+          "host_bytes": { "type": "integer", "format": "int64", "nullable": true },
+          "args": { "type": "array", "items": { "type": "string" }, "description": "The command line of the dry run (what the model process would get)" },
+          "duration_ms": { "type": "integer", "format": "int64", "description": "How long a new check took (not in a cached answer)" },
+          "n_ctx": { "type": "integer", "nullable": true, "description": "The context llama.cpp's fit chose (tokens)" },
+          "n_gpu_layers": { "type": "integer", "nullable": true, "description": "The GPU layers llama.cpp's fit chose" },
+          "fit": { "type": "string", "nullable": true, "enum": ["success", "failure", "error", "off", null], "description": "Result of llama.cpp's fit (`off`: the fit was switched off for this model)" },
+          "n_ctx_train": { "type": "integer", "nullable": true },
+          "n_layer": { "type": "integer", "nullable": true },
+          "error": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "code": { "type": "string", "example": "invalid_settings", "description": "`invalid_settings`, `out_of_memory`, `invalid_device`, `model_load_failed`, `device_missing`, `timeout`, `failed` (the helper could not be started), `unsupported`" },
+              "message": { "type": "string" },
+              "line": { "type": "string", "description": "The output line of llama.cpp the code comes from" }
+            }
+          },
+          "warnings": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AdminGpuInventory": {
+        "type": "object",
+        "description": "The GPUs the inventory helper found (at start-up, or at the last `POST /admin/gpus/rescan`)",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "source": { "type": "string", "enum": ["helper", "file", "off"], "description": "`off`: `PROVISION_ADMIN_INVENTORY=off`; `file`: recorded result (tests)" },
+          "error": { "type": "string", "description": "Why it failed (`timeout`, `failed`, `parse_error`, `unsupported`, `disabled`); the GPU names then come from the backends only" },
+          "message": { "type": "string" },
+          "time": { "type": "string", "format": "date-time", "nullable": true, "description": "When it was taken" },
+          "age_ms": { "type": "integer", "format": "int64" },
+          "duration_ms": { "type": "integer", "format": "int64" },
+          "devices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string", "example": "CUDA0", "description": "Device name as the backend registers it (CUDA0, ROCm0, Vulkan0, SYCL0, ...)" },
+                "backend": { "type": "string", "example": "CUDA" },
+                "vendor": { "type": "string", "example": "nvidia" },
+                "description": { "type": "string" },
+                "type": { "type": "string", "enum": ["gpu", "igpu", "accel"] },
+                "device_id": { "type": "string", "nullable": true, "description": "Device id as the backend reports it" },
+                "pci_bus_id": { "type": "string", "nullable": true, "example": "0000:01:00.0", "description": "PCI bus id, lower case `dddd:bb:dd.f`; null when the backend reports none" },
+                "memory_free": { "type": "integer", "format": "int64" },
+                "memory_total": { "type": "integer", "format": "int64" }
+              }
+            }
+          },
+          "backends": { "type": "array", "items": { "type": "string" }, "description": "GPU backends the helper loaded" }
+        }
+      },
+      "AdminGpu": {
+        "type": "object",
+        "properties": {
+          "device": { "type": "string", "example": "CUDA0" },
+          "backend": { "type": "string", "nullable": true, "example": "CUDA" },
+          "vendor": { "type": "string", "nullable": true, "example": "nvidia" },
+          "type": { "type": "string", "nullable": true },
+          "description": { "type": "string", "nullable": true },
+          "name": { "type": "string", "example": "NVIDIA GeForce GTX 1080 Ti" },
+          "pci_bus_id": { "type": "string", "nullable": true, "example": "0000:01:00.0" },
+          "mapping": { "type": "string", "enum": ["pci", "single", "unknown"], "description": "How the vendor tool's row was matched to this GPU" },
+          "tool": { "type": "string", "nullable": true, "example": "nvidia-smi" },
+          "index": { "type": "integer", "nullable": true, "description": "Index of the vendor tool's row (not the device number)" },
+          "uuid": { "type": "string", "nullable": true },
+          "unsupported": { "type": "boolean", "description": "The tool reports no usable memory for this GPU (e.g. MIG, vGPU)" },
+          "total": { "type": "integer", "format": "int64", "nullable": true },
+          "used": { "type": "integer", "format": "int64", "nullable": true },
+          "free": { "type": "integer", "format": "int64", "nullable": true },
+          "memory_source": { "type": "string", "enum": ["vendor_tool", "inventory", "none"], "description": "`inventory` = measured at start-up / last re-detect, see `memory_age_ms`" },
+          "memory_age_ms": { "type": "integer", "format": "int64", "nullable": true },
+          "settling": { "type": "boolean", "description": "A model on this GPU is loading or stopping (or did so a moment ago): the free memory is not final" },
+          "same_gpu_as": { "type": "array", "items": { "type": "string" }, "description": "Other device names of the same physical GPU (e.g. CUDA0 and Vulkan0)" },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "status": { "type": "string" },
+                "all_gpus": { "type": "boolean", "description": "The model has no GPU of its own and may use every GPU" },
+                "pinned": { "type": "boolean" },
+                "facts_status": { "type": "string" },
+                "memory": {
+                  "type": "object",
+                  "nullable": true,
+                  "properties": {
+                    "bytes": { "type": "integer", "format": "int64" },
+                    "source": { "type": "string", "enum": ["reported", "measured", "estimate"], "description": "`reported` by the model process itself (its memory breakdown, printed at log verbosity 4), `measured` per process by nvidia-smi (host only), or a rough `estimate`" },
+                    "by": { "type": "string", "nullable": true, "enum": ["model", "nvidia-smi", "llama.cpp", "formula", null], "description": "`model` (reported), `nvidia-smi` (measured), `llama.cpp` (estimate from a fit check of the current settings) or `formula` (estimate from the model file)" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "AdminGpus": {
+        "type": "object",
+        "properties": {
+          "build_devices": { "type": "array", "items": { "type": "string" } },
+          "gpu_backend": {
+            "type": "object",
+            "description": "The GPU backends of this server",
+            "properties": {
+              "state": { "type": "string", "enum": ["ok", "cpu_only", "no_devices"], "description": "`cpu_only`: no GPU backend in this build; `no_devices`: a GPU backend is there but found no GPU (driver, permissions such as /dev/kfd or /dev/dri, container without GPUs)" },
+              "message": { "type": "string" },
+              "libraries": { "type": "array", "items": { "type": "string" }, "description": "GPU backend libraries next to the binary" },
+              "backends": { "type": "array", "items": { "type": "object" } }
+            }
+          },
+          "inventory": { "$ref": "#/components/schemas/AdminGpuInventory" },
+          "probe": {
+            "type": "object",
+            "description": "The vendor tools",
+            "properties": {
+              "mode": { "type": "string", "enum": ["auto", "off", "tool", "file"], "description": "From `PROVISION_ADMIN_GPU_PROBE`" },
+              "source": { "type": "string", "example": "nvidia-smi", "description": "`nvidia-smi`, `amd-smi`, `rocm-smi`, `file`, `multiple` (several vendors), `none`" },
+              "ok": { "type": "boolean" },
+              "error": { "type": "string", "description": "Empty, or `disabled`, `not_found`, `timeout`, `failed`, `parse_error`, `unsupported`, `probe_stuck`" },
+              "message": { "type": "string", "description": "The error in words, e.g. the tool's first error line" },
+              "age_ms": { "type": "integer", "format": "int64", "nullable": true },
+              "stale": { "type": "boolean", "description": "The last run failed; the figures are from an older run" },
+              "mapping": { "type": "string", "enum": ["pci", "single", "unknown", "mixed", "none"], "description": "How the tool's rows were matched to the GPUs: by PCI bus id, the one GPU with the one row, not at all, a mix, or no GPU" },
+              "tools": { "type": "array", "items": { "type": "object" } }
+            }
+          },
+          "margin": { "type": "integer", "format": "int64", "example": 1073741824, "description": "Safety margin of the fit verdict (1 GiB, as llama.cpp's own fit)" },
+          "settle_ms": { "type": "integer", "example": 1500 },
+          "gpus": { "type": "array", "items": { "$ref": "#/components/schemas/AdminGpu" } },
+          "unmatched": { "type": "array", "items": { "type": "object" }, "description": "Rows of the vendor tool without a GPU of the server (e.g. hidden by CUDA_VISIBLE_DEVICES)" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`gpu_backend_not_initialised`, `vendor_rows_not_matched`" }
+        }
+      },
+      "AdminModelLog": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "status": { "type": "string", "nullable": true },
+          "instance": {
+            "type": "object",
+            "nullable": true,
+            "description": "The model's latest process",
+            "properties": {
+              "port": { "type": "integer" },
+              "running": { "type": "boolean" },
+              "started": { "type": "string", "format": "date-time" },
+              "started_ms": { "type": "integer", "format": "int64", "description": "`started` in milliseconds since the epoch: comparable with `last_failure.time_ms`, a greater value is a later start than the failure" },
+              "lines_total": { "type": "integer" }
+            }
+          },
+          "reason": { "$ref": "#/components/schemas/AdminFailureReason" },
+          "lines": { "type": "array", "items": { "type": "string" } },
+          "truncated": { "type": "boolean" },
+          "last_failure": { "$ref": "#/components/schemas/AdminFailure" }
+        }
+      },
+      "AdminDiagnostics": {
+        "type": "object",
+        "properties": {
+          "generated_at": { "type": "string", "format": "date-time" },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string", "example": "vendor_tool", "description": "`deployment`, `binary`, `gpu_backend`, `inventory`, `vendor_tool`, `memory_mapping`, `router_gpu_free`, `state_dir`, `admin_key`, `proxy`, `ip_allowlist`, `model_devices`, `model_settings`, and `stuck_helpers` at the end, only while a helper process hangs" },
+                "label": { "type": "string", "example": "GPU memory tool" },
+                "status": { "type": "string", "enum": ["ok", "warning", "error", "info"] },
+                "value": { "description": "What was found: a string, a number, a boolean, an object or null" },
+                "hint": { "type": "string", "description": "One line on what to do or what it means" }
+              }
+            }
+          }
+        }
+      },
+      "AdminUploadAvailability": {
+        "type": "object",
+        "description": "Whether GGUF files can be uploaded on this server",
+        "properties": {
+          "available": { "type": "boolean" },
+          "reason": { "type": "string", "nullable": true, "enum": ["no_models_dir", "models_dir_missing", "not_writable", "staging_unusable", "staging_other_filesystem", null], "description": "null when available. `no_models_dir`: no `--models-dir` (Docker: mount `/models-rw`; host: add it to `PROVISION_LLM_ARGS`; then restart). `models_dir_missing`, `not_writable`: fix the directory. `staging_unusable`: `.provision-upload` in the models directory is a file or a symbolic link. `staging_other_filesystem`: something is mounted over `.provision-upload`" },
+          "message": { "type": "string", "nullable": true, "description": "The reason in words, with what to do" }
+        }
+      },
+      "AdminUploadLimits": {
+        "type": "object",
+        "description": "Fixed limits of the upload",
+        "properties": {
+          "chunk_max": { "type": "integer", "example": 16777216, "description": "Largest chunk body in bytes" },
+          "chunk_default": { "type": "integer", "example": 8388608, "description": "Chunk size a client starts with" },
+          "chunk_min": { "type": "integer", "example": 245760, "description": "Smallest chunk a client steps down to when a proxy limits the request size" },
+          "max_sessions": { "type": "integer", "example": 4, "description": "Unfinished uploads at the same time" },
+          "max_writers": { "type": "integer", "example": 4, "description": "Chunks received at the same time over all uploads" },
+          "max_files": { "type": "integer", "example": 256, "description": "Files per upload" },
+          "ttl_h": { "type": "integer", "example": 72, "description": "Hours without progress after which an upload is removed (counted while the server runs)" },
+          "ttl_s": { "type": "integer", "example": 259200, "description": "The same in seconds" },
+          "max_header_bytes": { "type": "integer", "example": 67108864, "description": "Largest metadata section of a file" }
+        }
+      },
+      "AdminUploadSummary": {
+        "type": "object",
+        "description": "One upload in the list of `GET /admin/models/upload`",
+        "properties": {
+          "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "name": { "type": "string", "description": "The model id it will get" },
+          "state": { "type": "string", "enum": ["receiving", "checking", "ready", "publishing", "published", "rejected", "cancelled", "expired"] },
+          "substate": { "type": "string", "nullable": true, "description": "`checking`: `queued` (another upload's check runs), `hashing`, `classifying`, `load_check`" },
+          "blocked_by": { "type": "string", "nullable": true, "enum": ["manual", "name_taken", "publish_error", "check_failed", "sha256_mismatch", "settings_not_saved", "settings_invalid", null], "description": "`ready` only: what the upload waits for; details in `blocked`" },
+          "total_bytes": { "type": "integer", "format": "int64" },
+          "received_bytes": { "type": "integer", "format": "int64" },
+          "n_files": { "type": "integer", "description": "Number of files" },
+          "auto_publish": { "type": "boolean" },
+          "created": { "type": "string", "format": "date-time" },
+          "last_activity": { "type": "string", "format": "date-time" },
+          "error": { "type": "object", "nullable": true, "description": "`rejected` (or a failed step): `code`, `message`" },
+          "blocked": { "type": "object", "nullable": true, "description": "`ready`: details of `blocked_by` (e.g. `by` and `other` for `name_taken`)" },
+          "expires_at": { "type": "string", "format": "date-time", "nullable": true, "description": "When it is removed without progress; null while the server works on it" }
+        }
+      },
+      "AdminUploadOverview": {
+        "type": "object",
+        "required": ["available", "limits", "sessions"],
+        "properties": {
+          "available": { "type": "boolean" },
+          "reason": { "type": "string", "nullable": true, "description": "See `AdminUploadAvailability`" },
+          "message": { "type": "string", "nullable": true },
+          "limits": { "$ref": "#/components/schemas/AdminUploadLimits" },
+          "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/AdminUploadSummary" } },
+          "staging_bytes": { "type": "integer", "format": "int64", "description": "What the unfinished uploads take on disk" },
+          "models_dir": { "type": "string", "nullable": true },
+          "settings_writable": { "type": "boolean", "description": "The placement of an upload can be saved (the admin state directory is writable); otherwise an upload with settings stops as `ready` / `settings_not_saved`" },
+          "settings_error": { "type": "string", "nullable": true }
+        }
+      },
+      "AdminUploadFile": {
+        "type": "object",
+        "properties": {
+          "index": { "type": "integer", "description": "Position in `files` of the create request; the `file` of the chunk route" },
+          "name": { "type": "string", "description": "The original file name (shown and used for matching only, never a path)" },
+          "size": { "type": "integer", "format": "int64", "description": "Declared size in bytes" },
+          "offset": { "type": "integer", "format": "int64", "description": "Bytes the server accepted; the next chunk starts here" },
+          "durable_offset": { "type": "integer", "format": "int64", "description": "Bytes known to be on disk (last checkpoint, every 256 MiB or 15 s); after a restart of the server `offset` goes back to it" },
+          "complete": { "type": "boolean" },
+          "dropped": { "type": "boolean", "description": "Taken out of the upload with `drop_files`" },
+          "role": { "type": "string", "nullable": true, "enum": ["model", "projector", null], "description": "From the header check; null before" },
+          "sha256": { "type": "string", "nullable": true, "description": "Known once the checks have hashed the file" },
+          "sha256_expected": { "type": "string", "nullable": true },
+          "head_crc32": { "type": "string", "nullable": true, "description": "CRC-32 of the first MiB (8 hex digits), once that much has arrived: compare it with a file picked again before continuing" },
+          "final_name": { "type": "string", "nullable": true, "description": "The name in the models directory, once decided" },
+          "header": { "type": "object", "description": "The header check of this file: `state` (`none`, `scanning`, `queued`, `ok`, `warning`, `failed`, `error`), and what it read: `arch`, `type`, `split` (`no`, `count`), `message`" },
+          "error": { "type": "object", "nullable": true, "description": "Why this file cannot be used (`code`, `message`)" }
+        }
+      },
+      "AdminUploadSession": {
+        "allOf": [
+          { "$ref": "#/components/schemas/AdminUploadSummary" },
+          {
+            "type": "object",
+            "required": ["id", "state", "files"],
+            "properties": {
+              "files": { "type": "array", "items": { "$ref": "#/components/schemas/AdminUploadFile" } },
+              "settings": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Per-model settings for the first start" },
+              "settings_mode": { "type": "string", "enum": ["replace", "keep"] },
+              "plan": { "description": "The final names and roles, once the classification has decided them" },
+              "facts": { "description": "What the checks read from the files" },
+              "result": { "description": "`published`: the model and its final files; a `reload_error` when the model list could not be rebuilt (the next rescan lists the model)" },
+              "warnings": { "type": "array", "items": { "type": "string" } },
+              "idle_ms": { "type": "integer", "format": "int64", "description": "Time without progress, counted while the server runs" },
+              "last_client_idle_ms": { "type": "integer", "format": "int64", "nullable": true, "description": "Time since the last chunk from any sender; below 30000 another sender gets `other_client_active`" },
+              "recovered": { "type": "boolean", "description": "The server took the upload over after a restart" },
+              "recovered_without_record": { "type": "boolean" },
+              "record_persisted": { "type": "boolean", "description": "The upload's record is in the admin state directory" },
+              "chunk_max": { "type": "integer" },
+              "chunk_default": { "type": "integer" },
+              "progress": { "type": "object", "nullable": true, "description": "While hashing", "properties": { "done_bytes": { "type": "integer", "format": "int64" }, "total_bytes": { "type": "integer", "format": "int64" } } },
+              "checks": { "type": "array", "description": "What the checks found so far (the header check names architecture, parameters, quantization, training context)", "items": { "type": "object", "properties": { "step": { "type": "string" }, "file": { "type": "integer" }, "status": { "type": "string" }, "message": { "type": "string" } } } }
+            }
+          }
+        ]
+      },
+      "AdminUploadCreateRequest": {
+        "type": "object",
+        "required": ["name", "files"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "example": "qwen3-8b", "description": "The model id" },
+          "files": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "required": ["name", "size"],
+              "properties": {
+                "name": { "type": "string", "example": "Qwen3-8B-Q4_K_M.gguf" },
+                "size": { "type": "integer", "format": "int64", "minimum": 24 },
+                "last_modified": { "type": "integer", "format": "int64", "description": "Milliseconds since the epoch; a hint for matching the file after a reload" },
+                "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Expected SHA-256 (as Hugging Face shows it)" }
+              }
+            }
+          },
+          "settings": { "$ref": "#/components/schemas/AdminModelSettingsInput" },
+          "settings_mode": { "type": "string", "enum": ["replace", "keep"], "default": "replace", "description": "Saved settings of an earlier model with this id: `replace` drops them, `keep` uses them again with `settings` on top" },
+          "auto_publish": { "type": "boolean", "default": true },
+          "dry_run": { "type": "boolean", "default": false }
+        }
+      },
+      "AdminUploadCreated": {
+        "type": "object",
+        "properties": {
+          "upload": { "type": "object", "description": "The new upload, as `GET /admin/models/upload?id=` shows it; in a dry run only `id` (null), `name`, `files`, `settings`, `chunk_max`, `chunk_default`" },
+          "disk": {
+            "type": "object",
+            "description": "The filesystem of the models directory",
+            "properties": {
+              "free_bytes": { "type": "integer", "format": "int64" },
+              "total_bytes": { "type": "integer", "format": "int64" },
+              "needed_bytes": { "type": "integer", "format": "int64", "description": "What this upload needs" },
+              "other_uploads_bytes": { "type": "integer", "format": "int64", "description": "What the other unfinished uploads still need" },
+              "shares_disk_with": { "type": "array", "items": { "type": "string" }, "description": "Other data on the same filesystem: `admin_state`" }
+            }
+          },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "Never blocking: `not_enough_space` (larger than the free space minus what other unfinished uploads still need), `larger_than_disk`, `shares_disk_with_state` (a full disk would also stop settings from being saved), `record_not_persisted` (the record could not be written to the admin state directory)" },
+          "locks": { "type": "object", "description": "The settings that are locked for this model" },
+          "existing_settings": { "type": "object", "description": "Only when there are some: saved settings of an earlier model with this id (an `orphaned` entry of `GET /admin/models/settings`)" }
+        }
+      },
+      "AdminUploadChunkResult": {
+        "type": "object",
+        "properties": {
+          "offset": { "type": "integer", "format": "int64", "description": "The file's offset on the server after this chunk" },
+          "durable_offset": { "type": "integer", "format": "int64" },
+          "file_complete": { "type": "boolean" },
+          "state": { "type": "string", "description": "The upload's state; `checking` once every file is complete" },
+          "file": { "type": "integer" },
+          "received_bytes": { "type": "integer", "format": "int64", "description": "Of the whole upload" },
+          "total_bytes": { "type": "integer", "format": "int64" },
+          "file_error": { "type": "object", "nullable": true, "description": "Why this file cannot be used, once the header check decided so" }
+        }
+      },
+      "AdminUploadUpdateRequest": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+          "settings": { "$ref": "#/components/schemas/AdminModelSettingsInput" },
+          "settings_mode": { "type": "string", "enum": ["replace", "keep"] },
+          "auto_publish": { "type": "boolean" },
+          "files": { "type": "array", "description": "Set the expected SHA-256 of files (an empty string removes it)", "items": { "type": "object", "required": ["index"], "properties": { "index": { "type": "integer" }, "sha256": { "type": "string" } } } },
+          "drop_files": { "type": "array", "items": { "type": "integer" }, "description": "Indexes of files to take out of the upload; their data is deleted at once" }
+        }
+      },
+      "AdminUploadPublishRequest": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "ignore_sha256_mismatch": { "type": "boolean", "default": false, "description": "Publish although the SHA-256 differs from the expected one" },
+          "without_settings": { "type": "boolean", "default": false, "description": "Publish without the upload's settings (when they cannot be saved: `settings_not_saved`)" }
+        }
+      },
+      "AdminUploadIdRequest": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+        }
+      },
+      "AdminUploadAnswer": {
+        "type": "object",
+        "description": "Answer of update, publish and cancel",
+        "properties": {
+          "upload": { "$ref": "#/components/schemas/AdminUploadSession" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`update`" },
+          "locks": { "type": "object", "description": "`update`" },
+          "existing_settings": { "type": "object", "description": "`update`, only when there are some" },
+          "cancelled": { "type": "boolean", "description": "`cancel`" },
+          "freed_bytes": { "type": "integer", "format": "int64", "description": "`cancel`" }
+        }
+      },
+      "AdminModelDeleteRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+          "model": { "type": "string", "example": "gemma-3-4b" },
+          "dry_run": { "type": "boolean", "default": false, "description": "Only report what would be deleted" },
+          "stop": { "type": "boolean", "default": false, "description": "Stop the model first if it is running (otherwise 409 `model_running`)" },
+          "remove_settings": { "type": "boolean", "default": true, "description": "Also remove its saved per-model settings, its pin and what the server cached about it" },
+          "projector_only": { "type": "boolean", "default": false, "description": "Remove projector: delete only the model's projector file" }
+        }
+      },
+      "AdminModelDeleteResult": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "source": { "type": "string", "example": "models_dir", "description": "Dry run" },
+          "projector_only": { "type": "boolean" },
+          "files": { "type": "array", "description": "What is (would be) deleted, paths relative to the models directory", "items": { "type": "object", "properties": { "path": { "type": "string" }, "bytes": { "type": "integer", "format": "int64" }, "role": { "type": "string", "enum": ["model", "shard", "projector", "draft"] } } } },
+          "n_files": { "type": "integer" },
+          "total_bytes": { "type": "integer", "format": "int64" },
+          "kept": { "type": "array", "description": "Other entries of the model's folder that stay (not part of this model); at most 100 listed", "items": { "type": "object", "properties": { "path": { "type": "string" }, "bytes": { "type": "integer", "format": "int64", "nullable": true }, "kind": { "type": "string", "enum": ["file", "dir", "symlink"] } } } },
+          "n_kept": { "type": "integer" },
+          "kept_bytes": { "type": "integer", "format": "int64" },
+          "folder": { "type": "string", "nullable": true, "description": "The model's folder in the models directory; null for a top-level file" },
+          "folder_removed": { "type": "boolean", "description": "The folder is (would be) empty afterwards and removed" },
+          "running": { "type": "boolean", "description": "Dry run: the model is running (it would be stopped with `stop`)" },
+          "status": { "type": "string" },
+          "pinned": { "type": "boolean" },
+          "has_settings": { "type": "boolean", "description": "Dry run: the model has saved per-model settings" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "Dry run: `running`, `folder_keeps_other_model` (another GGUF file stays in the folder and may be listed under this id afterwards)" },
+          "deleted": { "type": "boolean" },
+          "projector_removed": { "type": "boolean", "description": "`projector_only`" },
+          "freed_bytes": { "type": "integer", "format": "int64" },
+          "settings_removed": { "type": "boolean" },
+          "pin_removed": { "type": "boolean" },
+          "trash_left": { "type": "boolean", "description": "The files wait in the trash, which the server deletes in the background" },
+          "reload_error": { "type": "string", "nullable": true, "description": "The model list could not be rebuilt afterwards; the files are gone all the same" }
+        }
+      },
       "Error": {
         "type": "object",
         "properties": {
@@ -552,7 +2399,18 @@
             "properties": {
               "code": { "type": "integer" },
               "message": { "type": "string" },
-              "type": { "type": "string" }
+              "type": { "type": "string" },
+              "param": { "type": "string", "description": "Admin validation and lock errors: the request field the error is about, a key of `settings` (e.g. `ctx-size`), `settings` or `model`" },
+              "license": {
+                "type": "object",
+                "description": "Present on 403 responses from the license gate",
+                "properties": {
+                  "mode": { "type": "string", "enum": ["trial", "online", "offline", "none"] },
+                  "reason": { "type": "string", "example": "request_limit_reached" },
+                  "used": { "type": "integer" },
+                  "limit": { "type": "integer" }
+                }
+              }
             }
           }
         }

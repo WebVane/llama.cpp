@@ -1,0 +1,59 @@
+llama-dual    | ggml_cuda_init: found 1 CUDA devices (Total VRAM: 11172 MiB):
+llama-dual    |   Device 0: NVIDIA GeForce GTX 1080 Ti, compute capability 6.1, VMM: yes, VRAM: 11172 MiB
+llama-dual    | load_backend: loaded CUDA backend from /app/libggml-cuda.so
+llama-dual    | load_backend: loaded CPU backend from /app/libggml-cpu-ivybridge.so
+llama-dual    | warn: LLAMA_ARG_HOST environment variable is set, but will be overwritten by command line argument --host
+llama-dual    | main: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true
+llama-dual    | build_info: b20-fa89da2
+llama-dual    | system_info: n_threads = 8 (n_threads_batch = 8) / 8 | CUDA : ARCHS = 610,750,800,860,890 | USE_GRAPHS = 1 | PEER_MAX_BATCH_SIZE = 128 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | F16C = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
+llama-dual    | init: using 8 threads for HTTP server
+llama-dual    | srv   load_models: Loaded 0 cached model presets
+llama-dual    | srv   load_models: Loaded 3 custom model presets from /config/models.ini
+llama-dual    | srv    operator(): Available models (3) (*: custom preset)
+llama-dual    | srv    operator():   * default
+llama-dual    | srv    operator():   * gte-qwen2-embed
+llama-dual    | srv    operator():   * qwen2.5-chat
+llama-dual    | main: starting router server, no model will be loaded in this process
+llama-dual    | start: binding port with default address family
+llama-dual    | main: router server is listening on http://0.0.0.0:8080
+llama-dual    | main: NOTE: router mode is experimental
+llama-dual    | main:       it is not recommended to use this mode in untrusted environments
+llama-dual    | srv  log_server_r: done request: GET / 10.64.0.2 200
+llama-dual    | srv  log_server_r: done request: GET /bundle.css 10.64.0.2 200
+llama-dual    | srv  log_server_r: done request: GET /bundle.js 10.64.0.2 200
+llama-dual    | srv  log_server_r: done request: HEAD /cors-proxy 10.64.0.2 404
+llama-dual    | srv  log_server_r: done request: GET /tools 10.64.0.2 404
+llama-dual    | srv          load: spawning server instance with name=default on port 42073
+llama-dual    | srv          load: spawning server instance with args:
+llama-dual    | srv          load:   /app/llama-server
+llama-dual    | srv          load:   --host
+llama-dual    | srv          load:   127.0.0.1
+llama-dual    | srv          load:   --port
+llama-dual    | srv          load:   42073
+llama-dual    | srv          load:   --alias
+llama-dual    | srv          load:   default
+llama-dual    | srv          load:   --ctx-size
+llama-dual    | srv          load:   8192
+llama-dual    | srv          load:   --n-gpu-layers
+llama-dual    | srv          load:   99
+llama-dual    | srv          load:   --threads
+llama-dual    | srv          load:   -1
+llama-dual    | srv  log_server_r: done request: POST /models/load 10.64.0.2 200
+llama-dual    | [42073] ggml_cuda_init: found 1 CUDA devices (Total VRAM: 11172 MiB):
+llama-dual    | [42073]   Device 0: NVIDIA GeForce GTX 1080 Ti, compute capability 6.1, VMM: yes, VRAM: 11172 MiB
+llama-dual    | [42073] load_backend: loaded CUDA backend from /app/libggml-cuda.so
+llama-dual    | [42073] load_backend: loaded CPU backend from /app/libggml-cpu-ivybridge.so
+llama-dual    | [42073] warn: LLAMA_ARG_HOST environment variable is set, but will be overwritten by command line argument --host
+llama-dual    | [42073] main: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true
+llama-dual    | [42073] build_info: b20-fa89da2
+llama-dual    | [42073] system_info: n_threads = 8 (n_threads_batch = 8) / 8 | CUDA : ARCHS = 610,750,800,860,890 | USE_GRAPHS = 1 | PEER_MAX_BATCH_SIZE = 128 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | F16C = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
+llama-dual    | [42073] init: using 8 threads for HTTP server
+llama-dual    | [42073] srv   load_models: Loaded 0 cached model presets
+llama-dual    | [42073] srv    operator(): Available models (0) (*: custom preset)
+llama-dual    | [42073] main: starting router server, no model will be loaded in this process
+llama-dual    | [42073] start: binding port with default address family
+llama-dual    | [42073] main: router server is listening on http://127.0.0.1:42073
+llama-dual    | [42073] main: NOTE: router mode is experimental
+llama-dual    | [42073] main:       it is not recommended to use this mode in untrusted environments
+llama-dual    | srv  log_server_r: done request: GET /tools 10.64.0.2 404
+llama-dual    | srv  ensure_model: waiting until model name=default is fully loaded...

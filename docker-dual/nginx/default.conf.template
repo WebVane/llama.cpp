@@ -1,0 +1,170 @@
+# Front door of the llama-dual stack (see docker-compose.yml and
+# docs/provision-admin.md).
+#
+# nginx is the only container with a published port.  It does two things:
+#
+#   1. /admin and /admin/...  -> forwarded only for client addresses on the
+#      allow-list, everybody else gets 403.  This is the "firewall" of the
+#      admin API: a packet filter cannot tell URLs apart, a reverse proxy can.
+#      /cors-proxy gets the same allow-list (see its location below).
+#   2. everything else        -> forwarded unchanged, exactly as if the client
+#      talked to the server directly (same paths, same bodies, streaming
+#      responses are not buffered).
+#
+# How this file is used
+# ---------------------
+# The official nginx image renders /etc/nginx/templates/*.template with
+# envsubst at container start and writes the result to /etc/nginx/conf.d/
+# (this file becomes conf.d/default.conf and replaces the stock one).  Only
+# environment variables that exist in the container AND match
+# NGINX_ENVSUBST_FILTER (set in docker-compose.yml) are substituted, which
+# leaves exactly one placeholder in this file: ADMIN_ALLOW_RULES, used in the
+# three locked locations below (/admin, /admin/..., /cors-proxy).  nginx's
+# own variables (written with a dollar sign: http_host, remote_addr, ...) are
+# not environment variables and pass through untouched.  Do not write the
+# placeholder (dollar sign + name) anywhere else in this file, comments
+# included: envsubst does not know what a comment is.
+#
+# ADMIN_ALLOW_RULES
+# -----------------
+# Raw nginx access directives, each one terminated by a semicolon, e.g.
+#
+#     ADMIN_ALLOW_RULES="allow 10.64.0.11; allow 10.64.0.0/24;"
+#
+# They are pasted in front of "deny all;", and nginx stops at the first rule
+# that matches the client address.  Empty (the default) leaves only
+# "deny all;": the admin API is closed for everyone.
+#
+#   - A missing semicolon or a typo makes the whole configuration invalid and
+#     nginx will not start, which takes the public API down with it.  Check
+#     before applying:
+#         docker compose run --rm --no-deps nginx nginx -t
+#   - The address that counts is the one nginx sees as the TCP peer
+#     (first field of every line of `docker compose logs nginx`).  For
+#     clients on the LAN that is their real address.  Requests made ON the
+#     Docker host itself (curl http://localhost:8096/..., an SSH tunnel that
+#     ends on the host, other containers going through the published port)
+#     do NOT arrive from 127.0.0.1: Docker forwards them and nginx sees the
+#     gateway address of this compose network, e.g. 172.18.0.1:
+#         docker inspect llama-dual-nginx \
+#             --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}'
+#     Allowing that address therefore means "anything that runs on the Docker
+#     host", and on hosts where Docker's userland proxy also carries remote
+#     traffic (IPv6 clients of an IPv4-only network, rootless Docker, Docker
+#     Desktop) it means "everybody".  Look at the access log first.
+#   - "allow 127.0.0.1;" only matches processes inside the nginx container.
+
+server {
+    # IPv4 only: the compose network has no IPv6 by default, and nginx would
+    # refuse to start on "listen [::]:80" where the kernel has IPv6 disabled.
+    listen 80 default_server;
+    server_name _;
+    server_tokens off;
+
+    # ---- reaching the server ------------------------------------------------
+    # The name is resolved through Docker's embedded DNS at request time (the
+    # variable in proxy_pass is what makes nginx do that) instead of once at
+    # start-up: nginx starts even while llama-dual is still down, and keeps
+    # working after llama-dual is re-created with a new address (image
+    # update).  While the server is unreachable clients get 502.
+    # proxy_pass without a URI part forwards the request line exactly as the
+    # client sent it (path, percent-encoding and query string untouched).
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $llama_upstream http://llama-dual:8080;
+
+    # ---- transparency -------------------------------------------------------
+    # One upstream connection per request (no keep-alive pool): costs nothing
+    # on a local bridge and guarantees that two clients never share a
+    # connection to the server.
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    # Host exactly as the client sent it (including the port).
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Keep the server's own "Server:" header on proxied responses.
+    proxy_pass_header Server;
+    # Do not drop request headers whose names contain an underscore.
+    underscores_in_headers on;
+
+    # No size limit of our own: the server enforces its limit itself
+    # (100 MB request body, 32 KiB request line) and answers with its own
+    # error, as it does without a proxy.
+    client_max_body_size 0;
+    large_client_header_buffers 4 64k;
+
+    # ---- streaming ----------------------------------------------------------
+    # Server-sent events (GET /models/sse, "stream": true completions) must
+    # reach the client token by token: no response buffering, no compression,
+    # and request bodies are passed on while they arrive.
+    proxy_buffering off;
+    proxy_request_buffering off;
+    gzip off;
+
+    # A non-streamed completion sends nothing until it is finished and
+    # /models/sse stays silent while no model changes state, so "no bytes for
+    # a long time" is normal here.  The server's own timeout is 1 hour.
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 3600s;
+    proxy_read_timeout 86400s;
+    client_body_timeout 3600s;
+    send_timeout 3600s;
+
+    # ---- admin API: allow-list, then nobody --------------------------------
+    # nginx matches locations against the normalised path: percent-encoding
+    # decoded once ("/%61dmin/status" is "/admin/status"), "." and ".."
+    # segments resolved, repeated slashes merged; a request line it cannot
+    # decode (e.g. "%u0061") is rejected with 400 before any location is
+    # tried.  The server routes on the path decoded once as well, so there is
+    # no spelling of an /admin URL that the server accepts and these two
+    # locations miss.  "^~" keeps regex locations (if any are ever added)
+    # from taking over.
+    # This assumes the server's routes start at "/": do not run it with
+    # --api-prefix (LLAMA_ARG_API_PREFIX) behind this file, the prefix moves
+    # /admin to a path these locations do not match.
+    location = /admin {
+        ${ADMIN_ALLOW_RULES}
+        deny all;
+        error_page 403 @admin_denied;
+        proxy_pass $llama_upstream;
+    }
+
+    location ^~ /admin/ {
+        ${ADMIN_ALLOW_RULES}
+        deny all;
+        error_page 403 @admin_denied;
+        proxy_pass $llama_upstream;
+    }
+
+    # ---- the server's CORS proxy: same allow-list ---------------------------
+    # With the MCP proxy switched on (--ui-mcp-proxy or --agent; neither is
+    # set in this stack) the server fetches any URL a client names at
+    # /cors-proxy, its own /admin API on 127.0.0.1 included, and that request
+    # does not pass the two locations above.  So /cors-proxy is open to the
+    # same addresses only.  While the proxy is off the server answers 403
+    # here for everybody anyway.
+    location ^~ /cors-proxy {
+        ${ADMIN_ALLOW_RULES}
+        deny all;
+        error_page 403 @cors_proxy_denied;
+        proxy_pass $llama_upstream;
+    }
+
+    # Same error shape as the server's own errors, so API clients and the web
+    # UI can tell "not allowed from this address" from anything else.
+    location @admin_denied {
+        default_type application/json;
+        return 403 '{"error":{"code":403,"message":"The admin API is not available from this address","type":"admin_forbidden"}}';
+    }
+
+    location @cors_proxy_denied {
+        default_type application/json;
+        return 403 '{"error":{"code":403,"message":"The CORS proxy is not available from this address","type":"admin_forbidden"}}';
+    }
+
+    # ---- everything else: unchanged ----------------------------------------
+    location / {
+        proxy_pass $llama_upstream;
+    }
+}

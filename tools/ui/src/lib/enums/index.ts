@@ -69,7 +69,12 @@ export {
 
 export { ModelCapability, ModelModality } from './model.enums';
 
-export { ServerRole, ServerModelStatus, ServerModelsSseEventType } from './server.enums';
+export {
+	ServerRole,
+	ServerModelSource,
+	ServerModelStatus,
+	ServerModelsSseEventType
+} from './server.enums';
 
 export { ParameterSource, SyncableParameterType, SettingsFieldType } from './settings.enums';
 
@@ -95,3 +100,34 @@ export {
 } from './tools.enums';
 
 export { SplashOrientation } from './splash.enums';
+
+export {
+	AdminContextMode,
+	AdminDiagnosticStatus,
+	AdminDownloadOutcome,
+	AdminDownloadWarning,
+	AdminErrorType,
+	AdminExportMode,
+	AdminFailureCode,
+	AdminFeature,
+	AdminFitErrorKind,
+	AdminFitSource,
+	AdminFitVerdict,
+	AdminGpuBackendState,
+	AdminGpuMapping,
+	AdminGpuMemorySource,
+	AdminImportIssue,
+	AdminLockSource,
+	AdminModelMemorySource,
+	AdminModelOperation,
+	AdminModelRole,
+	AdminNoticeLevel,
+	AdminProbeError,
+	AdminProbeState,
+	AdminRestartPhase,
+	AdminSettingKey,
+	AdminSettingOrigin,
+	AdminSettingsPhase,
+	AdminStorageDirKind,
+	AdminTab
+} from './admin.enums';

@@ -227,6 +227,16 @@ export class ModelPropsManager {
 		return this.cache.get(modelId);
 	}
 
+	/**
+	 * Drop the cached props of one model so the next read fetches them again.
+	 * The status manager calls it when the feed reports that a new instance
+	 * of the model starts or that it stopped: a restart with other settings
+	 * (e.g. a new context size) changes its props.
+	 */
+	invalidate(modelId: string): void {
+		if (this.cache.delete(modelId)) this.cacheVersion++;
+	}
+
 	isModelPropsFetching(modelId: string): boolean {
 		return this.fetching.has(modelId);
 	}

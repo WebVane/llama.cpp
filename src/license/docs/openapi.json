@@ -5,6 +5,7 @@
     "version": "2.1.0"
   },
   "servers": [
+    { "url": "https://license.scan-dev.com", "description": "Тестовый сервер лицензий (подписывает ключом k3, admin без авторизации)" },
     { "url": "https://license.example.com", "description": "Prod (placeholder)" },
     { "url": "http://localhost:8080", "description": "Dev" }
   ],
@@ -147,17 +148,146 @@
         }
       }
     },
-    "/api/v1/admin/activation-codes": {
+    "/api/v1/admin/products": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Список продуктов",
+        "security": [{ "adminAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Все продукты",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["products"],
+                  "properties": { "products": { "type": "array", "items": { "$ref": "#/components/schemas/Product" } } }
+                },
+                "example": { "products": [ { "productId": "ecf7a396-1cdd-421d-90e3-28f8f3050655", "code": "LLM", "name": "LLM" }, { "productId": "33333333-3333-3333-3333-333333333333", "code": "OCR", "name": "OCR" } ] }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
       "post": {
         "tags": ["admin"],
-        "summary": "Выпустить код активации (создать лицензию)",
-        "description": "Создаёт лицензию PENDING + activationCode (CSPRNG). Сырой код возвращается ОДИН РАЗ; в БД хранится только key_hash.",
+        "summary": "Создать продукт",
+        "description": "`code` — это значение, которое проверяет клиент: поле `product` в .lic должно совпасть с продуктом сборки (`OCR` у provision_ocr_server, `LLM` у provision-server).",
         "security": [{ "adminAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/IssueActivationCodeRequest" }
+              "schema": { "$ref": "#/components/schemas/CreateProductRequest" },
+              "example": { "code": "LLM", "name": "LLM" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Создано",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "required": ["productId"], "properties": { "productId": { "type": "string", "format": "uuid" } } }
+              }
+            }
+          },
+          "400": { "description": "`code and name required`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/admin/tariffs": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Список тарифов (всех продуктов)",
+        "security": [{ "adminAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Все тарифы",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["tariffs"],
+                  "properties": { "tariffs": { "type": "array", "items": { "$ref": "#/components/schemas/Tariff" } } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Создать тариф для продукта",
+        "description": "Лимиты лицензии берутся из тарифа: `perServerLimit` попадает в `limits.requestLimit` выданного .lic (null — безлимит, клиент показывает limit = -1).",
+        "security": [{ "adminAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateTariffRequest" },
+              "example": { "productId": "ecf7a396-1cdd-421d-90e3-28f8f3050655", "code": "LIMITED5", "maxServers": 2, "perServerLimit": 5, "globalMonthlyLimit": 10, "allowOfflineActivation": false, "allowGpu": true }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Создано",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "required": ["tariffId"], "properties": { "tariffId": { "type": "string", "format": "uuid" } } }
+              }
+            }
+          },
+          "400": { "description": "`productId, code, maxServers required`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/admin/clients": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Создать клиента (tenant)",
+        "description": "Клиент — владелец лицензий; его `clientId` попадает в .lic. Списка клиентов нет (GET → 405).",
+        "security": [{ "adminAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateClientRequest" },
+              "example": { "externalId": "customer-1" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Создано",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "required": ["clientId"], "properties": { "clientId": { "type": "string", "format": "uuid" } } }
+              }
+            }
+          },
+          "400": { "description": "`externalId required`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/admin/activation-codes": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Выпустить код активации (создать лицензию)",
+        "description": "Создаёт лицензию PENDING + activationCode (CSPRNG) для клиента на продукт по тарифу; лимиты берутся из тарифа. Сырой код возвращается ОДИН РАЗ; в БД хранится только key_hash. Порядок: создать клиента (`/admin/clients`), взять `productId` и `tariffId` из `/admin/products` и `/admin/tariffs`.",
+        "security": [{ "adminAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IssueActivationCodeRequest" },
+              "example": { "clientId": "3ed53d76-5bd8-4e0f-b803-065dff0988a0", "productId": "ecf7a396-1cdd-421d-90e3-28f8f3050655", "tariffId": "b731902c-13d5-4195-9d9c-e043b9cecd39", "maxServers": 5, "termDays": 365 }
             }
           }
         },
@@ -177,6 +307,7 @@
               }
             }
           },
+          "400": { "description": "`clientId, productId, tariffId required`", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
@@ -384,13 +515,64 @@
       },
       "IssueActivationCodeRequest": {
         "type": "object",
-        "required": ["product", "maxServers", "termDays", "tariff"],
+        "required": ["clientId", "productId", "tariffId"],
         "properties": {
-          "product": { "type": "string", "example": "OCR" },
-          "maxServers": { "type": "integer", "description": "купленные слоты" },
-          "termDays": { "type": "integer", "description": "срок в днях (end_date = now + termDays)" },
-          "requestLimit": { "type": "integer", "nullable": true },
-          "tariff": { "type": "string", "example": "BUSINESS" }
+          "clientId": { "type": "string", "format": "uuid", "description": "из /admin/clients" },
+          "productId": { "type": "string", "format": "uuid", "description": "из /admin/products" },
+          "tariffId": { "type": "string", "format": "uuid", "description": "из /admin/tariffs; задаёт лимиты лицензии" },
+          "maxServers": { "type": "integer", "description": "купленные слоты (сколько машин можно активировать)" },
+          "termDays": { "type": "integer", "description": "срок в днях (end_date = now + termDays)" }
+        }
+      },
+      "Product": {
+        "type": "object",
+        "required": ["productId", "code", "name"],
+        "properties": {
+          "productId": { "type": "string", "format": "uuid" },
+          "code": { "type": "string", "example": "LLM", "description": "значение поля product в .lic" },
+          "name": { "type": "string", "example": "LLM" }
+        }
+      },
+      "CreateProductRequest": {
+        "type": "object",
+        "required": ["code", "name"],
+        "properties": {
+          "code": { "type": "string", "example": "LLM" },
+          "name": { "type": "string", "example": "LLM" }
+        }
+      },
+      "Tariff": {
+        "type": "object",
+        "required": ["tariffId", "productId", "code", "maxServers"],
+        "properties": {
+          "tariffId": { "type": "string", "format": "uuid" },
+          "productId": { "type": "string", "format": "uuid" },
+          "code": { "type": "string", "example": "TEST" },
+          "maxServers": { "type": "integer" },
+          "perServerLimit": { "type": "integer", "nullable": true, "description": "запросов на сервер за 30-дневное окно; null — безлимит" },
+          "globalMonthlyLimit": { "type": "integer", "nullable": true, "description": "на все серверы лицензии за месяц; null — безлимит" },
+          "allowOfflineActivation": { "type": "boolean" },
+          "allowGpu": { "type": "boolean" }
+        }
+      },
+      "CreateTariffRequest": {
+        "type": "object",
+        "required": ["productId", "code", "maxServers"],
+        "properties": {
+          "productId": { "type": "string", "format": "uuid" },
+          "code": { "type": "string", "example": "LIMITED5" },
+          "maxServers": { "type": "integer", "example": 2 },
+          "perServerLimit": { "type": "integer", "nullable": true, "example": 5 },
+          "globalMonthlyLimit": { "type": "integer", "nullable": true, "example": 10 },
+          "allowOfflineActivation": { "type": "boolean", "example": false },
+          "allowGpu": { "type": "boolean", "example": true }
+        }
+      },
+      "CreateClientRequest": {
+        "type": "object",
+        "required": ["externalId"],
+        "properties": {
+          "externalId": { "type": "string", "example": "customer-1", "description": "идентификатор клиента во внешней системе" }
         }
       },
       "Error": {

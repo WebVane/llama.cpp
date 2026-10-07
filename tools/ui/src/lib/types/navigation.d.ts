@@ -14,4 +14,6 @@ export interface DesktopIconStripItem {
 	activeRoutePrefix?: string;
 	activeUrlIncludes?: string;
 	keys?: string[];
+	/** Shown only while the admin API probe (GET /admin/status) succeeded */
+	requiresAdmin?: boolean;
 }

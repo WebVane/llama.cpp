@@ -60,6 +60,7 @@ export default defineConfig(({ mode }) => {
 				'Cross-Origin-Opener-Policy': 'same-origin'
 			},
 			proxy: {
+				'/admin': SERVER_ORIGIN,
 				'/cors-proxy': SERVER_ORIGIN,
 				'/license': SERVER_ORIGIN,
 				'/models': SERVER_ORIGIN,

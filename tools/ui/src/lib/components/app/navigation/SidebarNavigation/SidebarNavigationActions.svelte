@@ -12,7 +12,7 @@
 		SIDEBAR_ACTIONS_ITEMS
 	} from '$lib/constants';
 	import { SidebarAction, TooltipSide } from '$lib/enums';
-	import { conversationsStore, deviceStore } from '$lib/stores';
+	import { adminStore, conversationsStore, deviceStore } from '$lib/stores';
 	import type { Component } from 'svelte';
 	import { onMount } from 'svelte';
 	import { circIn } from 'svelte/easing';
@@ -45,6 +45,10 @@
 	let searchInputRef = $state<HTMLInputElement | null>(null);
 
 	const isOnMobile = $derived(deviceStore.isMobile);
+	// the Admin item exists only while the admin API answered the startup probe
+	const items = $derived(
+		SIDEBAR_ACTIONS_ITEMS.filter((item) => !item.requiresAdmin || adminStore.isAvailable)
+	);
 
 	$effect(() => {
 		if (isSearchModeActive && searchInputRef) {
@@ -57,7 +61,7 @@
 
 		setTimeout(() => {
 			initialized = true;
-		}, ICON_STRIP_TRANSITION_DELAY_MULTIPLIER * SIDEBAR_ACTIONS_ITEMS.length);
+		}, ICON_STRIP_TRANSITION_DELAY_MULTIPLIER * items.length);
 	});
 
 	function handleSearchModeDeactivate() {
@@ -107,7 +111,7 @@
 			? 'hidden pointer-events-none'
 			: ''}"
 	>
-		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
+		{#each items as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
 			{@const itemHref = isSearchOnMobile ? ROUTES.SEARCH : item.route}
@@ -164,7 +168,7 @@
 	</div>
 {:else}
 	<div class="{className} flex-col gap-1 hidden md:flex">
-		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
+		{#each items as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
 			{@const itemOnClick =

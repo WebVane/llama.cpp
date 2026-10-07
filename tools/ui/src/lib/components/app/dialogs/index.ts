@@ -534,3 +534,35 @@ export { default as DialogMermaidPreview } from './DialogMermaidPreview.svelte';
  * banner when the server runs as a trial or refuses requests.
  */
 export { default as DialogLicenseActivate } from './DialogLicenseActivate.svelte';
+
+/**
+ * **DialogAdminAddModel** - Add a model from Hugging Face (admin panel)
+ *
+ * Takes `user/repo[:QUANT]`, runs the advisory pre-flight check
+ * (POST /admin/models/download/check: files, total size, free space and
+ * warnings) and starts the download through the public POST /models route.
+ * Warnings never disable the Download button.
+ */
+export { default as DialogAdminAddModel } from './DialogAdminAddModel.svelte';
+
+/**
+ * **DialogAdminModelSettings** - Per-model settings (admin panel, stage 2)
+ *
+ * GPU, context size (shared pool or per request x slots), parallel
+ * requests, GPU layers, flash attention, KV cache precision, micro-batch and
+ * model role of one model, with where each value comes from and the locks.
+ * The fit is checked by llama.cpp on the server after each edit (a rough
+ * estimate stands in meanwhile). Save / Save and load / Save and restart
+ * (with busy slots and "Restart when idle"), restart progress, failure
+ * reason with the output tail and Revert, "Remove custom settings", and
+ * export / import of the settings as a JSON file.
+ */
+export { default as DialogAdminModelSettings } from './DialogAdminModelSettings.svelte';
+
+/**
+ * **DialogAdminModelLog** - Output of a model (admin panel, stage 2)
+ *
+ * The last lines of the current or last instance and the snapshot of the
+ * last failed start with its classified reason (GET /admin/models/log).
+ */
+export { default as DialogAdminModelLog } from './DialogAdminModelLog.svelte';

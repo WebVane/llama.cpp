@@ -1,5 +1,6 @@
 #include "license/RequestCounter.h"
 
+#include "license/DurableWrite.h"
 #include "license/Jcs.h"
 
 #include <nlohmann/json.hpp>
@@ -128,19 +129,10 @@ bool write_ledger(const fs::path& path, const json& entries) {
     const auto tmp = path.parent_path() /
                      (path.filename().string() + ".tmp." +
                       std::to_string(rd()) + "." + std::to_string(rd()));
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out.write(body.data(), static_cast<std::streamsize>(body.size()));
-        if (!out.good()) { out.close(); fs::remove(tmp, ec); return false; }
-    }
-    fs::rename(tmp, path, ec);
-    if (ec) {
-        fs::remove(path, ec);
-        fs::rename(tmp, path, ec);
-        if (ec) { fs::remove(tmp, ec); return false; }
-    }
-    return true;
+    // every byte on disk (write, fsync, size, close checked) before the rename: a full disk leaves the
+    // previous ledger in place instead of an empty file
+    if (!durable_write_file(tmp, body)) return false;
+    return durable_replace(tmp, path);
 }
 
 bool ledger_entry_valid(const json& e) {
@@ -403,20 +395,11 @@ bool RequestCounter::write_atomic() {
                      (path_.filename().string() + ".tmp." +
                       std::to_string(rd()) + "." + std::to_string(rd()));
 
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out.write(body.data(), static_cast<std::streamsize>(body.size()));
-        if (!out.good()) { out.close(); fs::remove(tmp, ec); return false; }
-    }
-
-    fs::rename(tmp, path_, ec);
-    if (ec) {
-        // Windows rename-onto-existing fallback.
-        fs::remove(path_, ec);
-        fs::rename(tmp, path_, ec);
-        if (ec) { fs::remove(tmp, ec); return false; }
-    }
+    // Every byte on disk (write, fsync, size, close checked) BEFORE the rename: on a full disk the write
+    // fails here and the previous counter.dat stays as it was. A short or empty file renamed into place
+    // would read as Tampered at the next start and lock a licensed install for good.
+    if (!durable_write_file(tmp, body)) return false;
+    if (!durable_replace(tmp, path_)) return false;
     ledger_upsert();
     return true;
 }

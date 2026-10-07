@@ -29,6 +29,12 @@ export const CONVERSATION_TABS_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.conversat
 export const USER_OVERRIDES_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.userOverrides`;
 export const DISMISSED_RECOMMENDED_MCP_SERVERS_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.dismissedRecommendedMcpServers`;
 
+/**
+ * Admin key of the admin panel. Kept in sessionStorage; written to localStorage
+ * under the same name only when the user ticks "Remember on this device".
+ */
+export const ADMIN_KEY_STORAGE_KEY = `${STORAGE_APP_NAME}.adminKey`;
+
 /** Key prefix for per-conversation resumable stream state, conversationId is appended */
 export const STREAM_RESUME_LOCALSTORAGE_KEY_PREFIX = `${STORAGE_APP_NAME}.streamResume.`;
 

@@ -54,6 +54,7 @@ struct server_http_req {
     std::string body;
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
     const std::function<bool()> & should_stop;
+    std::string remote_addr = ""; // provision-admin: address of the TCP peer (httplib's req.remote_addr), "" = none (Unix socket)
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);
@@ -89,6 +90,13 @@ struct server_http_context {
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
     void del(const std::string & path, const handler_t & handler) const;
+
+    // provision-admin: a check for ONE POST route (server-admin-upload.cpp) that runs after the route matched and
+    // before its body is read (httplib's pre-request handler): nullptr lets the request go on, a response refuses it
+    // without reading the body; `hold` is kept until the request is done, whether its body was read or not.
+    // Every other route keeps today's behaviour.
+    using pre_body_handler_t = std::function<server_http_res_ptr(const server_http_req & req, std::shared_ptr<void> & hold)>;
+    void set_pre_body_handler(const std::string & path, const pre_body_handler_t & handler) const;
 
     // Register the Google Cloud Platform (Vertex AI) compat (AIP_PREDICT_ROUTE env var, or /predict)
     // Must be called AFTER all other API routes are registered

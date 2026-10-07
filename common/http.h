@@ -40,7 +40,9 @@ static common_http_url common_http_parse_url(const std::string & url) {
     }
 
     auto rest = url.substr(scheme_end + 3);
-    auto at_pos = rest.find('@');
+    // provision-admin: the user info ends at the last '@' of the authority (RFC 3986), never at one in the path or
+    // query: a '@' in a repository file name made the download send its Authorization header to another host
+    auto at_pos = rest.substr(0, rest.find_first_of("/?#")).rfind('@');
 
     if (at_pos != std::string::npos) {
         auto auth = rest.substr(0, at_pos);
