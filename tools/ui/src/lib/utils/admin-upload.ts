@@ -14,6 +14,7 @@
  */
 
 import {
+	ADMIN_MODELS_RW_ROOT,
 	ADMIN_UPLOAD,
 	ADMIN_UPLOAD_DRAFT_PREFIXES,
 	ADMIN_UPLOAD_NAME_MAX,
@@ -463,8 +464,9 @@ export function describeUploadUnavailable(
 
 	switch (reason) {
 		case 'no_models_dir':
+			// in Docker the entrypoint always passes --models-dir, so this means it could not create the folder
 			return {
-				fix: `Docker: mount a writable folder at /models-rw (the entrypoint then creates local/ and passes --models-dir). Host: add --models-dir to PROVISION_LLM_ARGS. ${restart}`,
+				fix: `Docker: the entrypoint could not create ${ADMIN_MODELS_RW_ROOT}/local (a read-only mount?), see the container log. Host: add --models-dir to PROVISION_LLM_ARGS. ${restart}`,
 				text: 'The server has no models directory to upload into.'
 			};
 		case 'models_dir_missing':

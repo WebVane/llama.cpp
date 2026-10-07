@@ -9,9 +9,12 @@
 #   1. docker login nexus.scan-dev.com:6001          # once per host
 #   2. mkdir -p models models-rw/hf models-rw/local  # next to this file
 #      # then drop Qwen2.5-7B-Instruct-Q5_K_M.gguf and
-#      # gte-Qwen2-1.5B-instruct-Q8_0.gguf into ./models.  Create models-rw/*
-#      # yourself (what Docker or the container creates can end up owned by
-#      # root), and copy nginx/default.conf.template along with this file.
+#      # gte-Qwen2-1.5B-instruct-Q8_0.gguf into ./models.  models-rw is the
+#      # ONE place for every model added later (downloads in hf/, uploads and
+#      # dropped-in files in local/): this single mount keeps them across a
+#      # recreate.  Create models-rw/* yourself (what Docker or the container
+#      # creates can end up owned by root), and copy
+#      # nginx/default.conf.template along with this file.
 #   3. docker compose pull                           # fetch the images
 #   4. docker compose up -d
 #   5. curl -fsS http://localhost:8096/v1/models | jq .
@@ -91,7 +94,10 @@
 #        docker compose exec llama-dual cat /var/lib/provision-llm-admin/admin.key
 #
 #   - Models downloaded from the admin panel go to ./models-rw/hf on the
-#     host; a .gguf dropped into ./models-rw/local shows up after "Rescan".
+#     host, uploaded ones to ./models-rw/local; a .gguf dropped into
+#     ./models-rw/local shows up after "Rescan".  Without the /models-rw mount
+#     the server keeps them inside the container and warns (container log and
+#     admin panel) that they are lost when it is recreated.
 #
 # Local dev build (skip Nexus, build from this checkout):
 #   Uncomment the `build:` block below and run `docker compose up -d --build`.
@@ -183,12 +189,21 @@ services:
       - ./models.ini:/config/models.ini:ro
       # License state (.lic, request counter) for TRIAL / licensed images.
       - llama-license-state:/var/lib/provision-llm
-      # Writable model storage, kept on the host so it survives image updates:
+      # Writable model storage: ONE root for every model file the server
+      # writes, so this single mount keeps all of them across a recreate
+      # (down/up, an image update):
       #   hf/     models downloaded from the admin panel (Hugging Face cache)
-      #   local/  drop a .gguf here and press "Rescan" in the admin panel
+      #   local/  models uploaded from the admin panel; drop a .gguf here and
+      #           press "Rescan"
       # Needs a filesystem with enough free space for the models you add.
       # Create both subdirectories on the host before the first start
       # (mkdir -p models-rw/hf models-rw/local), so that you own them.
+      # Without this mount the entrypoint creates /models-rw inside the
+      # container: downloads and uploads still work, but the files are lost
+      # when the container is recreated (a plain restart keeps them).  The
+      # container log and the admin panel warn about it
+      # (models_storage_ephemeral).  Copy them out before a recreate:
+      #   docker compose cp llama-dual:/models-rw/. ./models-rw/
       - "${MODELS_RW_DIR:-./models-rw}:/models-rw"
       # Admin settings (admin-state.json), per-model settings
       # (admin-models.json) and the generated admin key.

@@ -228,7 +228,9 @@
 			<Alert.Root>
 				<TriangleAlert class={ICON_CLASS_DEFAULT} />
 
-				<Alert.Description data-warning={code}>{describeModelWarning(code)}</Alert.Description>
+				<Alert.Description data-warning={code}>
+					{describeModelWarning(code, undefined, adminStore.status)}
+				</Alert.Description>
 			</Alert.Root>
 		{/each}
 

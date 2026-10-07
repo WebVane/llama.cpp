@@ -353,6 +353,8 @@ struct admin_context {
     std::vector<std::pair<std::string, size_t>> registry_backends; // backend registries of the router (name, devices)
     std::vector<std::string> registry_devices;      // device names of the router's non-CPU registries
     admin_access             access;                // PROVISION_ADMIN_ALLOW_FROM / PROVISION_ADMIN_TRUSTED_PROXIES
+    std::string              test_mountinfo;        // PROVISION_ADMIN_TEST_MOUNTINFO (test hook): read in place of /proc/self/mountinfo
+    bool                     in_container = false;  // the process runs in a container (Docker / Podman / Kubernetes); found once at init
 
     // LEAF mutex: guards the snapshot below. It is never held while calling into
     // server_models, because server_models::load_models() reads the snapshot
@@ -649,6 +651,32 @@ static bool admin_read_file(const fs::path & path, std::string & out, size_t max
     const bool ok = std::ferror(f) == 0;
     std::fclose(f);
     return ok;
+}
+
+// Does this process run in a container (Docker / Podman / Kubernetes)? Found once at init (the answer cannot
+// change while the process runs); admin_in_container() below hands it out. Under the mountinfo test hook the
+// process counts as a container, so that the "is this directory kept" checks can be tested on a host.
+static bool admin_detect_container() {
+    if (!admin_ctx().test_mountinfo.empty()) {
+        return true;
+    }
+#if defined(_WIN32)
+    return false;
+#else
+    std::error_code ec;
+    if (fs::exists("/.dockerenv", ec) || fs::exists("/run/.containerenv", ec)) {
+        return true;
+    }
+    std::string cgroup;
+    if (admin_read_file("/proc/1/cgroup", cgroup, 256 * 1024)) {
+        for (const char * w : { "docker", "containerd", "kubepods", "libpod", "lxc" }) {
+            if (cgroup.find(w) != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+#endif
 }
 
 // write + flush to disk, the caller renames the file into place
@@ -3205,6 +3233,10 @@ void server_admin_init(common_params & params) {
     const std::string model_devices = admin_getenv("MODEL_DEVICES"); // only read, stays in the environment
     admin_upload_read_env(); // stage 3: the test-only PROVISION_ADMIN_TEST_* hooks of the upload code
     admin_audit_read_env();  // stage 3 M3: ... and of the audit log
+    // test-only hook: a file read in place of /proc/self/mountinfo, and the process counts as a container; makes the
+    // "is this directory kept" checks of the status, storage and diagnostics routes testable on a host and on Windows
+    ctx.test_mountinfo = admin_strip(admin_getenv("PROVISION_ADMIN_TEST_MOUNTINFO"));
+    ctx.in_container   = admin_detect_container(); // after the hook: it makes the process count as a container
 
     // always, also when the layer is disabled: the key must not reach a child process
     admin_scrub_env();
@@ -4230,6 +4262,191 @@ static std::string admin_cache_dir() {
 }
 
 //
+// where the files are kept: container, mount table, directories that survive a recreate or a reboot
+// (GET /admin/status, /admin/storage, /admin/diagnostics)
+//
+
+// found once at init (admin_detect_container): the status route is polled, and the answer does not change
+static bool admin_in_container() {
+    return admin_ctx().in_container;
+}
+
+// /proc/self/mountinfo writes a blank, tab, newline or backslash in a path as \ooo (octal)
+static std::string admin_mountinfo_unescape(const std::string & s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i + 3 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '3' && s[i + 2] >= '0' && s[i + 2] <= '7' &&
+            s[i + 3] >= '0' && s[i + 3] <= '7') {
+            out += (char) ((s[i + 1] - '0') * 64 + (s[i + 2] - '0') * 8 + (s[i + 3] - '0'));
+            i += 3;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+// In a container: is the directory on a volume or bind mount (kept when the container is recreated)?
+// The mount that holds it is the longest mount point that is a prefix of it (on a path component
+// boundary, the last one listed when several are stacked); the container's own root ("/", the image
+// overlay) and a tmpfs are not kept. From /proc/self/mountinfo (or the file of the test hook).
+static bool admin_mountinfo_on_volume(const std::string & info, const std::string & target) {
+    std::string best;
+    std::string best_type;
+    for (const auto & line : admin_split_lines(info)) {
+        // id parent major:minor root mount-point options [optional fields...] - fstype source super-options
+        const std::vector<std::string> f = string_split<std::string>(line, ' ');
+        if (f.size() < 5) {
+            continue;
+        }
+        const std::string mp = admin_mountinfo_unescape(f[4]);
+        const bool holds = mp == "/" || target == mp ||
+                           (target.size() > mp.size() && target.compare(0, mp.size(), mp) == 0 && target[mp.size()] == '/');
+        if (!holds || mp.size() < best.size()) {
+            continue;
+        }
+        std::string type;
+        for (size_t i = 5; i + 1 < f.size(); i++) {
+            if (f[i] == "-") {
+                type = f[i + 1];
+                break;
+            }
+        }
+        best      = mp;
+        best_type = type;
+    }
+    return !best.empty() && best != "/" && best_type != "tmpfs" && best_type != "ramfs";
+}
+
+static bool admin_on_volume(const fs::path & dir) {
+    const std::string & test_file = admin_ctx().test_mountinfo;
+    std::string info;
+    if (!admin_read_file(test_file.empty() ? fs::path("/proc/self/mountinfo") : admin_path_from_utf8(test_file), info, 4 * 1024 * 1024)) {
+        return false;
+    }
+    std::error_code ec;
+    std::string target = admin_path_to_utf8(fs::weakly_canonical(dir, ec));
+#if defined(_WIN32)
+    std::replace(target.begin(), target.end(), '\\', '/'); // only under the test hook: its file names the mount points as C:/dir
+#endif
+    return admin_mountinfo_on_volume(info, target);
+}
+
+// Does the directory keep its files? In a container when it is on a volume or bind mount (the image layer is
+// lost when the container is recreated); on a host when it is not under /tmp or /var/tmp (cleared at boot on
+// many systems). Windows has no such directory.
+static bool admin_dir_persistent(const fs::path & dir, bool container) {
+    if (container) {
+        return admin_on_volume(dir);
+    }
+#if defined(_WIN32)
+    (void) dir;
+    return true;
+#else
+    // on a path component boundary: /tmp/x and /srv/../tmp/x are temporary, /tmpdata is not
+    const std::string p = admin_path_to_utf8(dir.lexically_normal());
+    for (const char * tmp : { "/tmp", "/var/tmp" }) {
+        if (p == tmp || string_starts_with(p, std::string(tmp) + "/")) {
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
+// the directory that holds dir (a trailing separator does not count), "" when there is none
+static fs::path admin_parent_dir(const fs::path & dir) {
+    std::error_code ec;
+    fs::path p = fs::weakly_canonical(dir, ec);
+    if (ec) {
+        p = dir.lexically_normal();
+    }
+    if (!p.has_filename()) {
+        p = p.parent_path(); // "a/b/" -> "a/b"
+    }
+    const fs::path parent = p.parent_path();
+    return parent == p ? fs::path() : parent;
+}
+
+// the writable model storage: the model cache (downloads of POST /models) and --models-dir (uploads, dropped-in
+// files), and whether each of them is kept
+struct admin_storage_state {
+    bool        container         = false;
+    std::string cache_dir;                    // "" when the cache directory is not known
+    bool        cache_persistent  = true;
+    std::string models_dir;                   // "" without --models-dir
+    bool        models_persistent = true;
+    std::vector<std::string> ephemeral;       // the kinds that are not kept: "cache", "models_dir"
+};
+
+static admin_storage_state admin_storage_check(const common_params & params) {
+    admin_storage_state s;
+    s.container  = admin_in_container();
+    s.cache_dir  = admin_cache_dir();
+    s.models_dir = params.models_dir;
+    if (!s.cache_dir.empty()) {
+        s.cache_persistent = admin_dir_persistent(admin_path_from_utf8(s.cache_dir), s.container);
+        if (!s.cache_persistent) {
+            s.ephemeral.push_back("cache");
+        }
+    }
+    if (!s.models_dir.empty()) {
+        s.models_persistent = admin_dir_persistent(admin_path_from_utf8(s.models_dir), s.container);
+        if (!s.models_persistent) {
+            s.ephemeral.push_back("models_dir");
+        }
+    }
+    return s;
+}
+
+// GET /admin/status: storage
+static json admin_storage_json(const admin_storage_state & s) {
+    return json {
+        {"container",  s.container},
+        {"persistent", s.ephemeral.empty()},
+        {"ephemeral",  s.ephemeral},
+    };
+}
+
+// the hint of the diagnostics item models_storage: the directories that are not kept and what to do
+static std::string admin_storage_hint(const admin_storage_state & s) {
+    if (s.ephemeral.empty()) {
+        return "";
+    }
+    std::vector<std::string> paths;
+    if (!s.cache_persistent) {
+        paths.push_back(s.cache_dir);
+    }
+    if (!s.models_persistent) {
+        paths.push_back(s.models_dir);
+    }
+    const std::string named = admin_join(paths, " and ");
+    if (!s.container) {
+        // the setting(s) of the directories concerned, in the order of the paths
+        std::vector<std::string> settings;
+        if (!s.cache_persistent) {
+            settings.push_back("LLAMA_CACHE");
+        }
+        if (!s.models_persistent) {
+            settings.push_back("--models-dir");
+        }
+        return "a temporary directory: " + named + " - the models may be lost on reboot; point " + admin_join(settings, " and ") +
+               " at a permanent directory";
+    }
+    // one mount keeps both when they are next to each other (Docker: /models-rw/hf and /models-rw/local)
+    std::string root = paths.size() == 1 ? paths[0] : "";
+    if (paths.size() == 2) {
+        const fs::path parent = admin_parent_dir(admin_path_from_utf8(paths[0]));
+        if (!parent.empty() && parent == admin_parent_dir(admin_path_from_utf8(paths[1]))) {
+            root = admin_path_to_utf8(parent);
+        }
+    }
+    return "not a volume: " + named + " - models downloaded or uploaded here are lost when the container is recreated "
+           "(docker compose down/up, an image update), a plain restart keeps them; mount a host directory at " +
+           (root.empty() ? std::string("each of them") : root);
+}
+
+//
 // GET /admin/status
 //
 
@@ -4297,6 +4514,8 @@ static server_http_res_ptr admin_handle_status(admin_context & ctx, const server
     out["features"] = json::array({ "model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete", "audit" });
     out["upload"]   = admin_upload_status_json(); // stage 3: {available, reason, message}
     out["audit"]    = admin_audit_status_json();  // stage 3 M3: {persisted, error, since, in_memory, lost, ...}
+    const admin_storage_state storage = admin_storage_check(params);
+    out["storage"]  = admin_storage_json(storage); // {container, persistent, ephemeral}: are the model cache and --models-dir kept
     std::string default_device;
     {
         std::lock_guard<std::mutex> lk(ctx.mtx_state);
@@ -4316,6 +4535,9 @@ static server_http_res_ptr admin_handle_status(admin_context & ctx, const server
     }
     if (!out["audit"].value("persisted", true)) {
         warnings.push_back("audit_not_persisted"); // the audit log is kept in memory only
+    }
+    if (!storage.ephemeral.empty()) {
+        warnings.push_back("models_storage_ephemeral"); // downloads or uploads go to a directory that is not kept
     }
     out["warnings"] = warnings;
     return admin_res_json(200, out);
@@ -4535,35 +4757,38 @@ static server_http_res_ptr admin_handle_post_settings(admin_context & ctx, const
 // GET /admin/storage
 //
 
-static json admin_dir_json(const std::string & kind, const fs::path & dir) {
+static json admin_dir_json(const std::string & kind, const fs::path & dir, bool container) {
     std::error_code ec;
     const bool exists = fs::is_directory(dir, ec);
     uint64_t total_bytes = 0;
     uint64_t free_bytes  = 0;
     admin_dir_space(dir, total_bytes, free_bytes);
     return json {
-        {"kind",        kind},
-        {"path",        admin_path_to_utf8(dir)},
-        {"exists",      exists},
+        {"kind",             kind},
+        {"path",             admin_path_to_utf8(dir)},
+        {"exists",           exists},
         // a directory that does not exist yet counts as writable when it can be created
-        {"writable",    admin_dir_writable(exists ? dir : admin_nearest_existing(dir))},
-        {"total_bytes", total_bytes},
-        {"free_bytes",  free_bytes},
+        {"writable",         admin_dir_writable(exists ? dir : admin_nearest_existing(dir))},
+        // kept when the container is recreated (a volume or bind mount) / across a reboot (not a temporary directory)
+        {"looks_persistent", admin_dir_persistent(dir, container)},
+        {"total_bytes",      total_bytes},
+        {"free_bytes",       free_bytes},
     };
 }
 
 static server_http_res_ptr admin_handle_storage(admin_context & ctx, const server_http_req &) {
     const common_params & params = ctx.routes->params;
     const std::string cache_dir = admin_cache_dir();
+    const bool container = admin_in_container();
 
     json dirs = json::array();
     if (!cache_dir.empty()) {
-        dirs.push_back(admin_dir_json("cache", admin_path_from_utf8(cache_dir)));
+        dirs.push_back(admin_dir_json("cache", admin_path_from_utf8(cache_dir), container));
     }
     if (!params.models_dir.empty()) {
-        dirs.push_back(admin_dir_json("models_dir", admin_path_from_utf8(params.models_dir)));
+        dirs.push_back(admin_dir_json("models_dir", admin_path_from_utf8(params.models_dir), container));
     }
-    dirs.push_back(admin_dir_json("state", ctx.state_dir));
+    dirs.push_back(admin_dir_json("state", ctx.state_dir, container));
 
     // unfinished downloads left in the cache (a download that is running has one, too)
     json partial = json::array();
@@ -7136,89 +7361,6 @@ static server_http_res_ptr admin_handle_model_log(admin_context & ctx, const ser
 // GET /admin/diagnostics: what this server detected about itself, in plain terms
 //
 
-static bool admin_in_container() {
-#if defined(_WIN32)
-    return false;
-#else
-    std::error_code ec;
-    if (fs::exists("/.dockerenv", ec) || fs::exists("/run/.containerenv", ec)) {
-        return true;
-    }
-    std::string cgroup;
-    if (admin_read_file("/proc/1/cgroup", cgroup, 256 * 1024)) {
-        for (const char * w : { "docker", "containerd", "kubepods", "libpod", "lxc" }) {
-            if (cgroup.find(w) != std::string::npos) {
-                return true;
-            }
-        }
-    }
-    return false;
-#endif
-}
-
-// /proc/self/mountinfo writes a blank, tab, newline or backslash in a path as \ooo (octal)
-static std::string admin_mountinfo_unescape(const std::string & s) {
-    std::string out;
-    for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] == '\\' && i + 3 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '3' && s[i + 2] >= '0' && s[i + 2] <= '7' &&
-            s[i + 3] >= '0' && s[i + 3] <= '7') {
-            out += (char) ((s[i + 1] - '0') * 64 + (s[i + 2] - '0') * 8 + (s[i + 3] - '0'));
-            i += 3;
-        } else {
-            out += s[i];
-        }
-    }
-    return out;
-}
-
-// In a container: is the directory on a volume or bind mount (kept when the container is recreated)?
-// The mount that holds it is the longest mount point that is a prefix of it (on a path component
-// boundary, the last one listed when several are stacked); the container's own root ("/", the image
-// overlay) and a tmpfs are not kept. From /proc/self/mountinfo.
-#if defined(__linux__)
-static bool admin_mountinfo_on_volume(const std::string & info, const std::string & target) {
-    std::string best;
-    std::string best_type;
-    for (const auto & line : admin_split_lines(info)) {
-        // id parent major:minor root mount-point options [optional fields...] - fstype source super-options
-        const std::vector<std::string> f = string_split<std::string>(line, ' ');
-        if (f.size() < 5) {
-            continue;
-        }
-        const std::string mp = admin_mountinfo_unescape(f[4]);
-        const bool holds = mp == "/" || target == mp ||
-                           (target.size() > mp.size() && target.compare(0, mp.size(), mp) == 0 && target[mp.size()] == '/');
-        if (!holds || mp.size() < best.size()) {
-            continue;
-        }
-        std::string type;
-        for (size_t i = 5; i + 1 < f.size(); i++) {
-            if (f[i] == "-") {
-                type = f[i + 1];
-                break;
-            }
-        }
-        best      = mp;
-        best_type = type;
-    }
-    return !best.empty() && best != "/" && best_type != "tmpfs" && best_type != "ramfs";
-}
-#endif
-
-static bool admin_on_volume(const fs::path & dir) {
-#if defined(__linux__)
-    std::string info;
-    if (!admin_read_file("/proc/self/mountinfo", info, 4 * 1024 * 1024)) {
-        return false;
-    }
-    std::error_code ec;
-    return admin_mountinfo_on_volume(info, admin_path_to_utf8(fs::weakly_canonical(dir, ec)));
-#else
-    (void) dir;
-    return false;
-#endif
-}
-
 // The version line of a vendor tool (diagnostics), bounded like a probe: a known version is kept, an
 // unknown one is asked again after a minute; never while the tool's probe hangs or is stuck, and at
 // most one version run per tool at a time (concurrent reports wait for the same one).
@@ -7394,13 +7536,24 @@ static server_http_res_ptr admin_handle_diagnostics(admin_context & ctx, const s
     {
         const bool writable = admin_dir_writable(ctx.state_dir);
         const std::string p = admin_path_to_utf8(ctx.state_dir);
-        const bool tmp = string_starts_with(p, "/tmp") || string_starts_with(p, "/var/tmp");
-        const bool persistent = container ? admin_on_volume(ctx.state_dir) : !tmp;
+        const bool persistent = admin_dir_persistent(ctx.state_dir, container);
         items.push_back(admin_diag_item("state_dir", "Admin state directory", !writable ? "error" : (persistent ? "ok" : "warning"),
             json({ {"path", p}, {"writable", writable}, {"looks_persistent", persistent} }),
             !writable ? "set PROVISION_ADMIN_STATE_DIR to a writable directory" :
             (persistent ? "" : (container ? "not a volume: the settings are lost when the container is recreated"
                                           : "a temporary directory: the settings may be lost on reboot"))));
+    }
+    // the model cache and --models-dir: the same rule as the state directory (status warning models_storage_ephemeral)
+    {
+        const admin_storage_state s = admin_storage_check(ctx.routes->params);
+        const json cache = s.cache_dir.empty()
+            ? json({ {"path", nullptr}, {"looks_persistent", nullptr} })
+            : json({ {"path", s.cache_dir}, {"looks_persistent", s.cache_persistent} });
+        const json models_dir = s.models_dir.empty()
+            ? json({ {"path", nullptr}, {"looks_persistent", nullptr} })
+            : json({ {"path", s.models_dir}, {"looks_persistent", s.models_persistent} });
+        items.push_back(admin_diag_item("models_storage", "Model storage", s.ephemeral.empty() ? "ok" : "warning",
+            json({ {"cache", cache}, {"models_dir", models_dir}, {"container", s.container} }), admin_storage_hint(s)));
     }
     items.push_back(admin_diag_item("admin_key", "Admin key", ctx.key.empty() ? "error" : "ok", ctx.key_source,
         ctx.key.empty() ? "no admin key: set PROVISION_ADMIN_KEY or make the state directory writable" : ""));

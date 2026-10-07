@@ -177,7 +177,11 @@ RUN chmod +x /entrypoint.sh
 # (set MODEL_DEVICES at run time to pin them).  This is a
 # large (~7 GB) layer; with --cache-from it is reused across rebuilds as
 # long as the URLs are unchanged.
-RUN mkdir -p /models && \
+# /models-rw is the one root for every model file the server writes (hf/:
+# downloads, local/: uploads and dropped-in files); the entrypoint creates
+# it as well when it is missing, so the layout exists with or without a
+# mount there (see the VOLUME note below).
+RUN mkdir -p /models /models-rw/hf /models-rw/local && \
     if [ "${TRIAL}" = "1" ]; then \
         echo "*** TRIAL: baking weights into /models ***" && \
         sed -i "/^device[[:space:]]*=/d" /config/models.ini && \
@@ -211,6 +215,13 @@ EXPOSE 8080
 # bind mount (-v ./models:/models, see docker-compose.yml), and the trial
 # image already has the weights baked into /models -- declaring a volume
 # would make every `docker run` copy the ~7 GB into a throwaway anon volume.
+# No VOLUME ["/models-rw"] either: an anonymous volume would hide the models
+# the admin panel downloads and uploads in /var/lib/docker/volumes, silence
+# the "not mounted" warning of the entrypoint and of the panel, and vanish
+# with `docker compose down -v`.  Mount a host directory there instead
+# (-v /srv/llm/models-rw:/models-rw, compose: MODELS_RW_DIR).  Without a
+# mount the entrypoint uses the directory of the writable layer, so downloads
+# and uploads still work, and warns that they are lost on recreate.
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1

@@ -1,12 +1,15 @@
 import { makeFacts, makeRow, SCHEMA } from './admin-fixtures';
+import { ADMIN_STORAGE_EPHEMERAL_WARNING } from '$lib/constants';
 import {
 	AdminContextMode,
 	AdminFailureCode,
 	AdminModelRole,
 	AdminRestartPhase,
 	AdminSettingOrigin,
+	AdminStorageDirKind,
 	ServerModelStatus
 } from '$lib/enums';
+import type { ApiAdminStatus, ApiAdminStorage } from '$lib/types/admin';
 import {
 	buildModelSettingsUpdate,
 	canonicalSettingValue,
@@ -690,6 +693,95 @@ describe('failure and revert', () => {
 		expect(describeModelWarning('model_devices_unknown_section:embd-b')).toBe(
 			'MODEL_DEVICES names "embd-b", which is not a section of models.ini; that entry is ignored, so the model is not locked to a GPU.'
 		);
+	});
+
+	it('words the ephemeral model storage by where the server runs', () => {
+		// the shapes of GET /admin/status `storage` and of GET /admin/storage `dirs[]`
+		const status: ApiAdminStatus = {
+			admin: true,
+			authorized: true,
+			dirs: { cache: '/models-rw/hf', models_dir: '/models-rw/local' },
+			key_configured: true,
+			storage: {
+				container: true,
+				ephemeral: [AdminStorageDirKind.CACHE, AdminStorageDirKind.MODELS_DIR],
+				persistent: false
+			},
+			warnings: [ADMIN_STORAGE_EPHEMERAL_WARNING]
+		};
+		const storage: ApiAdminStorage = {
+			dirs: [
+				{
+					exists: true,
+					free_bytes: 1,
+					kind: AdminStorageDirKind.CACHE,
+					looks_persistent: false,
+					path: '/models-rw/hf',
+					total_bytes: 2,
+					writable: true
+				}
+			],
+			partial_downloads: []
+		};
+
+		expect(ADMIN_STORAGE_EPHEMERAL_WARNING).toBe('models_storage_ephemeral');
+		expect(storage.dirs[0].looks_persistent).toBe(false);
+
+		const container = describeModelWarning(ADMIN_STORAGE_EPHEMERAL_WARNING, undefined, status);
+
+		expect(container).toContain('Model storage is not persistent');
+		expect(container).toContain('inside the container');
+		expect(container).toContain('lost when it is recreated');
+		expect(container).toContain('a plain restart keeps them');
+		expect(container).toContain('/models-rw');
+		expect(container).toContain('MODELS_RW_DIR');
+		expect(container).not.toContain('reboot');
+
+		// a host: only the setting of the directory concerned is named
+		const host = describeModelWarning(ADMIN_STORAGE_EPHEMERAL_WARNING, undefined, {
+			...status,
+			storage: { container: false, ephemeral: [AdminStorageDirKind.CACHE], persistent: false }
+		});
+
+		expect(host).toContain('Model storage is not persistent');
+		expect(host).toContain('temporary directory');
+		expect(host).toContain('lost on reboot');
+		expect(host).toContain('Point LLAMA_CACHE at');
+		expect(host).not.toContain('--models-dir');
+		expect(host).not.toContain('container');
+
+		expect(
+			describeModelWarning(ADMIN_STORAGE_EPHEMERAL_WARNING, undefined, {
+				...status,
+				storage: {
+					container: false,
+					ephemeral: [AdminStorageDirKind.MODELS_DIR],
+					persistent: false
+				}
+			})
+		).toContain('Point --models-dir at');
+		expect(
+			describeModelWarning(ADMIN_STORAGE_EPHEMERAL_WARNING, undefined, {
+				...status,
+				storage: {
+					container: false,
+					ephemeral: [AdminStorageDirKind.CACHE, AdminStorageDirKind.MODELS_DIR],
+					persistent: false
+				}
+			})
+		).toContain('Point --models-dir and LLAMA_CACHE at');
+
+		// no `storage` at all (should not happen): both ways out
+		const unknown = describeModelWarning(ADMIN_STORAGE_EPHEMERAL_WARNING);
+
+		expect(unknown).toContain('/models-rw');
+		expect(unknown).toContain('LLAMA_CACHE');
+
+		// the other codes do not read the status
+		expect(describeModelWarning('default_device_not_present', undefined, status)).toBe(
+			describeModelWarning('default_device_not_present')
+		);
+		expect(describeModelWarning('some_new_code', undefined, status)).toBe('some_new_code');
 	});
 });
 

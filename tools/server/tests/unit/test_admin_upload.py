@@ -542,6 +542,10 @@ def test_upload_status_limits_and_features():
 
     storage = _ok(_call("GET", "/admin/storage"))
     assert storage["uploads"] == []
+    # every directory says whether it is kept across a recreate of the container / a reboot (the rule is tested with
+    # the diagnostics in test_admin_models.py)
+    assert [d["kind"] for d in storage["dirs"]] == ["cache", "models_dir", "state"]
+    assert all(isinstance(d["looks_persistent"], bool) for d in storage["dirs"])
     staging = storage["upload_staging"]
     assert os.path.basename(staging["path"]) == ".provision-upload"
     assert _same_file(os.path.dirname(staging["path"]), models_dir)

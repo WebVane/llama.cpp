@@ -335,8 +335,14 @@ describe('texts', () => {
 			expect(text.fix.length).toBeGreaterThan(10);
 		}
 
-		expect(describeUploadUnavailable('no_models_dir', null).fix).toContain('/models-rw');
-		expect(describeUploadUnavailable('no_models_dir', null).fix).toContain('--models-dir');
+		// the Docker entrypoint always passes --models-dir: without one the folder could not be created
+		const noModelsDir = describeUploadUnavailable('no_models_dir', null).fix;
+
+		expect(noModelsDir).toContain('could not create /models-rw/local');
+		expect(noModelsDir).toContain('container log');
+		expect(noModelsDir).toContain('--models-dir to PROVISION_LLM_ARGS');
+		expect(noModelsDir).toContain('restart the server');
+		expect(noModelsDir).not.toContain('mount a writable folder');
 	});
 
 	it('words every rejection code', () => {

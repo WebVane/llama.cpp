@@ -479,4 +479,57 @@ describe('diagnostics report', () => {
 		expect(text).toContain('page: http://x');
 		expect(summarizeDiagnosticValue(diagnostics.items[1])).toBe('b1');
 	});
+
+	it('shows the model storage item with its paths and marks the ephemeral ones', () => {
+		const item = (value: unknown, status = 'ok') => ({
+			hint: '',
+			id: 'models_storage',
+			label: 'Model storage',
+			status,
+			value
+		});
+		const both = item({
+			cache: { looks_persistent: true, path: '/models-rw/hf' },
+			container: true,
+			models_dir: { looks_persistent: true, path: '/models-rw/local' }
+		});
+		const cacheOnly = item(
+			{
+				cache: { looks_persistent: false, path: '/root/.cache/llama.cpp' },
+				container: true,
+				models_dir: { looks_persistent: true, path: '/models-rw/local' }
+			},
+			'warning'
+		);
+		const noModelsDir = item(
+			{
+				cache: { looks_persistent: false, path: '/tmp/llama-cache' },
+				container: false,
+				models_dir: { looks_persistent: null, path: null }
+			},
+			'warning'
+		);
+
+		expect(summarizeDiagnosticValue(both)).toBe('cache /models-rw/hf; models dir /models-rw/local');
+		expect(summarizeDiagnosticValue(cacheOnly)).toBe(
+			'cache /root/.cache/llama.cpp (not persistent); models dir /models-rw/local'
+		);
+		expect(summarizeDiagnosticValue(noModelsDir)).toBe(
+			'cache /tmp/llama-cache (not persistent); no models dir (--models-dir not set)'
+		);
+
+		// the report keeps the nested value readable and drops the all-null models_dir
+		const report = formatDiagnosticsReport({
+			generated_at: '2026-10-07T10:00:00Z',
+			items: [cacheOnly, noModelsDir]
+		});
+
+		expect(report).toContain(
+			'[WARNING] Model storage: cache: {looks_persistent: no; path: /root/.cache/llama.cpp}; container: yes; models_dir: {looks_persistent: yes; path: /models-rw/local}'
+		);
+		expect(report).toContain(
+			'[WARNING] Model storage: cache: {looks_persistent: no; path: /tmp/llama-cache}; container: no\n'
+		);
+		expect(report).not.toContain('models_dir: {}');
+	});
 });

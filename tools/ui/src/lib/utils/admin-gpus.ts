@@ -240,7 +240,10 @@ export function formatDiagnosticValue(value: unknown): string {
 			if (Array.isArray(inner) && inner.length === 0) continue;
 
 			if (typeof inner === 'object' && !Array.isArray(inner)) {
-				parts.push(`${key}: {${formatDiagnosticValue(inner)}}`);
+				const nested = formatDiagnosticValue(inner);
+
+				// an object of nulls only (models_dir of models_storage without --models-dir) says nothing
+				if (nested !== '') parts.push(`${key}: {${nested}}`);
 			} else if (Array.isArray(inner) && inner.some((item) => typeof item === 'object')) {
 				parts.push(
 					`${key}: [${inner.map((item) => `{${formatDiagnosticValue(item)}}`).join(', ')}]`
@@ -254,6 +257,33 @@ export function formatDiagnosticValue(value: unknown): string {
 	}
 
 	return String(value);
+}
+
+/**
+ * The `models_storage` item: `{cache: {path, looks_persistent}, models_dir:
+ * {path | null, looks_persistent | null}, container}` as "cache <path>;
+ * models dir <path> (not persistent)", the ephemeral ones marked.
+ */
+function summarizeModelStorage(record: Record<string, unknown>): string {
+	const parts: string[] = [];
+
+	for (const [key, label] of [
+		['cache', 'cache'],
+		['models_dir', 'models dir']
+	]) {
+		const dir = record[key] as Record<string, unknown> | null | undefined;
+		const path = typeof dir?.path === 'string' ? dir.path : '';
+
+		if (!path) {
+			if (key === 'models_dir') parts.push('no models dir (--models-dir not set)');
+
+			continue;
+		}
+
+		parts.push(`${label} ${path}${dir?.looks_persistent === false ? ' (not persistent)' : ''}`);
+	}
+
+	return parts.join('; ');
 }
 
 /** One short value for the diagnostics panel (objects summarised, details in the report). */
@@ -289,6 +319,8 @@ export function summarizeDiagnosticValue(item: ApiAdminDiagnosticItem): string {
 		}
 		case 'state_dir':
 			return String(record.path ?? '');
+		case 'models_storage':
+			return summarizeModelStorage(record);
 		case 'model_settings':
 			return `${record.entries ?? 0} saved model${record.entries === 1 ? '' : 's'}${record.read_only ? ', read-only' : ''}`;
 		case 'audit': {

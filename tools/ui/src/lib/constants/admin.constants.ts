@@ -495,6 +495,18 @@ export const ADMIN_GGUF_FILE_TYPES: Record<number, string> = {
 };
 
 /*
+ * Storage root: in Docker every writable model directory lives under one
+ * root (hf/ = the model cache, local/ = the models directory), so one mount
+ * keeps everything across a recreate.
+ */
+
+/** The root the Docker entrypoint creates when nothing is mounted there. */
+export const ADMIN_MODELS_RW_ROOT = '/models-rw';
+
+/** Warning of GET /admin/status: the model cache or the models directory is not persistent. */
+export const ADMIN_STORAGE_EPHEMERAL_WARNING = 'models_storage_ephemeral';
+
+/*
  * Stage 3, milestone M3: the audit log of admin actions (Activity tab).
  */
 

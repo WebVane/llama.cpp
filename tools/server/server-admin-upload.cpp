@@ -2487,7 +2487,8 @@ static void up_open_dirs(up_context & u, bool create_staging) {
     std::string message;
     if (u.models_dir.empty()) {
         reason  = "no_models_dir";
-        message = "this server has no --models-dir: uploads need one (Docker: mount /models-rw; host: add --models-dir to PROVISION_LLM_ARGS), then restart";
+        message = "this server has no --models-dir: uploads need one (Docker: the entrypoint could not create /models-rw/local, see the container log; "
+                  "host: add --models-dir to PROVISION_LLM_ARGS), then restart";
     } else if (!up_dir_open_root(u.models_dir, root, err)) {
         reason  = "models_dir_missing";
         message = "the models directory " + u.models_dir_text + " does not exist or cannot be opened: " + up_errno_text(err);

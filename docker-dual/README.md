@@ -86,9 +86,14 @@ docker compose up -d
 ```bash
 # from the repository root
 docker build -f docker-dual/Dockerfile -t llama-dual .
+# models-rw: where models added at run time (POST /models downloads) are kept.
+# Without this mount they stay inside the container and the log warns that a
+# recreate loses them (section 8).
+mkdir -p models-rw/hf models-rw/local
 docker run -d --name llama-dual --gpus all \
     -p 8080:8080 \
     -v "$(pwd)/models:/models:ro" \
+    -v "$(pwd)/models-rw:/models-rw" \
     llama-dual
 ```
 
@@ -400,10 +405,33 @@ Full description, API reference and upgrade checklist:
   docker compose exec llama-dual cat /var/lib/provision-llm-admin/admin.key
   ```
 
-- Downloaded models are kept on the host in `./models-rw/hf`; a `.gguf` file
-  dropped into `./models-rw/local` appears after a rescan. Create both before
-  the first start (`mkdir -p models-rw/hf models-rw/local`), so that you own
-  them: what Docker or the container creates can end up owned by root.
+- `./models-rw` (compose: `MODELS_RW_DIR`) is the one place for every model
+  added at run time, so this single mount keeps all of them across a recreate:
+  downloaded models in `./models-rw/hf`, uploaded models in
+  `./models-rw/local`, where a `.gguf` file dropped in by hand appears after a
+  rescan as well. Create both before the first start
+  (`mkdir -p models-rw/hf models-rw/local`), so that you own them: what Docker
+  or the container creates can end up owned by root.
+- Without the `/models-rw` mount (plain `docker run`, an older compose file)
+  the panel still works: the entrypoint creates `/models-rw/hf` and
+  `/models-rw/local` inside the container, but those models are lost when the
+  container is recreated (`docker compose down`/`up`, an image update; a plain
+  restart keeps them). The container log says so at start-up
+  (`[entrypoint] WARNING: /models-rw is not mounted from the host`), the Admin
+  page shows the warning on every tab (`models_storage_ephemeral`) and
+  **Diagnostics** lists "Model storage" as a warning. Before such a container
+  is recreated, copy the models out, then start it with the mount:
+
+  ```bash
+  mkdir -p models-rw
+  docker compose cp llama-dual:/models-rw/. ./models-rw/
+  docker compose up -d
+  ```
+
+  A copy made with `sudo` belongs to root; give it back to yourself before the
+  start (`sudo chown -R "$(id -u):$(id -g)" models-rw`), so that you can still
+  drop files into `local/`.
+
 - Models uploaded in the panel (**Add model** -> **Upload GGUF**: one file, a
   split set, with or without its projector; it continues after a dropped
   connection, a reload or a restart) land in `./models-rw/local` as well, and
@@ -412,9 +440,11 @@ Full description, API reference and upgrade checklist:
   cleans it up. The server gives uploaded files the owner and group of
   `./models-rw/local` (it runs as root in the container) and makes them
   group-writable.
-  Without the `/models-rw` mount the panel shows the upload as unavailable. The
-  shipped nginx front door needs no change for uploads; a proxy of your own in
-  front of it may need a larger body limit for `/admin/`, see
+  The panel shows the upload as unavailable only when the server has no
+  writable models directory (the entrypoint could not create
+  `/models-rw/local`, for example on a read-only mount; the tab names the
+  reason). The shipped nginx front door needs no change for uploads; a proxy of
+  your own in front of it may need a larger body limit for `/admin/`, see
   [`docs/provision-admin.md`](../docs/provision-admin.md#169-behind-a-reverse-proxy).
 - Models in `./models-rw/local` (uploaded or dropped in) can be deleted in the
   panel (**Delete files**): only the files the model uses, other files in its
@@ -463,7 +493,7 @@ Full description, API reference and upgrade checklist:
 | `PROVISION_ADMIN_PINNED` | `qwen2.5-chat,gte-qwen2-embed` | Models that are never unloaded to make room, until a list is saved in the panel |
 | `PROVISION_ADMIN_GPU_PROBE` | `auto` | Source of the live GPU memory (`auto` = `nvidia-smi` here, `off` = memory as measured at start-up) |
 | `MODELS_MAX` | `3` | Both shipped models plus one slot for an added model |
-| `MODELS_RW_DIR` | `./models-rw` | Host directory mounted at `/models-rw`: downloads (`hf/`), uploads and dropped-in models (`local/`) |
+| `MODELS_RW_DIR` | `./models-rw` | Host directory mounted at `/models-rw`, the one root for every model added at run time: downloads (`hf/`), uploads and dropped-in models (`local/`). Without the mount they live inside the container and the server warns that a recreate loses them |
 | `NGINX_IMAGE` | `nginx:1.27-alpine` | Image of the front door (use a mirror if Docker Hub is not reachable) |
 | `HF_TOKEN`, `MODEL_ENDPOINT` | *(empty)* | Hugging Face token / mirror endpoint for downloads |
 
@@ -487,10 +517,16 @@ The admin layer is enabled by the compose file, not by the image: a plain
   `ADMIN_ALLOW_RULES`. `docker compose logs nginx` shows the address nginx
   saw (`access forbidden by rule, client: ...`).
 - **The Upload GGUF tab of "Add model" shows a reason instead of the drop
-  zone** &mdash; the server has no writable models directory: `/models-rw` is
-  not mounted (an older compose file), `./models-rw/local` is missing, or it is
-  not writable. The tab names the reason; fix it and run `docker compose up -d`
-  again.
+  zone** &mdash; the server has no writable models directory: the entrypoint
+  could not create `/models-rw/local` (a read-only mount? the container log
+  says), or the directory is not writable for the server. The tab names the
+  reason; fix it and run `docker compose up -d` again.
+- **The Admin page warns "Model storage is not persistent"; the container log
+  says `/models-rw is not mounted from the host`** &mdash; the container runs
+  without the `/models-rw` mount, so downloaded and uploaded models live inside
+  it and are lost when it is recreated. Copy them out and add the mount, see
+  section 8 (`docker compose cp llama-dual:/models-rw/. ./models-rw/`, then
+  `docker compose up -d`).
 - **An upload stops with "The disk is full"** &mdash; the filesystem of
   `./models-rw` is full (it often also holds the admin state volume and the
   Docker images). Free space, then press **Resume**; or **Cancel**, which frees

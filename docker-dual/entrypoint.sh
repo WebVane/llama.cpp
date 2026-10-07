@@ -94,10 +94,12 @@ if [[ -n "${MODEL_DEVICES}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Admin panel support (see docs/provision-admin.md).  Everything below is
-# inert unless docker-compose.yml asks for it (PROVISION_ADMIN=1, the
-# /models-rw mount), and none of it may abort startup: a failure here only
-# costs the optional feature, the preset models must still come up.
+# Admin panel support (see docs/provision-admin.md).  The admin layer itself
+# is switched on by docker-compose.yml (PROVISION_ADMIN=1); the model storage
+# below is always set up, mount or no mount.  None of it may abort startup: a
+# failure here only costs the optional feature, the preset models must still
+# come up (the script runs with set -e, so every command that may fail is
+# guarded).
 # ---------------------------------------------------------------------------
 
 # Optional settings arrive from compose as "${VAR:-}", i.e. set but empty when
@@ -111,17 +113,68 @@ for _var in PROVISION_ADMIN_KEY PROVISION_ADMIN_KEY_FILE PROVISION_ADMIN_STATE_D
 done
 unset _var
 
-# Writable model storage.  docker-compose.yml bind-mounts a host directory at
-# /models-rw; the image itself has no such directory, so with an older compose
-# file this block is skipped and downloads keep going to ~/.cache inside the
-# container, as before.
+# Writable model storage: ONE root, /models-rw, for every model file the
+# server writes, so that a single mount (-v <host dir>:/models-rw, compose
+# MODELS_RW_DIR) keeps all of it when the container is recreated.
 #   /models-rw/hf     Hugging Face cache (LLAMA_CACHE): models downloaded from
 #                     the admin panel / POST /models
-#   /models-rw/local  --models-dir: drop a .gguf file (or a directory with one)
-#                     here, then rescan (GET /v1/models?reload=1)
+#   /models-rw/local  --models-dir: GGUF files uploaded from the admin panel,
+#                     a .gguf file (or a directory with one) dropped in by hand
+#                     (then rescan: GET /v1/models?reload=1), and the
+#                     .provision-upload/ staging folder of unfinished uploads
+# The two stay separate subdirectories: the cache has a layout of its own
+# (per-repository directories read back by the server) and the models
+# directory is scanned for every .gguf in it, so one flat folder would list
+# each downloaded model twice.
+# The root and both subdirectories are created here when they are missing
+# (the image ships them too, see the Dockerfile), so downloads AND uploads
+# work without the mount -- but then the files live in the container's
+# writable layer and are LOST when it is recreated.  That is said here on
+# stderr, and the server says it again in the admin panel (GET /admin/status
+# warning models_storage_ephemeral, Diagnostics "Model storage").
 extra_args=()
 models_rw="/models-rw"
+mountinfo="/proc/self/mountinfo"
+if ! mkdir -p "${models_rw}" 2>/dev/null; then
+    echo "[entrypoint] warning: cannot create ${models_rw}: downloaded models go to ${LLAMA_CACHE:-the default cache inside the container} and the admin panel cannot upload" >&2
+fi
 if [[ -d "${models_rw}" ]]; then
+    # Is the root a mount (bind mount, named volume, NFS, ...) or only a
+    # directory of the image?  Field 5 of /proc/self/mountinfo is the mount
+    # point.  hf/ and local/ mounted separately count as well, like the
+    # server's own per-directory check.  mountpoint(1) is the fallback when
+    # the file cannot be read; "" = unknown, then no warning (the server's
+    # diagnostics report it).
+    rw_mounted=""
+    if [[ -r "${mountinfo}" ]]; then
+        rw_mounted="$(awk -v root="${models_rw}" '
+            $5 == root          { r = 1 }
+            $5 == root "/hf"    { h = 1 }
+            $5 == root "/local" { l = 1 }
+            END { if (r || (h && l)) print 1; else print 0 }
+        ' "${mountinfo}" 2>/dev/null)" || rw_mounted=""
+    fi
+    if [[ -z "${rw_mounted}" ]] && command -v mountpoint >/dev/null 2>&1; then
+        _rc=0
+        mountpoint -q "${models_rw}" 2>/dev/null || _rc=$?
+        # util-linux: 0 = a mount point, 32 = not one, 1 = could not tell
+        # (before util-linux 2.37 also "not one", so 1 stays "unknown" on
+        # purpose: no warning then, the server's diagnostics report it)
+        if [[ "${_rc}" -eq 0 ]]; then
+            rw_mounted=1
+        elif [[ "${_rc}" -eq 32 ]]; then
+            rw_mounted=0
+        fi
+        unset _rc
+    fi
+    if [[ "${rw_mounted}" == "0" ]]; then
+        echo "[entrypoint] WARNING: ${models_rw} is not mounted from the host." >&2
+        echo "[entrypoint]   Models downloaded or uploaded through the admin panel are stored inside the" >&2
+        echo "[entrypoint]   container and are LOST when it is recreated (docker compose down/up, an image" >&2
+        echo "[entrypoint]   update). A plain restart keeps them. Copy them out before a recreate:" >&2
+        echo "[entrypoint]   docker compose cp llama-dual:${models_rw}/. ./models-rw/" >&2
+        echo "[entrypoint]   Mount a host directory: -v /srv/llm/models-rw:${models_rw} (compose: MODELS_RW_DIR)." >&2
+    fi
     if [[ -w "${models_rw}" ]]; then
         # The container runs as root.  A subdirectory created here is handed
         # to the owner of the mounted directory, as if the operator had
@@ -142,18 +195,24 @@ if [[ -d "${models_rw}" ]]; then
         done
         unset _sub rw_owner
     else
-        echo "[entrypoint] warning: ${models_rw} is not writable: downloaded models will not be kept on the host" >&2
+        echo "[entrypoint] warning: ${models_rw} is not writable (a read-only mount?): the server cannot download or upload into it" >&2
     fi
     if [[ -d "${models_rw}/hf" ]]; then
         # An explicit LLAMA_CACHE from the environment wins.
         export LLAMA_CACHE="${LLAMA_CACHE:-${models_rw}/hf}"
+    else
+        echo "[entrypoint] warning: no ${models_rw}/hf: downloaded models go to ${LLAMA_CACHE:-the default cache inside the container}" >&2
     fi
     # The router refuses to start when --models-dir does not exist, so pass
     # it only when the directory is really there.
     if [[ -d "${models_rw}/local" ]]; then
         extra_args+=(--models-dir "${models_rw}/local")
+    else
+        echo "[entrypoint] warning: no ${models_rw}/local: the admin panel cannot upload (no --models-dir)" >&2
     fi
+    unset rw_mounted
 fi
+unset mountinfo
 
 # Startup-preload guard.  The router refuses to start when more sections ask
 # for `load-on-startup` than it may keep loaded ("number of models to load on

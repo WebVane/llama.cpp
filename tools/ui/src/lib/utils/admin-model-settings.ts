@@ -11,10 +11,12 @@ import {
 	ADMIN_DEVICE_NONE,
 	ADMIN_FAILURE_LABELS,
 	ADMIN_MODEL_DEVICES_MAX,
+	ADMIN_MODELS_RW_ROOT,
 	ADMIN_ORIGIN_LABELS,
 	ADMIN_PARALLEL_AUTO_SLOTS,
 	ADMIN_SETTING_KEYS,
-	ADMIN_SETTING_LABELS
+	ADMIN_SETTING_LABELS,
+	ADMIN_STORAGE_EPHEMERAL_WARNING
 } from '$lib/constants';
 import {
 	AdminContextMode,
@@ -23,6 +25,7 @@ import {
 	AdminRestartPhase,
 	AdminSettingKey,
 	AdminSettingOrigin,
+	AdminStorageDirKind,
 	ServerModelStatus
 } from '$lib/enums';
 import type {
@@ -35,7 +38,9 @@ import type {
 	ApiAdminModelSettingsRow,
 	ApiAdminModelSettingsSaveResult,
 	ApiAdminSettingField,
-	ApiAdminSettingSchema
+	ApiAdminSettingSchema,
+	ApiAdminStatus,
+	ApiAdminStatusStorage
 } from '$lib/types/admin';
 
 /** List warning of GET /admin/models/settings, followed by the entry name. */
@@ -867,8 +872,44 @@ export function placementSummary(
 	};
 }
 
-/** Sentence for a warning code of a row, of the draft or of the model list. */
-export function describeModelWarning(code: string, row?: ApiAdminModelSettingsRow): string {
+/**
+ * models_storage_ephemeral: the model cache or the models directory does not
+ * survive a recreate. The way out depends on where the server runs: in a
+ * container the root must be mounted, on a host the directories moved.
+ */
+function describeStorageEphemeral(storage: ApiAdminStatusStorage | null | undefined): string {
+	const what = 'Model storage is not persistent: models downloaded or uploaded here';
+
+	if (storage?.container === true) {
+		return `${what} live inside the container and are lost when it is recreated (docker compose down/up, an image update); a plain restart keeps them. Mount a host folder at ${ADMIN_MODELS_RW_ROOT} (compose: MODELS_RW_DIR), then recreate the container.`;
+	}
+
+	if (storage?.container === false) {
+		// only the setting of each directory concerned (both when `ephemeral` names none, which should not happen)
+		const settings = [
+			storage.ephemeral.includes(AdminStorageDirKind.MODELS_DIR) ? '--models-dir' : '',
+			storage.ephemeral.includes(AdminStorageDirKind.CACHE) ? 'LLAMA_CACHE' : ''
+		].filter(Boolean);
+		const point = settings.length > 0 ? settings.join(' and ') : '--models-dir and LLAMA_CACHE';
+
+		return `${what} are in a temporary directory and may be lost on reboot. Point ${point} at a permanent directory.`;
+	}
+
+	// a status without `storage` (it is only ever sent with the warning): both ways out
+	return `${what} may be lost when the container is recreated or the host reboots. Docker: mount a host folder at ${ADMIN_MODELS_RW_ROOT} (compose: MODELS_RW_DIR). Host: point --models-dir and LLAMA_CACHE at a permanent directory.`;
+}
+
+/**
+ * Sentence for a warning code of a row, of the draft, of the model list or
+ * of the status.
+ * @param status - GET /admin/status, for the codes whose words depend on it
+ * (models_storage_ephemeral: container or host)
+ */
+export function describeModelWarning(
+	code: string,
+	row?: ApiAdminModelSettingsRow,
+	status?: Pick<ApiAdminStatus, 'storage'> | null
+): string {
 	if (code.startsWith(ADMIN_WARNING_UNKNOWN_SECTION)) {
 		const name = code.slice(ADMIN_WARNING_UNKNOWN_SECTION.length);
 
@@ -880,6 +921,8 @@ export function describeModelWarning(code: string, row?: ApiAdminModelSettingsRo
 			return `A saved value could not be applied: ${row?.apply_error || 'see the server log'}.`;
 		case 'audit_not_persisted':
 			return 'The audit log cannot be written to the state directory: new records are kept in memory only and are lost when the server restarts. The Activity tab has the details.';
+		case ADMIN_STORAGE_EPHEMERAL_WARNING:
+			return describeStorageEphemeral(status?.storage);
 		case 'ctx_above_train':
 			return 'The context is larger than the model was trained for (times the slots): quality may drop beyond the trained length.';
 		case 'default_device_not_present':

@@ -161,7 +161,7 @@ All of these can be set in the shell or in a `.env` file next to the compose fil
 | `PROVISION_ADMIN_PINNED` | `qwen2.5-chat,gte-qwen2-embed` | Set it to an empty value to pin nothing. |
 | `PROVISION_ADMIN_GPU_PROBE` | `auto` | See [3.1](#31-server-environment-variables). In the image, `auto` finds the `nvidia-smi` that the NVIDIA Container Toolkit mounts. |
 | `MODELS_MAX` | `3` | The two shipped models plus one slot for a model added later. |
-| `MODELS_RW_DIR` | `./models-rw` | Host directory for downloaded, uploaded and dropped-in models, mounted at `/models-rw`; without it the panel cannot upload. Create `hf/` and `local/` in it yourself before the first start, see [11. Storage](#11-storage). |
+| `MODELS_RW_DIR` | `./models-rw` | Host directory mounted at `/models-rw`: the one root for every model added at run time (downloaded ones in `hf/`, uploaded and dropped-in ones in `local/`), so this single mount keeps all of them across a recreate. Without the mount the panel still downloads and uploads, into the container, and warns that those models are lost when the container is recreated. Create `hf/` and `local/` in it yourself before the first start, see [11. Storage](#11-storage). |
 | `MODEL_DEVICES` | *(empty)* | Per-model GPU override applied by the entrypoint; it wins over `models.ini` and over the panel ([6.3](#63-where-a-value-comes-from)). |
 | `HF_TOKEN` | *(empty)* | Hugging Face token for gated or private repositories. |
 | `MODEL_ENDPOINT` | *(empty)* | Hugging Face endpoint, e.g. an internal mirror. Default `https://huggingface.co/`. |
@@ -190,12 +190,20 @@ MODELS_RW_DIR=/srv/llm/models-rw
 `docker-dual/entrypoint.sh` does these things for the admin layer; none of them can
 abort the start-up:
 
-- When `/models-rw` is mounted it creates `/models-rw/hf` and `/models-rw/local` if they
-  are missing (and gives them the owner of `/models-rw`), exports
-  `LLAMA_CACHE=/models-rw/hf` (unless `LLAMA_CACHE` is already set) and passes
-  `--models-dir /models-rw/local`, which is also where uploads go
-  ([16](#16-uploading-gguf-files)). Without the mount nothing changes, and the panel
-  shows the upload as unavailable.
+- It sets up the writable model storage, mount or no mount: it creates `/models-rw`,
+  `/models-rw/hf` and `/models-rw/local` if they are missing (a subdirectory it creates
+  gets the owner of `/models-rw`), exports `LLAMA_CACHE=/models-rw/hf` (unless
+  `LLAMA_CACHE` is already set) and passes `--models-dir /models-rw/local`, which is
+  also where uploads go ([16](#16-uploading-gguf-files)). When `/models-rw` is not a
+  mount (checked in `/proc/self/mountinfo`; `hf/` and `local/` mounted separately count
+  too) it prints a multi-line `[entrypoint] WARNING: /models-rw is not mounted from the
+  host` on stderr: downloads and uploads work, but the files live in the container and
+  are lost when it is recreated ([11](#11-storage)). When it cannot tell, it stays
+  quiet and leaves the warning to the server's diagnostics. A directory it cannot create
+  (a read-only mount, a read-only root filesystem) only costs that part, with a
+  warning: no `hf/` means the default cache inside the container (or an explicit
+  `LLAMA_CACHE`), no `local/` means no `--models-dir` and the panel shows the upload as
+  unavailable.
 - Empty `PROVISION_ADMIN_KEY`, `PROVISION_ADMIN_KEY_FILE` and `PROVISION_ADMIN_STATE_DIR`
   are removed from the environment.
 - Startup-preload guard. The router refuses to start when more models are marked
@@ -1225,6 +1233,7 @@ what the server found on this machine, each item with a status (`ok`, `warning`,
 | GPU memory matched to devices (`memory_mapping`) | `pci`, `single`, `unknown`, `mixed`, `none` | "some GPUs could not be matched: their memory is shown as measured by the device inventory" |
 | Router without GPU context (`router_gpu_free`) | on a host with NVIDIA: the router's own PID is not among the GPU processes of `nvidia-smi` (in a container it cannot be checked: `info`) | |
 | Admin state directory (`state_dir`) | path, writable, looks persistent (in a container: a mount of its own) | "not a volume: the settings are lost when the container is recreated"; "set PROVISION_ADMIN_STATE_DIR to a writable directory" |
+| Model storage (`models_storage`) | `cache` (the model cache, `LLAMA_CACHE`) and `models_dir` (`--models-dir`; `path` and `looks_persistent` are `null` without one), each with `path` and `looks_persistent`, plus `container`. Persistent means: in a container, on a mount of its own (a bind mount, a named volume, NFS, read from `/proc/self/mountinfo` like `state_dir`); on a host, not under `/tmp` or `/var/tmp`; on Windows, always. `warning` when either is not persistent ([11](#11-storage)) | "not a volume: /models-rw/hf and /models-rw/local - models downloaded or uploaded here are lost when the container is recreated (docker compose down/up, an image update), a plain restart keeps them; mount a host directory at /models-rw" (naming the directories concerned); "a temporary directory: /tmp/x - the models may be lost on reboot; point LLAMA_CACHE at a permanent directory" (naming the setting of each directory concerned: `LLAMA_CACHE`, `--models-dir` or both) |
 | Admin key (`admin_key`) | where it comes from | "no admin key: set PROVISION_ADMIN_KEY or make the state directory writable" |
 | Requests through a reverse proxy (`proxy`) | whether an admin request carried `X-Forwarded-For` | "no X-Forwarded-For seen: requests reach the server directly; lock /admin in the reverse proxy or with PROVISION_ADMIN_ALLOW_FROM for remote use" |
 | Admin address allow-list (`ip_allowlist`) | the built-in allow-list ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)): `enabled`, `entries`, `trusted_proxies`, and for this request `seen_from` (the address the allow-list checks), `peer` (the TCP peer), `via_forwarded_for`, `note` (why a trusted proxy's `X-Forwarded-For` was not used). `info` while it is off | "PROVISION_ADMIN_ALLOW_FROM: '10.64.0.5/24' has host bits set, it is read as 10.64.0.0/24"; "the trusted proxy 10.64.0.1 is also on the allow-list: ..."; "the trusted proxy range 192.168.0.0/16 is wide: every address in it can claim any client address ..."; "the CORS proxy (--ui-mcp-proxy / --agent) is on: ..."; with trusted proxies but no allow-list: "PROVISION_ADMIN_TRUSTED_PROXIES without PROVISION_ADMIN_ALLOW_FROM only affects the client address the audit log records: any address may use /admin" ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)) |
@@ -1245,6 +1254,60 @@ and why something is unknown.
 | `/models-rw/local` | `./models-rw/local` | `/srv/provision-llm/models-rw/local` | models directory: drop files here; uploads from the panel go here too, and `.provision-upload/` in it holds unfinished uploads |
 | `/var/lib/provision-llm-admin` | volume `llama-admin-state` | `/var/lib/provision-llm-admin` | `admin-state.json`, `admin-models.json`, their `.bak` files, `admin.key`, the records of unfinished uploads, the activity log (`admin-audit*.jsonl*`) |
 | `/var/lib/provision-llm` | volume `llama-license-state` | `/var/lib/provision-llm` | license state |
+
+**One root.** Every model file the server writes is under `/models-rw` (host
+installation: `/srv/provision-llm/models-rw`): the model cache `hf/` and the models
+directory `local/`. One root is enough for one mount: `-v <host dir>:/models-rw`
+(compose: `MODELS_RW_DIR`) keeps downloaded, uploaded and dropped-in models alike across
+a recreate (`docker compose down`/`up`, an image update), and on a host one directory is
+enough to back up or to put on a filesystem of its own. The two stay separate
+subdirectories: the cache has a layout of its own (one directory per repository, see
+below, read back by the server), while the models directory is scanned for every
+`.gguf` it contains; in one flat folder each downloaded model would be listed twice.
+
+**Not mounted.** The image ships the empty layout and the entrypoint creates it as well
+([3.3](#33-what-the-entrypoint-does)), so downloads and uploads work without the mount
+too (a plain `docker run`, an older compose file): the files then live in the
+container's writable layer. A plain restart keeps them; a recreate deletes them. The
+server tells you in four places, and the entrypoint in a fifth:
+
+- the container log at start-up: `[entrypoint] WARNING: /models-rw is not mounted from
+  the host.`, followed by what that means and the mount to add;
+- `GET /admin/status` ([12.1](#121-get-adminstatus)): `warnings` carries
+  `models_storage_ephemeral` and `storage.ephemeral` names the parts (`cache`,
+  `models_dir`); the Admin page shows the warning as a banner on every tab;
+- `GET /admin/storage` ([12.4](#124-get-adminstorage)): `looks_persistent` per
+  directory;
+- Diagnostics ([10](#10-diagnostics)): the item "Model storage" (`models_storage`).
+
+The rule is the one of the state directory item: in a container a directory is
+persistent when it is on a mount of its own (a bind mount, a named volume, NFS; read
+from `/proc/self/mountinfo`, so nothing is specific to one host); on a host when it is
+not under `/tmp` or `/var/tmp`; on Windows always. The entrypoint looks at the mount
+point `/models-rw` itself (or `hf/` and `local/` mounted separately); the server checks
+the cache and the models directory one by one, so `storage.ephemeral` can name only one
+of them when, for example, `LLAMA_CACHE` was pointed elsewhere. The image declares no
+`VOLUME` for `/models-rw` on purpose: an anonymous volume would hide the files in
+`/var/lib/docker/volumes`, silence the warning and vanish with `docker compose down -v`.
+
+**Recovering models from a container without the mount.** Copy them out before the
+container is recreated (the container may be running or stopped), then start it with
+the mount; the copy keeps the relative symlinks of the cache and belongs to the user who
+runs the command:
+
+```bash
+cd /path/to/the/stack
+mkdir -p models-rw
+docker compose cp llama-dual:/models-rw/. ./models-rw/
+# MODELS_RW_DIR=./models-rw is the compose default; with another path set it in .env
+docker compose up -d                 # recreates llama-dual with the mount
+```
+
+Plain `docker run`: `docker cp llama-dual:/models-rw/. ./models-rw/`, then run the
+container again with `-v "$(pwd)/models-rw:/models-rw"`. Either way, a copy made with
+`sudo` belongs to root, and the entrypoint leaves existing `hf/` and `local/` alone: give
+the directory back to yourself before the start, so that you can still drop files into
+`local/`: `sudo chown -R "$(id -u):$(id -g)" models-rw`.
 
 **Model cache** (`hf/`). Hugging Face layout, one directory per repository:
 
@@ -1314,7 +1377,8 @@ mkdir -p models-rw/hf models-rw/local
 ```
 
 If they are missing, the entrypoint creates them and gives them the owner of
-`models-rw`, which is root when Docker had to create `models-rw` itself.
+`models-rw`, which is root when Docker had to create `models-rw` itself (and inside the
+container when `/models-rw` is not mounted at all).
 
 Files and folders that the server publishes after an upload, and everything in
 `.provision-upload`, are made group-writable (folders `0770`, files `0660`; folders also
@@ -1491,6 +1555,7 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/status
   "upload": { "available": true, "reason": null, "message": null },
   "audit": { "persisted": true, "error": null, "since": null, "in_memory": 0, "lost": 0, "max_bytes": 4194304, "ring_max": 1000 },
   "dirs": { "cache": "/models-rw/hf", "models_dir": "/models-rw/local", "preset": "/config/models.ini" },
+  "storage": { "container": true, "persistent": true, "ephemeral": [] },
   "license_build": false,
   "ip_allowlist": false,
   "warnings": []
@@ -1519,9 +1584,17 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/status
 - `state.model_settings`: the per-model settings file; `error` says why it could not be
   read, `backup_loaded` that its `.bak` was used instead, `read_only` that saving is
   refused, `entries` how many models have saved settings.
+- `storage`: whether the model storage survives a recreate ([11](#11-storage)).
+  `container`: the server runs in a container; `persistent`: the cache and a set models
+  directory both look persistent; `ephemeral`: the parts that do not (`cache`,
+  `models_dir`), `[]` when all do. The paths are the ones in `dirs`.
 - `warnings`: `default_device_not_present` when "GPU for new models" names a GPU this
   server does not have; `audit_not_persisted` while the activity log is kept in memory
-  only ([18.6](#186-when-the-log-cannot-be-written)).
+  only ([18.6](#186-when-the-log-cannot-be-written)); `models_storage_ephemeral` when
+  the model cache or the models directory is not persistent (`storage.ephemeral` says
+  which): in a container, models downloaded or uploaded there are lost when it is
+  recreated (mount a host directory at `/models-rw`); on a host they are in a temporary
+  directory. The Admin page shows it as a banner on every tab.
 - `ip_allowlist`: the server's own address allow-list is on
   ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)). Only in the answer with
   a valid key; the details are in Diagnostics.
@@ -1602,9 +1675,9 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/storage
 ```json
 {
   "dirs": [
-    { "kind": "cache", "path": "/models-rw/hf", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 },
-    { "kind": "models_dir", "path": "/models-rw/local", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 },
-    { "kind": "state", "path": "/var/lib/provision-llm-admin", "exists": true, "writable": true, "total_bytes": 100000000000, "free_bytes": 60000000000 }
+    { "kind": "cache", "path": "/models-rw/hf", "exists": true, "writable": true, "looks_persistent": true, "total_bytes": 480000000000, "free_bytes": 120000000000 },
+    { "kind": "models_dir", "path": "/models-rw/local", "exists": true, "writable": true, "looks_persistent": true, "total_bytes": 480000000000, "free_bytes": 120000000000 },
+    { "kind": "state", "path": "/var/lib/provision-llm-admin", "exists": true, "writable": true, "looks_persistent": true, "total_bytes": 100000000000, "free_bytes": 60000000000 }
   ],
   "partial_downloads": [ { "path": "/models-rw/hf/models--user--repo/blobs/<hash>.downloadInProgress", "bytes": 123456789 } ],
   "uploads": [ { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "bytes": 1258291200,
@@ -1618,8 +1691,12 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/storage
 }
 ```
 
-`total_bytes` / `free_bytes` describe the filesystem the directory is on. The
-`models_dir` entry is missing when the server runs without `--models-dir`. `uploads`:
+`total_bytes` / `free_bytes` describe the filesystem the directory is on.
+`looks_persistent`: the directory survives a recreate (in a container: it is on a mount
+of its own) or a reboot (on a host: not under `/tmp` or `/var/tmp`), see
+[11](#11-storage); `false` for `cache` or `models_dir` is what `models_storage_ephemeral`
+in `GET /admin/status` reports. The `models_dir` entry is missing when the server runs
+without `--models-dir`. `uploads`:
 the unfinished uploads ([16](#16-uploading-gguf-files)), each as in the list of
 [12.14](#1214-get-adminmodelsupload) (shortened above) plus what it takes on disk
 (`bytes`); `upload_staging`: the folder of the unfinished uploads, what they take
@@ -2049,6 +2126,10 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/diagnostics
     { "id": "vendor_tool", "label": "GPU memory tool", "status": "warning",
       "value": { "mode": "auto", "setting": "auto", "tools": [], "error": "not_found" },
       "hint": "nvidia-smi was not found on PATH; nvidia-smi is not available inside the container: add NVIDIA_DRIVER_CAPABILITIES=compute,utility" },
+    { "id": "models_storage", "label": "Model storage", "status": "warning",
+      "value": { "cache": { "path": "/models-rw/hf", "looks_persistent": false },
+                 "models_dir": { "path": "/models-rw/local", "looks_persistent": false }, "container": true },
+      "hint": "not a volume: /models-rw/hf and /models-rw/local - models downloaded or uploaded here are lost when the container is recreated (docker compose down/up, an image update), a plain restart keeps them; mount a host directory at /models-rw" },
     { "id": "proxy", "label": "Requests through a reverse proxy", "status": "ok", "value": true, "hint": "X-Forwarded-For seen" }
   ]
 }
@@ -2749,7 +2830,10 @@ Owners and modes:
 | `/var/lib/provision-llm` | provision-llm | 0700 | license state and home of the account, created by systemd |
 
 Any other paths work too; change them in the environment file (`LLAMA_CACHE`,
-`PROVISION_LLM_ARGS`) and, for the binary, in the unit. Put the model directories on a
+`PROVISION_LLM_ARGS`) and, for the binary, in the unit. Keep the cache and the models
+directory under one root as here, so that one directory holds every added model
+([11](#11-storage)), and out of `/tmp` and `/var/tmp`: the panel reports a directory
+there as temporary (`models_storage_ephemeral`). Put the model directories on a
 filesystem with room for the models you plan to download or upload. Uploads from the
 panel go into the models directory ([16](#16-uploading-gguf-files)), so it must be
 writable for `provision-llm`. Delete uploaded models in the panel
@@ -2997,7 +3081,9 @@ published directly on port 8096.
 - The host must be able to pull the nginx image. If Docker Hub is not reachable,
   mirror `nginx:1.27-alpine` into your registry and set `NGINX_IMAGE`.
 - Pick the place for added models: `./models-rw` next to the compose file, or another
-  path via `MODELS_RW_DIR`. It needs room for the models you plan to download.
+  path via `MODELS_RW_DIR`. It needs room for the models you plan to download or upload.
+  It is the one mount that keeps them across a recreate; without it the server warns
+  that they are lost with the container ([11](#11-storage)).
 - Decide which addresses may use the admin API (`ADMIN_ALLOW_RULES`).
 - Record the running image ([14.1](#141-every-update-record-the-image-and-back-up-the-admin-state)).
 - The server image must be the one built from the same revision as these files
@@ -3259,9 +3345,20 @@ problems below and what to do.
   dialog falls back to the rough estimate. Saving still works.
 - **The Upload GGUF tab shows a reason instead of the drop zone.** `upload.reason` in
   `GET /admin/status` says why ([16.1](#161-what-can-be-uploaded)): no `--models-dir`
-  (Docker: the `/models-rw` mount; host: `PROVISION_LLM_ARGS`), the directory is missing
+  (Docker: the entrypoint could not create `/models-rw/local`, a read-only mount for
+  example, the container log says; host: `PROVISION_LLM_ARGS`), the directory is missing
   or not writable for the server, `.provision-upload` is a file or a symbolic link, or
   something is mounted over it. Fix it and restart the server.
+- **The Admin page warns "Model storage is not persistent"
+  (`models_storage_ephemeral`), the container log says `/models-rw is not mounted from
+  the host`.** The container runs without the `/models-rw` mount (a plain `docker run`,
+  an older compose file): models downloaded or uploaded through the panel live inside
+  the container and are lost when it is recreated; a plain restart keeps them. Copy them
+  out and add the mount, [11](#11-storage) (**Recovering models from a container without
+  the mount**). On a host the same warning means that `LLAMA_CACHE` or `--models-dir`
+  points under `/tmp` or `/var/tmp`: move them to a permanent directory
+  ([13.2](#132-account-directories-files)) and restart the server. Diagnostics
+  (**Model storage**) names the directory concerned.
 - **The upload says "A proxy limits the request size; the upload uses smaller pieces".**
   A proxy in front of the server refuses large requests (a `413` that is not the
   server's own). It still works, only slower; for full speed add the two nginx lines of
@@ -3350,19 +3447,20 @@ the same dialog on its **Upload GGUF** tab.
   model that is already there, and replacing the files of an existing model. Upload
   under a new name, or delete the old model first ([17](#17-deleting-models-of-the-models-directory)).
 - **Needed**: the server runs with `--models-dir`, and the directory exists and is
-  writable for the server. Docker: the `/models-rw` mount of the shipped compose file;
-  the entrypoint then creates `local/` and passes `--models-dir`
-  ([3.3](#33-what-the-entrypoint-does)). Host: `--models-dir` in `PROVISION_LLM_ARGS`
-  ([13.4](#134-settings)). A models directory cannot be added while the server runs:
-  restart it after the change. Uploads never go into the model cache (`LLAMA_CACHE`) or
-  into the read-only `/models`.
+  writable for the server. Docker: the entrypoint creates `/models-rw/local` and passes
+  `--models-dir` whether or not `/models-rw` is mounted
+  ([3.3](#33-what-the-entrypoint-does)); without the mount the uploaded files live in
+  the container and the panel warns that a recreate loses them ([11](#11-storage)).
+  Host: `--models-dir` in `PROVISION_LLM_ARGS` ([13.4](#134-settings)). A models
+  directory cannot be added while the server runs: restart it after the change. Uploads
+  never go into the model cache (`LLAMA_CACHE`) or into the read-only `/models`.
 
 When uploads are not possible, the **Upload GGUF** tab shows the reason and the fix
 instead of the drop zone (`upload` in `GET /admin/status`, [12.1](#121-get-adminstatus)):
 
 | `reason` | Meaning | Fix |
 |---|---|---|
-| `no_models_dir` | the server runs without `--models-dir` | Docker: mount `/models-rw` (the shipped compose file does). Host: add `--models-dir /srv/provision-llm/models-rw/local` to `PROVISION_LLM_ARGS`. Then restart the server |
+| `no_models_dir` | the server runs without `--models-dir` | Docker: the entrypoint could not create `/models-rw/local` (a read-only mount?), see the container log. Host: add `--models-dir /srv/provision-llm/models-rw/local` to `PROVISION_LLM_ARGS`. Then restart the server |
 | `models_dir_missing` | the directory named by `--models-dir` does not exist | create it ([13.2](#132-account-directories-files)), restart |
 | `not_writable` | the server cannot write into it | owner and mode, see [11](#11-storage) and [13.2](#132-account-directories-files) |
 | `staging_unusable` | `.provision-upload` in the models directory is a file or a symbolic link, or cannot be created | remove it; the server creates the folder itself |

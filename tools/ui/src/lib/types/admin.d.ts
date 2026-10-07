@@ -43,12 +43,29 @@ export interface ApiAdminStatus {
 	license_build?: boolean;
 	/** Stage-2 parts this server has (see AdminFeature); absent on an older server */
 	features?: string[];
-	/** e.g. `default_device_not_present` */
+	/** e.g. `default_device_not_present`, `models_storage_ephemeral` */
 	warnings?: string[];
 	/** Stage 3: whether GGUF files can be uploaded into the models directory */
 	upload?: { available: boolean; reason: string | null; message: string | null };
 	/** Stage 3 M3: whether the audit log is written to the state directory (warning audit_not_persisted) */
 	audit?: ApiAdminAuditStatus;
+	/** Whether the writable model directories survive a recreate (warning models_storage_ephemeral); absent on an older server */
+	storage?: ApiAdminStatusStorage;
+}
+
+/**
+ * `storage` of GET /admin/status: the model cache (LLAMA_CACHE) and the
+ * models directory (--models-dir) checked for persistence. In a container a
+ * directory is persistent when it is a mount of its own; on a host when it
+ * is not under a temporary directory.
+ */
+export interface ApiAdminStatusStorage {
+	/** The server runs in a container (the warning then asks for a mount at /models-rw) */
+	container: boolean;
+	/** Every checked directory is persistent */
+	persistent: boolean;
+	/** The kinds that are not: `cache` and / or `models_dir` ([] when all are; the state directory is not part of it) */
+	ephemeral: Exclude<AdminStorageDirKind, AdminStorageDirKind.STATE>[];
 }
 
 /** `state.model_settings` of GET /admin/status: the per-model settings file. */
@@ -110,6 +127,8 @@ export interface ApiAdminStorageDir {
 	writable: boolean;
 	total_bytes: number;
 	free_bytes: number;
+	/** The directory survives a recreate / reboot (same rule as status `storage`); absent on an older server */
+	looks_persistent?: boolean;
 }
 
 export interface ApiAdminPartialDownload {

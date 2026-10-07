@@ -20,6 +20,7 @@ import struct
 import sys
 import threading
 import urllib.parse
+from pathlib import Path
 
 import pytest
 from utils import *
@@ -42,7 +43,7 @@ SETTING_KEYS = [
 FEATURES = ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete", "audit"]  # stage 3: upload, delete, audit
 DIAGNOSTIC_ITEMS = [
     "deployment", "binary", "gpu_backend", "inventory", "vendor_tool", "memory_mapping", "router_gpu_free", "state_dir",
-    "admin_key", "proxy", "ip_allowlist", "model_devices", "model_settings", "audit",
+    "models_storage", "admin_key", "proxy", "ip_allowlist", "model_devices", "model_settings", "audit",
 ]
 MODELS_FILE = "admin-models.json"
 
@@ -289,6 +290,33 @@ def _diagnostics(headers: dict | None = None) -> dict:
     body = _admin_get("/admin/diagnostics", headers=headers)
     assert [i["id"] for i in body["items"]] == DIAGNOSTIC_ITEMS
     return {i["id"]: i for i in body["items"]}
+
+
+def _warnings_but_storage(status: dict) -> list:
+    """the warnings of GET /admin/status without models_storage_ephemeral, which depends on where the directories of
+    the test are (under /tmp on a Linux host); test_diagnostics_report checks that rule. The code and `storage`
+    must agree, though"""
+    assert ("models_storage_ephemeral" in status["warnings"]) == (not status["storage"]["persistent"])
+    return [w for w in status["warnings"] if w != "models_storage_ephemeral"]
+
+
+def _mountinfo(*mounts: str) -> str:
+    """the /proc/self/mountinfo of a container, for the test hook PROVISION_ADMIN_TEST_MOUNTINFO: the root is the
+    image overlay and every directory of `mounts` is a bind mount of its own (docker -v); the mount points as the
+    kernel writes them (blanks escaped), on Windows with forward slashes"""
+    def mount_point(path: str) -> str:
+        p = Path(path).resolve().as_posix() if os.name == "nt" else os.path.realpath(path)
+        return p.replace(" ", "\\040")
+    lines = ["25 20 0:22 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A:/var/lib/docker/overlay2/l/B"]
+    lines += [f"{100 + i} 25 8:1 /srv/llm/{i} {mount_point(m)} rw,relatime - ext4 /dev/sda1 rw" for i, m in enumerate(mounts)]
+    return _fixture_file("mountinfo.txt", "\n".join(lines) + "\n")
+
+
+def _private_cache(tmp_path_factory) -> str:
+    """an empty model cache for this test alone (the server reads LLAMA_CACHE); not below tmp_path, see test_admin.py"""
+    cache = str(tmp_path_factory.mktemp("cache"))
+    stage1.env.setenv("LLAMA_CACHE", cache)
+    return cache
 
 
 def _models_file() -> dict:
@@ -574,7 +602,7 @@ def test_models_status_and_settings_report_stage2_fields():
 
     status = stage1._admin_status()
     assert status["features"] == FEATURES
-    assert status["warnings"] == []
+    assert _warnings_but_storage(status) == []
     model_settings = status["state"]["model_settings"]
     assert stage1._same_path(model_settings["file"], os.path.join(state_dir, MODELS_FILE))
     assert model_settings["error"] == ""
@@ -764,7 +792,7 @@ def test_models_default_device_not_present():
 
     stage1._post_settings({"default_device": "CUDA1"})
     assert _flag("tinyA", "--device") == "CUDA1"
-    assert stage1._admin_status()["warnings"] == []
+    assert _warnings_but_storage(stage1._admin_status()) == []
 
 
 #
@@ -2563,6 +2591,26 @@ def test_diagnostics_report():
     assert stage1._same_path(state["path"], state_dir) and state["writable"] is True
     if not container:
         assert state["looks_persistent"] == (not state["path"].startswith(("/tmp", "/var/tmp")))
+    # the model cache and --models-dir follow the same rule, and /admin/storage says the same per directory
+    storage = items["models_storage"]
+    value = storage["value"]
+    assert stage1._same_path(value["cache"]["path"], SHARED_CACHE_DIR)
+    assert stage1._same_path(value["models_dir"]["path"], server.models_dir)
+    dirs = {d["kind"]: d for d in _admin_get("/admin/storage")["dirs"]}
+    for kind in ("cache", "models_dir"):
+        assert isinstance(value[kind]["looks_persistent"], bool)
+        assert dirs[kind]["looks_persistent"] == value[kind]["looks_persistent"]
+    assert dirs["state"]["looks_persistent"] == state["looks_persistent"]
+    if not container:
+        assert value["container"] is False
+        for kind in ("cache", "models_dir"):
+            assert value[kind]["looks_persistent"] == (not value[kind]["path"].startswith(("/tmp", "/var/tmp")))
+        ephemeral = [kind for kind in ("cache", "models_dir") if not value[kind]["looks_persistent"]]
+        assert storage["status"] == ("warning" if ephemeral else "ok")
+        assert storage["hint"].startswith("a temporary directory: ") == bool(ephemeral)
+        status = stage1._admin_status()
+        assert status["storage"] == {"container": False, "persistent": not ephemeral, "ephemeral": ephemeral}
+        assert ("models_storage_ephemeral" in status["warnings"]) == bool(ephemeral)
     assert items["admin_key"]["status"] == "ok" and items["admin_key"]["value"] == "env"
     assert items["proxy"]["status"] == "info" and items["proxy"]["value"] is False
     assert items["model_devices"]["value"] is None and items["model_devices"]["hint"] == "not set"
@@ -2594,6 +2642,89 @@ def test_diagnostics_with_canned_devices_and_tools():
     assert vendor["value"]["tools"][0]["version"].startswith("canned output")
     assert items["memory_mapping"]["status"] == "ok" and items["memory_mapping"]["value"] == "pci"
     assert items["model_devices"]["value"] == "*=CUDA0"
+
+
+def test_diagnostics_models_storage_in_a_container_without_a_cache_mount(tmp_path_factory):
+    """the mount table of a container (test hook): --models-dir is a bind mount of its own, the model cache and the
+    state directory are in the image layer and are lost with the container"""
+    global server
+    cache = _private_cache(tmp_path_factory)
+    _setup()
+    _enable(PROVISION_ADMIN_GPU_PROBE="off", PROVISION_ADMIN_TEST_MOUNTINFO=_mountinfo(server.models_dir))
+    server.start()
+
+    status = stage1._admin_status()
+    assert status["warnings"] == ["models_storage_ephemeral"]
+    assert status["storage"] == {"container": True, "persistent": False, "ephemeral": ["cache"]}
+    items = _diagnostics()
+    assert items["deployment"]["value"] == "container"
+    item = items["models_storage"]
+    assert item["status"] == "warning"
+    value = item["value"]
+    assert value["container"] is True
+    assert stage1._same_path(value["cache"]["path"], cache) and value["cache"]["looks_persistent"] is False
+    assert stage1._same_path(value["models_dir"]["path"], server.models_dir) and value["models_dir"]["looks_persistent"] is True
+    # the hint names the directory that is lost, and that is the one to mount
+    assert item["hint"].startswith("not a volume: " + value["cache"]["path"] + " ") and "recreated" in item["hint"]
+    assert item["hint"].endswith("mount a host directory at " + value["cache"]["path"])
+    state = items["state_dir"]
+    assert state["status"] == "warning" and state["value"]["looks_persistent"] is False and state["hint"].startswith("not a volume")
+    dirs = {d["kind"]: d["looks_persistent"] for d in _admin_get("/admin/storage")["dirs"]}
+    assert dirs == {"cache": False, "models_dir": True, "state": False}
+
+
+def test_diagnostics_models_storage_in_a_container_on_mounts(tmp_path_factory):
+    """the model cache, --models-dir and the state directory are mounts of their own: nothing to warn about"""
+    global server
+    cache = _private_cache(tmp_path_factory)
+    _setup()
+    _enable(PROVISION_ADMIN_GPU_PROBE="off", PROVISION_ADMIN_TEST_MOUNTINFO=_mountinfo(cache, server.models_dir, state_dir))
+    server.start()
+
+    status = stage1._admin_status()
+    assert status["warnings"] == []
+    assert status["storage"] == {"container": True, "persistent": True, "ephemeral": []}
+    items = _diagnostics()
+    item = items["models_storage"]
+    assert item["status"] == "ok" and item["hint"] == ""
+    assert item["value"]["cache"]["looks_persistent"] is True and item["value"]["models_dir"]["looks_persistent"] is True
+    assert items["state_dir"]["status"] == "ok" and items["state_dir"]["value"]["looks_persistent"] is True
+    assert all(d["looks_persistent"] is True for d in _admin_get("/admin/storage")["dirs"])
+
+
+def test_diagnostics_models_storage_one_root_hint():
+    """nothing is mounted and the two directories are next to each other (Docker: /models-rw/hf and /models-rw/local):
+    the hint names their common parent, the one directory to mount"""
+    global server
+    root = work_dir / "models-rw"
+    cache = root / "hf"
+    cache.mkdir(parents=True)
+    stage1.env.setenv("LLAMA_CACHE", str(cache))
+    server.models_dir = stage1._make_models_dir(root, "tinyA", "tinyB")  # <root>/models
+    _setup()
+    _enable(PROVISION_ADMIN_GPU_PROBE="off", PROVISION_ADMIN_TEST_MOUNTINFO=_mountinfo())
+    server.start()
+
+    status = stage1._admin_status()
+    assert status["warnings"] == ["models_storage_ephemeral"]
+    assert status["storage"] == {"container": True, "persistent": False, "ephemeral": ["cache", "models_dir"]}
+    item = _diagnostics()["models_storage"]
+    assert item["status"] == "warning"
+    assert item["hint"].startswith(f"not a volume: {item['value']['cache']['path']} and {item['value']['models_dir']['path']} ")
+    assert os.path.normcase(item["hint"]).endswith("mount a host directory at " + os.path.normcase(str(root)))
+
+
+def test_diagnostics_models_storage_without_models_dir():
+    """no --models-dir: the item says so, nothing of it is ephemeral"""
+    global server
+    _setup(models_dir=())
+    _enable(PROVISION_ADMIN_GPU_PROBE="off")
+    server.start()
+
+    value = _diagnostics()["models_storage"]["value"]
+    assert value["models_dir"] == {"path": None, "looks_persistent": None}
+    assert stage1._same_path(value["cache"]["path"], SHARED_CACHE_DIR)
+    assert "models_dir" not in stage1._admin_status()["storage"]["ephemeral"]
 
 
 #
