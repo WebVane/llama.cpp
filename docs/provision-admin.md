@@ -2,9 +2,9 @@
 
 This document describes the admin layer of `provision-server` in router mode: what it
 does, how it is switched on, how it is locked down, the per-model settings and the GPU
-memory view, uploading and deleting model files, the HTTP API, where the data lives, and
-how to run and upgrade it, both with the `docker-dual/` Docker deployment and directly
-on a Linux host.
+memory view, uploading and deleting model files, the activity log of admin actions, the
+HTTP API, where the data lives, and how to run and upgrade it, both with the
+`docker-dual/` Docker deployment and directly on a Linux host.
 
 - [1. What it is](#1-what-it-is)
 - [2. What stays public, by design](#2-what-stays-public-by-design)
@@ -23,6 +23,7 @@ on a Linux host.
 - [15. Troubleshooting](#15-troubleshooting)
 - [16. Uploading GGUF files](#16-uploading-gguf-files)
 - [17. Deleting models of the models directory](#17-deleting-models-of-the-models-directory)
+- [18. Activity log](#18-activity-log)
 
 ## 1. What it is
 
@@ -45,6 +46,7 @@ The admin layer adds an API under `/admin` and an **Admin** page to the web UI
 | Why a model did not start: a reason and the last lines of its output | Models tab, failed row; `GET /admin/models/log`, see [9](#9-when-a-model-fails-to-start) |
 | Export one model's settings to a file and import them (on this or another server) | the Settings dialog, see [6.8](#68-export-and-import) |
 | What the server found on this machine (Docker or host, GPU backends, GPUs, memory source, state directory, proxy), with a hint for every problem | Settings tab, **Diagnostics**; `GET /admin/diagnostics`, see [10](#10-diagnostics) |
+| What was done through the admin API, from which address, and which admin requests were refused; what the server did by itself; what it saw of the public model routes (finished downloads, removed models, failed starts) | **Activity** tab; `GET /admin/audit`, see [18](#18-activity-log) |
 
 The layer exists only in the **router** process (the one started with `--models-preset`
 / `--models-dir`, i.e. without a model of its own) and only when it is enabled with
@@ -100,7 +102,8 @@ not stop a user of the API from loading, unloading or downloading models, or fro
 deleting downloaded ones (`DELETE /models` deletes only models of the model cache, as
 before). If that matters in your environment, restrict who can reach the API at all
 (network, or the server's `--api-key` / `LLAMA_API_KEY`, which then applies to `/admin`
-as well).
+as well). The activity log cannot say who used these routes either; it records only some
+of their effects, as "public API (unknown)" ([18.4](#184-what-cannot-be-recorded)).
 
 `GET /v1/models` shows the effective arguments of every model (`status.args`,
 `status.preset`), so the values of per-model settings are visible there without a key.
@@ -125,7 +128,7 @@ processes never see them).
 | `PROVISION_ADMIN_GPU_PROBE` | Where the live GPU memory comes from, see [7.2](#72-live-memory). `auto` (default): for every GPU vendor the inventory found, its tool from `PATH` (`nvidia-smi`; `amd-smi`, else `rocm-smi`, both also from `$ROCM_PATH/bin` and `/opt/rocm/bin`). `off`: no vendor tool. `nvidia-smi:<path>`, `amd-smi:<path>`, `rocm-smi:<path>`, or just an absolute path (the tool is told by its file name): that tool at that path. `file:<path>`: recorded tool output for tests (the first line names the format). |
 | `PROVISION_ADMIN_INVENTORY` | The GPU inventory at start-up, see [7.1](#71-which-gpus-the-server-has). `auto` (default): run it. `off`: skip it (GPU names only, no PCI ids, no start-up memory). `file:<path>`: a recorded result, for tests. |
 | `PROVISION_ADMIN_ALLOW_FROM` | The server's own address allow-list for every `/admin` route, for hosts without nginx, see [4.3](#43-built-in-address-allow-list-hosts-without-nginx). IPv4 / IPv6 addresses and CIDR ranges, separated by commas or blanks, e.g. `10.64.0.0/24, 127.0.0.1, ::1`. Unset or empty (default): off, any address may use `/admin` (with the admin key). An entry that cannot be read locks `/admin` for everybody. |
-| `PROVISION_ADMIN_TRUSTED_PROXIES` | Addresses / ranges of reverse proxies in front of the server. Only for a request from one of them is `X-Forwarded-For` used to find the client address for the allow-list; unset (default): `X-Forwarded-For` is ignored. Every listed address can claim any client address, so list only the proxies themselves. No effect without `PROVISION_ADMIN_ALLOW_FROM`. |
+| `PROVISION_ADMIN_TRUSTED_PROXIES` | Addresses / ranges of reverse proxies in front of the server. Only for a request from one of them is `X-Forwarded-For` used to find the client address, for the allow-list and for the activity log ([18.2](#182-who-addresses-and-proxies)); unset (default): `X-Forwarded-For` is ignored (the activity log keeps it as unverified). Every listed address can claim any client address, so list only the proxies themselves. Without `PROVISION_ADMIN_ALLOW_FROM` it changes only which address the activity log records, not who may use `/admin`. |
 
 `MODEL_DEVICES` (the variable of the Docker entrypoint) is only read, never removed. It
 is an extra lock source when it is present ([6.4](#64-locked-fields)); on a host without
@@ -140,7 +143,8 @@ internal environment variables that the server sets itself; do not set any other
 
 Uploading and deleting model files have no setting of their own: they need only a
 models directory (`--models-dir`) that the server can write to, see
-[16.1](#161-what-can-be-uploaded).
+[16.1](#161-what-can-be-uploaded). Nor does the activity log: it is written into the
+admin state directory ([18.5](#185-storage-rotation-and-retention)).
 
 ### 3.2 `docker-dual/docker-compose.yml`
 
@@ -425,7 +429,7 @@ allow-list is checked first, then the key.
 | Variable | Meaning |
 |---|---|
 | `PROVISION_ADMIN_ALLOW_FROM` | IPv4 and IPv6 addresses and CIDR ranges, separated by commas and / or blanks: `10.64.0.0/24, 127.0.0.1, ::1, fd00::/8`. Unset or empty: off. |
-| `PROVISION_ADMIN_TRUSTED_PROXIES` | Addresses and ranges of reverse proxies whose `X-Forwarded-For` the server believes (see below). Unset: `X-Forwarded-For` is ignored. |
+| `PROVISION_ADMIN_TRUSTED_PROXIES` | Addresses and ranges of reverse proxies whose `X-Forwarded-For` the server believes (see below), for the allow-list and for the activity log. Unset: `X-Forwarded-For` is ignored. |
 
 Both are read once when the router starts (restart the server after a change) and are
 removed from the environment like every `PROVISION_ADMIN_*` variable: the model
@@ -444,7 +448,9 @@ What the allow-list does:
 
   The server log has one warning per refused request (without the key or any other
   header): `admin: refused /admin/settings from 10.64.1.7: not on PROVISION_ADMIN_ALLOW_FROM`.
-  The web UI hides the Admin item ([4.4](#44-the-admin-item-in-the-web-ui)).
+  The activity log records the refusals too, merged per address and path
+  ([18.3](#183-refused-requests)). The web UI hides the Admin item
+  ([4.4](#44-the-admin-item-in-the-web-ui)).
 - Addresses are compared as numbers, not as text: `2001:DB8:0:0::1` is `2001:db8::1`, and
   an IPv4 client that a dual-stack listener (`--host ::`) reports as `::ffff:10.64.0.7`
   matches the IPv4 entries (`10.64.0.0/24`). An entry with host bits set
@@ -480,9 +486,9 @@ server reads `X-Forwarded-For` from the right: every proxy appends the address i
 the request from, so the entries on the right are written by your proxies and whatever
 a client wrote itself is further left. The first entry from the right that is not a
 trusted proxy is the client; entries left of it are never looked at. When every entry
-is a trusted proxy, the leftmost one counts. When the header is missing, sent twice, or
-the entry that decides is not an address, the request counts as coming from the proxy
-itself.
+is a trusted proxy, the leftmost one counts. When the header is missing, sent in more
+than one header line (in any spelling of its name), or the entry that decides is not an
+address, the request counts as coming from the proxy itself.
 
 Example: nginx on the same host (it sends `X-Forwarded-For $proxy_add_x_forwarded_for`),
 the server on `127.0.0.1`:
@@ -515,8 +521,13 @@ PROVISION_ADMIN_TRUSTED_PROXIES=127.0.0.1
   proxy may use `/admin`: a request it forwards without a usable `X-Forwarded-For`
   counts as coming from the proxy and is then allowed. The server warns about such an
   overlap at startup and in Diagnostics.
-- `PROVISION_ADMIN_TRUSTED_PROXIES` without `PROVISION_ADMIN_ALLOW_FROM` has no effect
-  (a warning at startup and in Diagnostics).
+- `PROVISION_ADMIN_TRUSTED_PROXIES` without `PROVISION_ADMIN_ALLOW_FROM` does not restrict
+  anything: any address may use `/admin`. It then only decides which client address the
+  activity log records as verified ([18.2](#182-who-addresses-and-proxies)). The server
+  says so at startup and in Diagnostics ("PROVISION_ADMIN_TRUSTED_PROXIES without
+  PROVISION_ADMIN_ALLOW_FROM only affects the client address the audit log records: any
+  address may use /admin"). That is the way to get verified addresses in the log behind a
+  proxy that keeps the access rule itself, such as the nginx of the Docker deployment.
 
 Examples:
 
@@ -1216,9 +1227,10 @@ what the server found on this machine, each item with a status (`ok`, `warning`,
 | Admin state directory (`state_dir`) | path, writable, looks persistent (in a container: a mount of its own) | "not a volume: the settings are lost when the container is recreated"; "set PROVISION_ADMIN_STATE_DIR to a writable directory" |
 | Admin key (`admin_key`) | where it comes from | "no admin key: set PROVISION_ADMIN_KEY or make the state directory writable" |
 | Requests through a reverse proxy (`proxy`) | whether an admin request carried `X-Forwarded-For` | "no X-Forwarded-For seen: requests reach the server directly; lock /admin in the reverse proxy or with PROVISION_ADMIN_ALLOW_FROM for remote use" |
-| Admin address allow-list (`ip_allowlist`) | the built-in allow-list ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)): `enabled`, `entries`, `trusted_proxies`, and for this request `seen_from` (the address the allow-list checks), `peer` (the TCP peer), `via_forwarded_for`, `note` (why a trusted proxy's `X-Forwarded-For` was not used). `info` while it is off | "PROVISION_ADMIN_ALLOW_FROM: '10.64.0.5/24' has host bits set, it is read as 10.64.0.0/24"; "the trusted proxy 10.64.0.1 is also on the allow-list: ..."; "the trusted proxy range 192.168.0.0/16 is wide: every address in it can claim any client address ..."; "the CORS proxy (--ui-mcp-proxy / --agent) is on: ..."; "PROVISION_ADMIN_TRUSTED_PROXIES has no effect without PROVISION_ADMIN_ALLOW_FROM" |
+| Admin address allow-list (`ip_allowlist`) | the built-in allow-list ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)): `enabled`, `entries`, `trusted_proxies`, and for this request `seen_from` (the address the allow-list checks), `peer` (the TCP peer), `via_forwarded_for`, `note` (why a trusted proxy's `X-Forwarded-For` was not used). `info` while it is off | "PROVISION_ADMIN_ALLOW_FROM: '10.64.0.5/24' has host bits set, it is read as 10.64.0.0/24"; "the trusted proxy 10.64.0.1 is also on the allow-list: ..."; "the trusted proxy range 192.168.0.0/16 is wide: every address in it can claim any client address ..."; "the CORS proxy (--ui-mcp-proxy / --agent) is on: ..."; with trusted proxies but no allow-list: "PROVISION_ADMIN_TRUSTED_PROXIES without PROVISION_ADMIN_ALLOW_FROM only affects the client address the audit log records: any address may use /admin" ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)) |
 | `MODEL_DEVICES` (`model_devices`) | its value when set | |
 | Per-model settings file (`model_settings`) | file, entries, read-only, `.bak` used, problems | "fix or remove the file, then restart the server" |
+| Audit log (`audit`) | the activity log ([18](#18-activity-log)): `persisted`, `error` and `since` (why and since when it is kept in memory), `in_memory` (records waiting in memory), `lost`, `max_bytes` (rotation size), `ring_max`, `files` (name, bytes, store). `warning` while it is kept in memory | "the audit log is kept in memory only (the last 1000 records) since ...: ...; it is written again by itself once the state directory can be written (tried every minute), records kept in memory meanwhile are lost on restart" |
 | Helper processes (`stuck_helpers`) | listed only while a fit check or GPU inventory helper has not exited after it was stopped (status `error`): which one and for how long | "the GPU driver may be hanging (check dmesg), restart the server if it does not clear" |
 
 Nothing has to be sent anywhere: the panel shows on each server what was detected there
@@ -1231,7 +1243,7 @@ and why something is unknown.
 | `/models` (read-only) | `./models` | `/srv/provision-llm/models` | the GGUF files of the `models.ini` sections |
 | `/models-rw/hf` | `./models-rw/hf` | `/srv/provision-llm/models-rw/hf` | model cache: everything downloaded with `POST /models` |
 | `/models-rw/local` | `./models-rw/local` | `/srv/provision-llm/models-rw/local` | models directory: drop files here; uploads from the panel go here too, and `.provision-upload/` in it holds unfinished uploads |
-| `/var/lib/provision-llm-admin` | volume `llama-admin-state` | `/var/lib/provision-llm-admin` | `admin-state.json`, `admin-models.json`, their `.bak` files, `admin.key`, the records of unfinished uploads |
+| `/var/lib/provision-llm-admin` | volume `llama-admin-state` | `/var/lib/provision-llm-admin` | `admin-state.json`, `admin-models.json`, their `.bak` files, `admin.key`, the records of unfinished uploads, the activity log (`admin-audit*.jsonl*`) |
 | `/var/lib/provision-llm` | volume `llama-license-state` | `/var/lib/provision-llm` | license state |
 
 **Model cache** (`hf/`). Hugging Face layout, one directory per repository:
@@ -1347,6 +1359,13 @@ settings) are written atomically; the previous version of each is kept as `.bak`
 - `admin-state.json` and `admin-models.json` are separate on purpose: an older image
   ignores `admin-models.json` and leaves it alone, and a newer one finds it again.
 
+**Activity log.** `admin-audit.jsonl`, for the refused requests
+`admin-audit-refusals.jsonl` and for the effects of the public model routes
+`admin-audit-observed.jsonl`, each with its previous generation `.1`, in the admin state
+directory: appended and synced per record, rotated at 4 MiB, at most 24 MiB in all,
+mode `0600` ([18.5](#185-storage-rotation-and-retention)). While they cannot be written
+the log is kept in memory ([18.6](#186-when-the-log-cannot-be-written)).
+
 To reset the settings and the key, stop the server, remove the files and start it
 again. Not while it runs: the server keeps the settings in memory and writes
 `admin-models.json` again whenever a model with saved settings starts or loads, so
@@ -1366,8 +1385,9 @@ sudo systemctl start provision-llm
 
 Leave out `admin.key` to keep the key, or remove only `admin-models.json*` to drop the
 per-model settings. Removing the whole state also drops the records of unfinished
-uploads; their data in `.provision-upload/` is then removed by the server. Or remove the
-whole Docker volume (`docker volume ls` shows its name):
+uploads; their data in `.provision-upload/` is then removed by the server. The commands
+above leave the activity log alone; add `admin-audit*.jsonl*` to clear it as well. Or
+remove the whole Docker volume (`docker volume ls` shows its name):
 
 ```bash
 docker compose down
@@ -1397,8 +1417,8 @@ key in `param`, and errors with more detail carry it next to `type` (for example
 | Status | `error.type` | When |
 |---|---|---|
 | 400 | `invalid_request_error` | body is not valid, or a value fails validation; nothing is saved |
-| 401 | `admin_key_required` | `X-Admin-Key` missing or wrong |
-| 403 | `admin_forbidden` | the client address is not on the allow-list: answered by nginx ([4.1](#41-address-allow-list-nginx)), or by the server's own allow-list ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)), whose message names the address it saw; also every `/admin` request while the server's allow-list has an invalid entry ("The admin API is locked: ...") |
+| 401 | `admin_key_required` | `X-Admin-Key` missing or wrong (recorded in the activity log, [18.3](#183-refused-requests)) |
+| 403 | `admin_forbidden` | the client address is not on the allow-list: answered by nginx ([4.1](#41-address-allow-list-nginx)), or by the server's own allow-list ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)), whose message names the address it saw; also every `/admin` request while the server's allow-list has an invalid entry ("The admin API is locked: ..."). The server's own `403` answers are recorded in the activity log ([18.3](#183-refused-requests)), those of nginx are not |
 | 404 | | the admin layer is disabled, or the server is not a router |
 | 404 | `not_found_error` | unknown model id (per-model routes). The server replaces the body of every `404` with its generic `{"error": {"code": 404, "message": "File Not Found", "type": "not_found_error"}}` |
 | 409 | `default_device_locked` | `default_device` is fixed by `MODEL_DEVICES` |
@@ -1434,9 +1454,9 @@ KEY=$(docker compose exec -T llama-dual cat /var/lib/provision-llm-admin/admin.k
 
 **Older servers.** `GET /admin/status` lists the optional parts the server has in
 `features`. The web UI shows the per-model settings, the GPU cards, the failure tails,
-the fit check, the diagnostics, the upload and the deletion of models-directory models
-only when the server lists them, so a browser that still has a newer web UI cached keeps
-working against an older server.
+the fit check, the diagnostics, the upload and the deletion of models-directory models,
+and the Activity tab only when the server lists them, so a browser that still has a newer
+web UI cached keeps working against an older server.
 
 ### 12.1 `GET /admin/status`
 
@@ -1461,7 +1481,7 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/status
 {
   "admin": true, "authorized": true, "key_configured": true, "version": 1,
   "key_source": "generated",
-  "features": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete"],
+  "features": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete", "audit"],
   "models": { "max": 3, "running": 2, "total": 5 },
   "state": {
     "dir": "/var/lib/provision-llm-admin", "writable": true, "error": "",
@@ -1469,6 +1489,7 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/status
   },
   "download": { "available": true, "offline": false },
   "upload": { "available": true, "reason": null, "message": null },
+  "audit": { "persisted": true, "error": null, "since": null, "in_memory": 0, "lost": 0, "max_bytes": 4194304, "ring_max": 1000 },
   "dirs": { "cache": "/models-rw/hf", "models_dir": "/models-rw/local", "preset": "/config/models.ini" },
   "license_build": false,
   "ip_allowlist": false,
@@ -1486,13 +1507,21 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/status
   `staging_other_filesystem` ([16.1](#161-what-can-be-uploaded)), and `upload.message`
   says what to do.
 - `features` `upload` and `delete`: the routes of [12.14](#1214-get-adminmodelsupload) to
-  [12.18](#1218-post-adminmodelsdelete).
+  [12.18](#1218-post-adminmodelsdelete); `audit`: the activity log,
+  [12.19](#1219-get-adminaudit).
+- `audit`: the activity log ([18](#18-activity-log)). `persisted: false` while records
+  of any of its three files are kept in memory
+  ([18.6](#186-when-the-log-cannot-be-written)), with `error` and `since`; `in_memory`:
+  records waiting in memory; `lost`: records the full memory rings dropped meanwhile;
+  `max_bytes`: the size at which a file is rotated; `ring_max`: the size of each ring
+  (one per file).
 - `state.error`: why the saved settings could not be read; empty when fine.
 - `state.model_settings`: the per-model settings file; `error` says why it could not be
   read, `backup_loaded` that its `.bak` was used instead, `read_only` that saving is
   refused, `entries` how many models have saved settings.
 - `warnings`: `default_device_not_present` when "GPU for new models" names a GPU this
-  server does not have.
+  server does not have; `audit_not_persisted` while the activity log is kept in memory
+  only ([18.6](#186-when-the-log-cannot-be-written)).
 - `ip_allowlist`: the server's own address allow-list is on
   ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)). Only in the answer with
   a valid key; the details are in Diagnostics.
@@ -1580,7 +1609,12 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/storage
   "partial_downloads": [ { "path": "/models-rw/hf/models--user--repo/blobs/<hash>.downloadInProgress", "bytes": 123456789 } ],
   "uploads": [ { "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "bytes": 1258291200,
                   "total_bytes": 3341008960, "received_bytes": 1258291200, "expires_at": "2026-10-09T10:20:00Z" } ],
-  "upload_staging": { "path": "/models-rw/local/.provision-upload", "bytes": 1258291200, "trash_bytes": 0 }
+  "upload_staging": { "path": "/models-rw/local/.provision-upload", "bytes": 1258291200, "trash_bytes": 0 },
+  "audit": { "persisted": true, "total_bytes": 5263772, "max_bytes": 4194304,
+             "files": [ { "name": "admin-audit.jsonl", "bytes": 1069056, "store": "changes" },
+                        { "name": "admin-audit.jsonl.1", "bytes": 4194120, "store": "changes" },
+                        { "name": "admin-audit-refusals.jsonl", "bytes": 184, "store": "refusals" },
+                        { "name": "admin-audit-observed.jsonl", "bytes": 412, "store": "observed" } ] }
 }
 ```
 
@@ -1589,7 +1623,9 @@ curl -s -H "X-Admin-Key: $KEY" $BASE/admin/storage
 the unfinished uploads ([16](#16-uploading-gguf-files)), each as in the list of
 [12.14](#1214-get-adminmodelsupload) (shortened above) plus what it takes on disk
 (`bytes`); `upload_staging`: the folder of the unfinished uploads, what they take
-together and what still waits in the trash of deleted models (`trash_bytes`).
+together and what still waits in the trash of deleted models (`trash_bytes`). `audit`:
+the files of the activity log ([18.5](#185-storage-rotation-and-retention)) with their
+size (`store`: `changes`, `refusals` or `observed`), their total, and the rotation size.
 
 ### 12.5 `POST /admin/models/download/check`
 
@@ -1659,6 +1695,11 @@ Write the quantization tag in upper case (`:Q4_K_M`); the web UI does that for y
 directory is deleted with `POST /admin/models/delete` ([12.18](#1218-post-adminmodelsdelete)).
 A download no longer takes an `@` in a file path of the repository for the user part of
 the URL, so it cannot be sent, with `HF_TOKEN`, to another host.
+
+These routes carry no admin key, so the activity log does not know who called them; it
+records the finished or failed download and the removed model as "public API (unknown)",
+and the `reset` above as a change of the admin who sent it
+([18.4](#184-what-cannot-be-recorded)).
 
 ### 12.7 `GET /admin/models/settings`
 
@@ -2084,7 +2125,7 @@ curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/models/upload?id=9f1c2b7e4a6d4c0e8b3
       "complete": true, "dropped": false, "role": "projector",
       "sha256": "8d1e5a7c3b9f2e4d6a8c0b1f3e5d7c9a2b4f6e8d0c1a3b5e7f9d2c4b6a8e0f13", "sha256_expected": null,
       "head_crc32": "9e8f7a6b", "final_name": "mmproj-gemma-3-4b.gguf",
-      "header": { "state": "ok", "arch": "clip", "type": null },
+      "header": { "state": "ok", "arch": "clip", "type": "mmproj" },
       "error": null }
   ],
   "settings": { "device": "CUDA1", "ctx-size": "16384" }, "settings_mode": "replace",
@@ -2130,9 +2171,11 @@ Per file (`files[]`):
   did not load; decided by the load check at the end), `failed` (the check could not run;
   it runs again), `error` (the file is refused, see `error`). Once the metadata was read:
   `arch` and `type`, the file's `general.architecture` and `general.type` as the converter
-  wrote them (`model`, `adapter`, `imatrix`; projectors often have none or an older value
-  such as `clip-vision`), `null` when absent; `split` (`no`, `count`) for a shard. `message`
-  only with a warning, a failure or a refusal: the reason.
+  wrote them (`model`, `adapter`, `imatrix`, `mmproj` from the current converter; older
+  projectors have none or a value such as `clip-vision`), `null` when absent. The role
+  does not come from `type`: a file whose architecture is `clip` is the projector. `split`
+  (`no`, `count`) for a shard. `message` only with a warning, a failure or a refusal: the
+  reason.
 - `error`: why this file cannot be used (`code`, `message`; the codes are in
   [16.4](#164-checks-before-the-model-becomes-visible)), or `null`.
 
@@ -2425,7 +2468,7 @@ downloaded models only.
 | `dry_run` | `false` | only report what would be deleted |
 | `stop` | `false` | stop the model first if it is running; without it a running model is `409 model_running` |
 | `remove_settings` | `true` | also remove its saved settings, its pin and what the server cached about it (not with `projector_only`: the model keeps its settings) |
-| `projector_only` | `false` | **Remove projector**: only the model's projector file |
+| `projector_only` | `false` | only the model's own projector file (**Remove only the projector** in the panel) |
 
 ```bash
 curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' \
@@ -2442,7 +2485,7 @@ The dry run (`200`):
   "n_files": 2, "total_bytes": 3341008960,
   "kept": [ { "path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file" },
             { "path": "mtp-shared-draft.gguf", "bytes": 52428800, "kind": "file", "shared": true } ],
-  "n_kept": 2, "kept_bytes": 52433920,
+  "n_kept": 2, "kept_truncated": false, "kept_bytes": 52433920,
   "folder": "gemma-3-4b", "folder_removed": false,
   "running": false, "status": "unloaded", "pinned": false, "has_settings": true,
   "warnings": [], "dry_run": true
@@ -2453,11 +2496,13 @@ The dry run (`200`):
   `role` (`model`, `shard`, `projector`, `draft`). Only what the models directory gives
   this model: its file (and the shards named after the first one), and for a model in a
   folder the projector and draft model in that folder.
-- `kept`: what stays: the other entries of the model's folder ("kept: not part of this
+- `kept`: what stays: the other entries of the model's folder ("Kept: not part of this
   model"; `kind` `file`, `dir` or `symlink`; `bytes` is `null` for a folder) and, with
-  `shared: true`, a projector or draft model that the model uses but every model gets (on
-  the router command line or in the `[*]` section of `models.ini`). At most 100 are
-  listed; `n_kept` is the number listed, `kept_bytes` the size of all files that stay.
+  `shared: true`, a projector or draft model that the model uses but every model gets (a
+  draft model on the router command line, a projector or draft model in the `[*]` section
+  of `models.ini`). At most 100 are listed; `n_kept` is the number of all entries that
+  stay, and `kept_truncated` is `true` when the list holds fewer; `kept_bytes` the size of
+  all files that stay.
 - `folder` (`null` for a top-level file); `folder_removed`: the folder would be empty and
   is removed.
 - `running`, `status`, `pinned`, `has_settings`: the model as it is now.
@@ -2497,6 +2542,97 @@ upload_unavailable` (`reason`: the models directory cannot be used for the trash
 now, see [16.1](#161-what-can-be-uploaded)); `504 stop_timeout` (nothing was deleted);
 `500 server_error` (the trash folder could not be created, the model's folder could not
 be opened, or a file could not be moved; what was moved is put back).
+
+### 12.19 `GET /admin/audit`
+
+The activity log of [18](#18-activity-log), newest record first, one page at a time.
+Present when `features` lists `audit`.
+
+| Parameter | Meaning |
+|---|---|
+| `limit` | records per page, 1 to 500; default 100 |
+| `before` | only records older than this one: the `next_before` of the previous page. Leave it out for the newest records |
+| `kind` | only these kinds, separated by commas: `change`, `refusal`, `server`, `observed` (another value: `400`) |
+| `action` | only these actions ([18.1](#181-what-is-recorded)), separated by commas. A name also matches the actions below it: `upload` (or `upload.*`) matches `upload.create`, `upload.published`, ... |
+| `result` | only these results, separated by commas: `ok`, `error`, `failed`, `rejected`, `refused` |
+| `format` | `json` (default), or `jsonl`: the log as a file instead of a page (below) |
+
+```bash
+curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/audit?limit=3"
+```
+
+```json
+{
+  "entries": [
+    { "seq": 1204, "id": "1204", "kind": "change", "action": "model_settings.update", "result": "ok",
+      "ts": 1791364364381, "time": "2026-10-07T09:12:44Z", "target": "qwen2.5-chat",
+      "actor": { "type": "client", "peer": "172.18.0.3", "client": "172.18.0.3", "via_proxy": false,
+                 "forwarded_for": "10.64.0.7", "forwarded_trusted": false,
+                 "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+                 "label": "172.18.0.3 (X-Forwarded-For 10.64.0.7, unverified)" },
+      "details": { "changed": true, "changes": { "ctx-size": { "from": null, "to": "32768" } },
+                   "was_running": true, "restart": true, "restarted": true },
+      "persisted": true, "open": false },
+    { "seq": 1201, "id": "1201", "kind": "refusal", "action": "access.refused", "result": "refused",
+      "ts": 1791364152410, "time": "2026-10-07T09:09:12Z", "target": "/admin/settings",
+      "actor": { "type": "client", "peer": "10.64.1.9", "client": "10.64.1.9", "via_proxy": false,
+                 "user_agent": "curl/8.5.0", "label": "10.64.1.9" },
+      "details": { "status": 401, "code": "admin_key_required", "reason": "wrong_key", "probe": false,
+                   "count": 12, "first": "2026-10-07T09:09:12Z", "last": "2026-10-07T09:10:02Z" },
+      "count": 12, "updated_seq": 1203, "persisted": true, "open": false },
+    { "seq": 1200, "id": "1200", "kind": "observed", "action": "download.finished", "result": "ok",
+      "ts": 1791363330120, "time": "2026-10-07T08:55:30Z", "target": "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M",
+      "actor": { "type": "public_api", "label": "public API (unknown)" }, "details": {},
+      "persisted": true, "open": false }
+  ],
+  "next_before": "1200",
+  "matched": 1180,
+  "persisted": true,
+  "audit": { "persisted": true, "error": null, "since": null, "in_memory": 0, "lost": 0, "max_bytes": 4194304, "ring_max": 1000 },
+  "warnings": []
+}
+```
+
+- `entries`: the records, newest first. Each has the fields of its line in the file
+  ([18.5](#185-storage-rotation-and-retention)): `seq`, `kind`, `action`, `result`, `ts`
+  (milliseconds since 1970) and `time` (UTC), `target` (the model id, upload name, path
+  or file; `""` when there is none), `actor` ([18.2](#182-who-addresses-and-proxies)),
+  `details` ([18.1](#181-what-is-recorded)), `count` for a merged record, `truncated` for
+  one that had to be cut down to its head ([18.5](#185-storage-rotation-and-retention)).
+  The answer adds:
+  - `id`: the record's `seq` as a string;
+  - `persisted`: `false` for a record that is only in memory;
+  - `open`: `true` for a merged record whose 60 seconds are not over: its `count` still
+    grows;
+  - `updated_seq`: for a merged record, the `seq` of its latest update (a window still
+    counting has no update yet: its own `seq`); `seq` stays the number of its first line,
+    so paging is stable;
+  - `unreadable: true` for a line whose start can be read but not the rest (cut by a
+    crash, edited by hand), with only `seq`, `kind`, `action` and `result`; a line without
+    even that is skipped.
+- `next_before`: send it as `before` for the next older page; `null` when there is
+  nothing older (with the filters applied).
+- `matched`: how many records match the filters and `before` in all, this page included.
+- `persisted`: `false` while any of the three files of the log is kept in memory
+  ([18.6](#186-when-the-log-cannot-be-written)). `audit` and `warnings`
+  (`audit_not_persisted`) as in [12.1](#121-get-adminstatus).
+
+**Download.** `?format=jsonl` answers the lines themselves as a file
+(`Content-Type: application/x-ndjson`,
+`Content-Disposition: attachment; filename="provision-admin-audit.jsonl"`): every line of
+the three files, of their `.1` and of the memory rings, sorted by `seq` (oldest first).
+A merged record that ended appears with its first line and, when it counted more than
+the first request, its update (`group` = the `seq` of the first line), which has the
+final count. A window still counting appears at
+the place of its first line, with its current count; its update line follows when it
+ends. The filters and `before` apply as for a page; `limit` does not.
+
+```bash
+curl -s -H "X-Admin-Key: $KEY" -o admin-audit.jsonl "$BASE/admin/audit?format=jsonl"
+```
+
+Errors: `400 invalid_request_error` for a parameter that is not valid (`param` names it:
+`before`, `limit`, `kind`, `format`). The route only reads: calling it is not recorded.
 
 ## 13. Deployment on a Linux host
 
@@ -2680,7 +2816,10 @@ sends `X-Forwarded-For`) and do not list `127.0.0.1` in `PROVISION_ADMIN_ALLOW_F
 server then re-checks the address nginx forwards, but it does not restrict the host
 itself: any process on the host can send its own `X-Forwarded-For` straight to
 `127.0.0.1:8080` and name an allowed address, so for the host only the admin key applies
-(as with the site alone).
+(as with the site alone). `PROVISION_ADMIN_TRUSTED_PROXIES=127.0.0.1` alone, without the
+server's allow-list, makes the activity log record the address nginx saw as verified
+instead of `127.0.0.1` ([18.2](#182-who-addresses-and-proxies)); the same caveat about
+processes on the host applies to what the log records.
 
 ```bash
 # Debian / Ubuntu
@@ -2843,6 +2982,9 @@ What changes:
   directory ([16](#16-uploading-gguf-files), [17](#17-deleting-models-of-the-models-directory)).
   Both use `/models-rw/local`, which the compose file already mounts; nothing changes in
   `docker-compose.yml`, the nginx template or `models.ini` for them.
+- It also adds the activity log ([18](#18-activity-log)): `admin-audit.jsonl` appears in
+  the admin state volume at the first start, beginning with `audit.started`; earlier
+  actions are not in it. An older image leaves the file alone.
 
 ### 14.3 From a host without the admin panel: before you start
 
@@ -3115,45 +3257,71 @@ problems below and what to do.
 - **The fit check says `timeout` or stays `unknown`.** The check takes longer than 30
   seconds (a very large model on slow storage) or the GPU memory is not known; the
   dialog falls back to the rough estimate. Saving still works.
-- **The Upload tab is disabled.** `upload.reason` in `GET /admin/status` says why
-  ([16.1](#161-what-can-be-uploaded)): no `--models-dir` (Docker: the `/models-rw` mount;
-  host: `PROVISION_LLM_ARGS`), the directory is missing or not writable for the server,
-  or something is mounted over `.provision-upload`. Fix it and restart the server.
-- **The upload says "a proxy limits request size; using smaller pieces".** A proxy in
-  front of the server refuses large requests (a `413` that is not the server's own). It
-  still works, only slower; for full speed add the two nginx lines of
+- **The Upload GGUF tab shows a reason instead of the drop zone.** `upload.reason` in
+  `GET /admin/status` says why ([16.1](#161-what-can-be-uploaded)): no `--models-dir`
+  (Docker: the `/models-rw` mount; host: `PROVISION_LLM_ARGS`), the directory is missing
+  or not writable for the server, `.provision-upload` is a file or a symbolic link, or
+  something is mounted over it. Fix it and restart the server.
+- **The upload says "A proxy limits the request size; the upload uses smaller pieces".**
+  A proxy in front of the server refuses large requests (a `413` that is not the
+  server's own). It still works, only slower; for full speed add the two nginx lines of
   [16.9](#169-behind-a-reverse-proxy) to that proxy.
-- **The upload is paused with "Disk full" (`507`).** Free space on the filesystem of the
-  models directory, then **Resume**; or **Cancel**, which frees what was received.
+- **Chunks answered `502` by a proxy.** The server refused a chunk before its body (for
+  example while the upload is busy) and closed the connection; the page continues by
+  itself ([16.9](#169-behind-a-reverse-proxy)). Many in a row: see the server log.
+- **The upload stops with "The disk is full" (`507`).** Free space on the filesystem of
+  the models directory, then **Resume**; or **Cancel**, which frees what was received.
 - **"This is not the same file" (`content_mismatch`) when continuing an upload.** The file
   picked again differs from the one that was being sent (another file with the same
   name and size, or a newer version). Pick the right file, or cancel and upload the new
   one.
-- **"In another tab" (`other_client_active`).** Another browser tab, browser or admin is
-  sending this upload. **Take over** continues it here; the other one stops.
-- **An upload was rejected with "architecture ... not supported by this server build".**
-  The model needs a newer llama.cpp. Update the image (or rebuild the binary), then
-  upload again.
+- **"Another browser tab or client is uploading this model right now"
+  (`other_client_active`).** Another browser tab, browser or admin is sending this
+  upload. **Take over** continues it here; the other one stops.
+- **An upload was rejected with "This server build does not support the model
+  architecture"** (`unknown_architecture`). The model needs a newer llama.cpp. Update
+  the image (or rebuild the binary), then upload again.
 - **An upload waits as `ready`.** `blocked_by` says why ([12.14](#1214-get-adminmodelsupload)):
   `name_taken` (rename it), `sha256_mismatch` (check the expected value; publish anyway
-  or cancel), `check_failed` (retry; the check timed out or ran out of memory, the data
-  is kept), `settings_not_saved` (the admin state directory is not writable: publish
-  without the placement, or fix the directory), `settings_invalid` (a setting is no
-  longer valid, for example its GPU is gone: change the settings), `manual` or
-  `publish_error` (publish).
+  or cancel), `check_failed` (retry; the check timed out, ran out of memory or could not
+  read a file, the data is kept; on Windows `path_too_long`: rename it to at most
+  `max_name_length` characters, [16.5](#165-where-the-files-end-up)), `settings_not_saved`
+  (the admin state directory is not writable: publish without the placement, or fix the
+  directory), `settings_invalid` (a setting is no longer valid, for example its GPU is
+  gone: publish without the placement, or change the upload's settings with `update`),
+  `manual` or `publish_error` (publish).
 - **An uploaded model is not in the list after publishing, with `reload_error`.** The
   files are published but the model list could not be rebuilt (for example a broken
   `models.ini`). Fix the cause and press **Rescan**.
-- **Delete answers `409 model_running`.** Tick "it will be stopped" in the dialog (`stop`
-  in the API). `504 stop_timeout`: the model did not stop, nothing was deleted; see
-  **Save and restart answers `504 stop_timeout`** above.
+- **Delete answers `409 model_running`.** The model started in the meantime: the dialog
+  then says it is running and offers **Stop and delete** (`stop` in the API).
+  `504 stop_timeout`: the model did not stop, nothing was deleted; see **Save and
+  restart answers `504 stop_timeout`** above.
 - **Delete answers `409 not_deletable`.** The model is not a model of the models
-  directory (a downloaded model: use **Delete**; a `models.ini` section: edit the file),
-  or one of its files lies outside the models directory, is a symbolic link or is on
-  another filesystem ([17.3](#173-what-is-refused)).
+  directory (a downloaded model: use **Delete**; a `models.ini` section, or a model whose
+  file is set in `models.ini` or on the router command line: edit that), or one of its
+  files lies outside the models directory, is a symbolic link or is on another
+  filesystem; **Remove only the projector** is refused for a projector that every model
+  gets ([17.3](#173-what-is-refused)).
 - **A multimodal model fails at every start after an upload.** The projector probably
-  does not fit the model. **Remove projector** ([17.4](#174-remove-projector)), then
-  upload the model again with the right projector if you need image input.
+  does not fit the model. **Delete files** -> **Remove only the projector**
+  ([17.4](#174-remove-projector)), then upload the model again with the right projector
+  if you need image input.
+- **The Activity tab says the log is kept in memory only** (`audit_not_persisted` in
+  `GET /admin/status`). The admin state directory is not writable, or a write to the log
+  failed (a full disk). The Diagnostics items "Audit log" and "Admin state directory"
+  say why. Download the log if the records matter and fix the directory: the server tries
+  again every minute and then writes the records it kept, no restart needed
+  ([18.6](#186-when-the-log-cannot-be-written)).
+- **The Activity tab shows the address of nginx, with the real address as
+  "unverified".** The server cannot check the `X-Forwarded-For` of a proxy that is not
+  listed in `PROVISION_ADMIN_TRUSTED_PROXIES`; in the Docker stack that is the default.
+  [18.2](#182-who-addresses-and-proxies) shows how to trust the nginx of the stack.
+- **An action is missing from the Activity tab.** Loading, unloading, downloading and
+  `DELETE /models` go through the public routes and show only by their effects
+  ([18.4](#184-what-cannot-be-recorded)); files added to or removed from the models
+  directory by hand leave no record at all; requests that nginx or `--api-key` refused
+  never reach the admin layer; read-only requests are not recorded.
 
 ## 16. Uploading GGUF files
 
@@ -3254,8 +3422,10 @@ instead of the drop zone (`upload` in `GET /admin/status`, [12.1](#121-get-admin
    - **Ready**: what it waits for, with the matching action: **Publish** (`manual`,
      `publish_error`), **Retry the checks** (`check_failed`), a corrected value with
      **Save and check again** or **Publish anyway** (`sha256_mismatch`), a new name with
-     **Rename and publish** (`name_taken`), **Publish without the placement** (and
-     **Retry**, for `settings_not_saved`; also for `settings_invalid`).
+     **Rename and publish** (`name_taken`), a shorter name with **Rename and check
+     again** (Windows, `check_failed` with `path_too_long`,
+     [16.5](#165-where-the-files-end-up)), **Publish without the placement**
+     (`settings_not_saved`, `settings_invalid`) and, for `settings_not_saved`, **Retry**.
    - **Not started** (the create request was refused): the reason, with **Try again**,
      or a new name and **Try again with this name** when the name was the problem.
 
@@ -3369,9 +3539,13 @@ The server decides the final names from the id; the original file names are only
   appeared in the meantime the upload waits as `ready` (`name_taken`), and a rename
   that fails leaves it `ready` (`publish_error`) with **Publish** to try again.
 - Before publishing, the checks arrange the files under their final names inside the
-  upload's folder in `.provision-upload`. A move that fails there is undone, and one
-  that a crash interrupted is repaired at the next start, so a retry starts from a clean
-  state.
+  upload's folder in `.provision-upload`. A move that fails there is undone, so a retry
+  starts from a clean state. When a crash interrupts the first arrangement, the next
+  start moves the files back (an upload rebuilt without its record cannot do that: the
+  files that were moved already are sent again). A crash in the middle of renaming an
+  upload that was already arranged (a rename after `name_taken` or `path_too_long`) is
+  not repaired: the upload then waits as `ready` / `check_failed`; cancel it and upload
+  again.
 - Order: first the model's per-model settings are saved
   ([6.9](#69-settings-for-a-model-that-is-being-added)), then the files become visible,
   then the model list is rebuilt. A request that arrives in between (automatic loading)
@@ -3391,8 +3565,8 @@ The server decides the final names from the id; the original file names are only
   `.provision-upload`, whose path is about 55 characters longer than the published one,
   and llama.cpp loads a split model only from a path of at most 259 characters. A name
   that makes that path too long waits as `ready` / `check_failed` (`path_too_long`, with
-  the longest name that fits in `max_name_length`): rename the upload, then Retry;
-  nothing is uploaded again.
+  the longest name that fits in `max_name_length`): **Rename and check again** (API: an
+  `update` with the new name, then `publish`); nothing is uploaded again.
 
 ### 16.6 Resuming
 
@@ -3404,8 +3578,6 @@ The server decides the final names from the id; the original file names are only
 | Another browser tab or another admin sends to the same upload | A chunk from another tab within 30 seconds of the last one is refused (`409 other_client_active`); that tab offers **Take over**, and the first tab stops at its next chunk. A reloaded tab keeps its own id (it is kept for the tab session), so it does not count as another tab. |
 | The admin key was changed | The next chunk gets `401`; the page asks for the new key and continues. |
 | The disk is full | `507 disk_full`. The chunk that failed is discarded and the upload is kept: free space, then **Resume**; or **Cancel** (frees what was received). |
-
->>>
 
 **Expiry.** An upload is removed after 72 hours without progress. The time counts only
 while the server runs (a server that was down over a weekend does not remove the uploads
@@ -3507,6 +3679,16 @@ location ^~ /admin/ {
 }
 ```
 
+**Early answers arrive as `502`.** An answer the server gives before it reads the body (a
+busy upload, another sender, too many chunks at once,
+[12.16](#1216-post-adminmodelsuploadchunk)) closes the connection. A proxy without
+request buffering (the snippet above, and the shipped configurations) is then still
+passing the body on and answers with its own `502 Bad Gateway` page instead of the
+server's JSON (seen with nginx 1.27); with request buffering on, the server's JSON
+arrives. The page treats a `5xx` that is not the server's JSON like a dropped
+connection: it asks the server where the upload is and goes on. Scripts should do the
+same, as the script of [16.10](#1610-with-curl) does after every chunk that fails.
+
 ingress-nginx: the annotations `nginx.ingress.kubernetes.io/proxy-body-size: "32m"` and
 `nginx.ingress.kubernetes.io/proxy-request-buffering: "off"` on the ingress of the admin
 path (not verified here). A CDN with a 100 MB request limit (for example Cloudflare) is
@@ -3527,8 +3709,9 @@ The upload API is plain HTTP and can be driven from a script (see [12](#12-api-r
 for `BASE` and `KEY`, and [12.14](#1214-get-adminmodelsupload) onwards for every field).
 This script uploads one file with `curl` and `jq`. It prints the id of the upload; to
 continue after an interruption, run it again with that id as the third argument, and it
-goes on from where the server is. For a split set or a projector, list every file in
-`files` and send each one with its own index (`file=0`, `file=1`, ...).
+goes on from where the server is, after `verify=1` probes have shown that the file is the
+one the server has. For a split set or a projector, list every file in `files` and send
+each one with its own index (`file=0`, `file=1`, ...).
 
 ```bash
 #!/usr/bin/env bash
@@ -3539,11 +3722,11 @@ SIZE=$(stat -c %s "$FILE")                  # macOS: stat -f %z "$FILE"
 CHUNK=$((8 * 1024 * 1024))                  # behind a proxy with a 1 MiB limit: $((960 * 1024))
 H=(-H "X-Admin-Key: $KEY")
 fail() { echo "$1" >&2; exit 1; }
-send() {    # send OFFSET LENGTH: these bytes of FILE as one chunk; prints the answer
+send() {    # send OFFSET LENGTH [&verify=1]: these bytes of FILE as one chunk; prints the answer
     tail -c +"$(($1 + 1))" "$FILE" | head -c "$2" |
         curl -s --fail-with-body -X POST "${H[@]}" -H "X-Upload-Client: $CLIENT" \
             -H 'Content-Type: application/octet-stream' --data-binary @- \
-            "$BASE/admin/models/upload/chunk?id=$ID&file=0&offset=$1"
+            "$BASE/admin/models/upload/chunk?id=$ID&file=0&offset=$1${3:-}"
 }
 post_json() {
     curl -s --fail-with-body -X POST "${H[@]}" -H 'Content-Type: application/json' -d "$2" "$BASE$1"
@@ -3574,8 +3757,10 @@ CLIENT="curl-$(hostname)-${ID:0:8}"         # the same "browser tab" when run ag
 # 3. send the file, one chunk at a time, from where the server is
 A=$(status) || fail "$A"
 OFF=$(jq '.files[0].offset' <<< "$A")
-if [ "$OFF" -gt 0 ]; then                   # continuing: the server compares the first MiB
-    A=$(send 0 $((OFF < 1048576 ? OFF : 1048576))) || fail "$A"    # (stores nothing)
+if [ "$OFF" -gt 0 ]; then                   # continuing: is this the file the server has?
+    M=$((OFF < 1048576 ? OFF : 1048576))    # verify=1 compares and stores nothing
+    A=$(send 0 "$M" '&verify=1') || fail "$A"                    # the first MiB
+    A=$(send $((OFF - M)) "$M" '&verify=1') || fail "$A"         # the MiB before the offset
 fi
 FAILS=0
 while [ "$OFF" -lt "$SIZE" ]; do
@@ -3604,6 +3789,10 @@ jq '{ state, blocked_by, error, files: [ (.files // [])[] | { name, role, size, 
 
 - `--data-binary @-` reads the chunk into memory first, so `curl` sends a
   `Content-Length`. No `Expect:` header workaround is needed.
+- When it continues an upload, the two `verify=1` probes
+  ([12.16](#1216-post-adminmodelsuploadchunk)) compare the first MiB and the MiB before
+  the server's offset with the bytes the server stored; a different file stops the
+  script with `409 content_mismatch` before anything is written.
 - Every failure is handled the same way: ask the server where it is, then send from
   there. Sending a chunk again is always safe ([12.16](#1216-post-adminmodelsuploadchunk)).
   Do not add `curl --retry` to these calls: on a retry `curl` does not take back the
@@ -3618,24 +3807,30 @@ jq '{ state, blocked_by, error, files: [ (.files // [])[] | { name, role, size, 
 ## 17. Deleting models of the models directory
 
 Admin page, **Models** tab: rows of models from the models directory (source
-`models_dir`: uploaded ones and ones dropped in by hand) have **Delete files**.
-Downloaded models (source `cache`) keep their **Delete**, the public `DELETE /models`
+`models_dir`: uploaded ones and ones dropped in by hand) have **Delete files**. It opens
+the dialog "Delete model files?"; for a model with its own projector the same dialog
+offers **Remove only the projector** ([17.4](#174-remove-projector)). Downloaded models
+(source `cache`) keep their **Delete**, the public `DELETE /models`
 ([12.6](#126-downloading-and-deleting-existing-routes-no-admin-key)); sections of
 `models.ini` are removed in `models.ini`.
-<!-- s3-recheck: UI labels "Delete files..." and where "Remove projector" sits (delete dialog per critique scope-ux #4). -->
 
 ### 17.1 What is deleted
 
-- **Only the files the model uses**: its GGUF file, or every shard of a split model (the
-  `-NNNNN-of-NNNNN` names the loader derives from the first one), its projector
-  (`mmproj`) and its draft model, if it has them.
+- **Only the files the models directory gives this model**: its GGUF file, or every
+  shard of a split model (the `-NNNNN-of-NNNNN` names the loader derives from the first
+  one), and for a model in a folder the projector (`mmproj`) and the draft model in that
+  folder, if it has them.
 - **Everything else stays**: other `.gguf` files in the same folder (for example other
   quantizations that `huggingface-cli download --local-dir` put there), READMEs,
-  subfolders. The dialog lists them as "kept: not part of this model". The folder of the
-  model is removed only when it is empty afterwards.
+  subfolders. The dialog lists them as "Kept: not part of this model". A projector or
+  draft model that every model gets (a draft model on the router command line, a
+  projector or draft model in the `[*]` section of `models.ini`) is listed as kept too,
+  marked "used by every model". The folder of the model is removed only when it is empty
+  afterwards.
 - **The dialog first shows what would happen** (a dry run): every file with its size and
   the total, the files that are kept, whether the model is running or pinned and whether
-  it has saved settings. To confirm, type the model id.
+  it has saved settings. To confirm, type the model id; the button reads **Delete**, or
+  **Stop and delete** for a running model.
 - **"Also remove its saved settings"** (ticked by default) also removes the model's
   per-model settings, its pin, and what the server cached about it (facts, fit results,
   output tail). Otherwise the old settings would attach again to a model that comes back
@@ -3650,8 +3845,8 @@ Downloaded models (source `cache`) keep their **Delete**, the public `DELETE /mo
 
 ### 17.2 A running model
 
-- Without `stop` a running model is refused (`409 model_running`). The dialog says
-  "running: it will be stopped" and sends `stop`.
+- Without `stop` a running model is refused (`409 model_running`). The dialog says "The
+  model is running: it is stopped first, its requests fail." and sends `stop`.
 - With `stop` the server stops the model and waits at most its stop timeout plus 10
   seconds, as **Save and restart** does ([6.5](#65-saving-and-restarting)). If it does not
   stop in time the answer is `504 stop_timeout` and nothing is deleted. A model that a
@@ -3660,29 +3855,40 @@ Downloaded models (source `cache`) keep their **Delete**, the public `DELETE /mo
 
 ### 17.3 What is refused
 
-`409 not_deletable`, with the reason:
+`409 not_deletable`, with the `reason`:
 
-- there is no model with this id (`not_found`; this route never answers `404`);
-- the model is not from the models directory: a downloaded model (use **Delete** /
-  `DELETE /models`), a section of `models.ini`, or a model of the models directory that
-  a `models.ini` section of the same name merges with (change `models.ini`);
-- a file it uses lies outside the models directory, or its entry in the models directory
-  is a symbolic link;
-- a file is on another filesystem or busy (for example a mount point inside the models
-  directory);
-- **Remove projector** for a model that has no projector.
-
-<!-- s3-recheck: not_deletable reason codes (e.g. not_models_dir / preset / outside_models_dir / symlink / other_filesystem). -->
+- there is no model with this id, or it is still being downloaded (`not_found`; this
+  route never answers `404`);
+- the model is not from the models directory: a downloaded model (`cache`: use
+  **Delete** / `DELETE /models`), a section of `models.ini`, or a model of the models
+  directory that a `models.ini` section of the same name merges with (`preset`: change
+  `models.ini`);
+- its model file is not the one the models directory gives it, because `models.ini` or
+  the router command line sets another one (`preset`);
+- a file it uses lies outside the models directory or in a deeper folder
+  (`outside_models_dir`), its folder or file in the models directory is a symbolic link
+  or not a regular file (`symlink`), or its model or projector file is missing
+  (`missing`);
+- a file is on another filesystem or busy, for example a mount point inside the models
+  directory (`other_filesystem`; what was moved already is put back);
+- the server has no models directory, or it cannot be opened (`no_models_dir`), or the
+  model has no model file (`no_file`);
+- **Remove only the projector** for a model without a projector of its own: it has
+  none, or its projector is the one every model gets (`no_projector`).
 
 ### 17.4 Remove projector
 
-For a model of the models directory that has a projector, **Remove projector** moves only
-the projector file (`mmproj`, the file the model uses) into the trash and rebuilds the
-model list. The model stays, with its settings, and loses only its image / audio input.
-It is the way out when the projector does not fit the model (every start fails,
-[9](#9-when-a-model-fails-to-start)) or was not wanted. The rules for a running model
-([17.2](#172-a-running-model)) apply. A projector cannot be added to an existing model
-from the panel: delete the model and upload it again with the projector.
+For a model in a folder of the models directory that has its own projector, **Delete
+files** -> **Remove only the projector** switches the dialog to "Remove the projector?";
+its button **Remove the projector** moves only the projector file (`mmproj`, the file
+the model uses) into the trash and rebuilds the model list. The model stays, with its
+settings and pin, and loses only its image / audio input. It is the way out when the
+projector does not fit the model (every start fails; the failure panel of
+[9](#9-when-a-model-fails-to-start) points here) or was not wanted. The rules for a
+running model ([17.2](#172-a-running-model)) apply. A projector that every model gets
+(the `[*]` section of `models.ini`) is not removed from here. A projector cannot be added
+to an existing model from the panel: delete the model and upload it again with the
+projector.
 
 ### 17.5 With curl
 
@@ -3701,4 +3907,372 @@ curl -s -X POST -H "X-Admin-Key: $KEY" -H 'Content-Type: application/json' \
     -d '{ "model": "gemma-3-4b", "projector_only": true, "stop": true }' $BASE/admin/models/delete
 ```
 
-<!-- s3-recheck: the request field that selects "Remove projector" ("projector_only" is this document's choice; the HTTP contract of the base design does not name it). -->
+## 18. Activity log
+
+The server keeps a log of what was done through the admin API (the server log and
+Diagnostics call it the audit log): which settings were changed and to what, which
+models were uploaded or deleted, which requests were refused, what the server did by
+itself (an automatic revert, an expired upload), and what it saw happen through the
+public model routes. Admin page, **Activity** tab, and
+`GET /admin/audit` ([12.19](#1219-get-adminaudit)). There is nothing to configure: the
+log starts with the admin layer and is written into the admin state directory
+([18.5](#185-storage-rotation-and-retention)).
+
+There are no user accounts. Everyone who has the admin key is the same admin, so "who"
+in this log means "from which address, and with which browser or tool, the admin key was
+presented" ([18.2](#182-who-addresses-and-proxies)).
+
+### 18.1 What is recorded
+
+One record per action: the time, the actor ([18.2](#182-who-addresses-and-proxies)), the
+action, its target (a model id, an upload name or a path), the result and details. The
+`kind` of a record says where it comes from:
+
+| Kind | Records |
+|---|---|
+| `change` | an admin request with the admin key that changes something, with its outcome |
+| `refusal` | refused admin requests (`401`, `403`), merged ([18.3](#183-refused-requests)) |
+| `server` | what the server did by itself |
+| `observed` | an effect of the public model routes, seen on the model status feed; who caused it is not known |
+
+| Action | Kind | When | Target | Details |
+|---|---|---|---|---|
+| `settings.update` | `change` | **Save** of the Settings tab, `POST /admin/settings` | `settings` | `changes`: every setting that changed (`models_max`, `default_device`, `pinned`) as `{"from": ..., "to": ...}`; `changed`; `keys`: the keys that were sent; `reload_failed` when the model list could not be rebuilt after a change of `default_device` |
+| `model_settings.update` | `change` | **Save**, **Save and restart** and the import of the Settings dialog, `POST /admin/models/settings` | model id | `changes`: every key that differs, as `{"from": ..., "to": ...}` with the stored text of the value (`"32768"`; `null` = not set); `changed`; `was_running`, `restart`, `restarted`; `load_failed` when the model could not be started now |
+| `model_settings.reset` | `change` | **Remove custom settings**, and "Also remove its saved settings" of **Delete** for a downloaded model (`POST /admin/models/settings` with `reset: true`) | model id | `changes`: the values that were removed |
+| `gpus.rescan` | `change` | **Re-detect GPUs**, `POST /admin/gpus/rescan` | `gpus` | `devices` found; `error` when the detection failed (result `failed`) |
+| `upload.create` | `change` | an upload is started ([16](#16-uploading-gguf-files)) | the name | upload `id`, `bytes`, `files` |
+| `upload.takeover` | `change` | **Take over** of an upload another tab or client was sending | the name | upload `id` |
+| `upload.cancel` | `change` | **Cancel** of an upload | the name | upload `id`, `bytes` received |
+| `upload.published` | `change` | the checks passed and the model was published | model id | upload `id`, `bytes`, `layout` (`file` or `folder`), `sha256` of every file, `arch`, `settings` (the placement chosen for the upload) |
+| `upload.rejected` | `change` | a check refused the files ([16.4](#164-checks-before-the-model-becomes-visible)) | the name | upload `id`, `bytes` received, `code` (the reason), `file` |
+| `upload.expired` | `server` | 72 hours without progress | the name | upload `id`, `bytes` received, `code` (`expired`) |
+| `upload.resumed_after_restart` | `server` | the server found an unfinished upload when it started | the name | upload `id`, `state` |
+| `upload.swept` | `server` | the server removed a leftover folder from `.provision-upload` ([11](#11-storage)). Recorded once the removal is done: `ok`; `failed` once when the folder cannot be removed (the sweep tries again every minute), then `ok` once a later sweep removed it | the folder | `folder` (relative to the models directory), `foreign` (another server's), `name` |
+| `model.delete` | `change` | **Delete files**, `POST /admin/models/delete` | model id | `files`, `bytes` freed, `paths` (the first 16, relative to the models directory), `projector_only` (`false`), `stopped`, `settings_removed`, `pin_removed`, `folder_removed`, `reload_failed` |
+| `model.remove_projector` | `change` | **Remove only the projector** | model id | as `model.delete`, with `projector_only: true` |
+| `model_settings.reverted` | `server` | the automatic revert after two failed starts ([6.6](#66-trial-commit-and-automatic-revert)) | model id | `reason` of the failure, `failures`, `to` (`last_good` or `models_ini`) |
+| `model_settings.reverted_at_startup` | `server` | settings that were being tried or failing when the server stopped are not applied again at start-up | model id | `phase` (`trial` or `failed`), `to` |
+| `audit.started` | `server` | the server started | | `version` of the server, `persisted`, `max_bytes` |
+| `audit.persisted_again` | `server` | a file of the log is written to disk again after a write error ([18.6](#186-when-the-log-cannot-be-written)); one per file, written into that file | the file | `store` (`changes`, `refusals` or `observed`), `not_persisted_since`, `lost` |
+| `access.refused` | `refusal` | `401` or `403` answers ([18.3](#183-refused-requests)) | the path | `status`, `code`, `reason`, `probe`, `count`, `first`, `last` |
+| `access.refused_more` | `refusal` | the summary of refusals beyond the caps ([18.3](#183-refused-requests)) | | `count`, `first`, `last`, `clients`, `sample` (addresses), `items` (paths) |
+| `download.finished`, `download.failed` | `observed` | a download with `POST /models` ended | model id | |
+| `model.removed` | `observed` | a downloaded model was removed with `DELETE /models` ([12.6](#126-downloading-and-deleting-existing-routes-no-admin-key)). Files removed from the models directory by hand leave no record ([18.4](#184-what-cannot-be-recorded)) | model id | |
+| `model.start_failed` | `observed` | a model process ended with an error before it was loaded ([9](#9-when-a-model-fails-to-start)) | model id | `reason`, `exit_code`, `failures`, `settings_reverted` |
+| `observed.more` | `observed` | more than 30 `observed` records in a minute: the rest are counted in one summary | | `count`, `first`, `last`, `items` (actions and model ids) |
+
+- **Results.** `ok`; `error` for an admin request that was answered with an error (a
+  value that fails validation, a locked field, `409 restart_required`, a failed save, a
+  refused upload create): nothing was changed, and the details carry the `status` and
+  the error type (`code`); `failed` when the action itself did not work (a GPU
+  re-detection, a download, a model start); `rejected` for an upload the checks refused;
+  `refused` for a refused request.
+- **Changes, not reads.** Requests that only read (every `GET`, the fit check
+  `POST /admin/models/settings/check`, the download check
+  `POST /admin/models/download/check`, the dry run of a delete or an upload create, the
+  status probe) are not recorded. Nor are the single chunks of an upload: only its
+  start, take-over, end and cancel.
+- **Values.** A setting is recorded as its old and new value, each at most 128 bytes of
+  JSON (a longer one is cut and stored as text). Files are named relative to the models
+  directory; nothing names a path outside it ([18.8](#188-privacy)).
+- **Uploads.** The upload `id` links the records of one upload. `upload.published` and
+  `upload.rejected` are the outcome of the server's checks, recorded when they end, also
+  after a restart of the server: they carry the actor of the admin who created the upload
+  (kept with the upload's record in the state directory, [11](#11-storage)). Only an
+  upload the server had to rebuild without its record is published under the actor
+  `server`.
+- **Routine model traffic is skipped.** Loading, unloading and evicting a model, and
+  automatic loading on the first request, are not recorded, whoever caused them; only
+  the `observed` actions above are. Anyone who can reach the public API can cause those,
+  so they are capped at 30 a minute; the rest are counted in one `observed.more` record.
+  Like the refusals they have a file and a memory ring of their own
+  ([18.5](#185-storage-rotation-and-retention)), so they never replace a change record.
+
+### 18.2 Who: addresses and proxies
+
+Every record of an admin request carries what the server knows about its sender
+(`actor` in the API, type `client`):
+
+| Field | Meaning |
+|---|---|
+| `peer` | the TCP peer of the request: the machine that opened the connection to the server. Behind nginx or another proxy this is the proxy (`unix socket` for a request over a Unix socket) |
+| `client` | the client address as the server's address logic finds it ([4.3](#43-built-in-address-allow-list-hosts-without-nginx)): the peer, or, only when the peer is listed in `PROVISION_ADMIN_TRUSTED_PROXIES`, the address taken from its `X-Forwarded-For`. The same address the built-in allow-list checks; the activity log uses it whether that allow-list is on or off |
+| `via_proxy` | `client` was taken from the `X-Forwarded-For` of a trusted proxy |
+| `forwarded_for` | only when the request had one: the raw `X-Forwarded-For` header as it arrived (several header lines joined with `, `, in the order they arrived), at most 128 bytes |
+| `forwarded_trusted` | with `forwarded_for`: whether the peer is a trusted proxy. When it is not, the header is whatever the sender wrote (any client can send one) and counts as unverified |
+| `note` | why the `X-Forwarded-For` of a trusted proxy was not used (missing, sent in more than one header line, an entry that is not an address) |
+| `user_agent` | only when the request had one: the `User-Agent` header, at most 128 bytes: which browser or tool |
+| `label` | the actor in one line, as the panel shows it |
+
+The `label` reads `10.64.0.7` (a direct request), `10.64.0.7 via trusted proxy 127.0.0.1`
+(taken from a trusted proxy), or `172.18.0.3 (X-Forwarded-For 10.64.0.7, unverified)` (a
+header the server cannot check). Records of the server itself have the actor type
+`server`; the `observed` records the type `public_api`, label "public API (unknown)":
+the public routes carry no admin key, and the server does not record who called them. A
+merged record of many clients (the status probe of refused browsers, the summary of a
+flood) has the type `various`.
+
+What that means in the usual setups:
+
+| Setup | `peer` | `client` | `X-Forwarded-For` | `label` |
+|---|---|---|---|---|
+| Host without a proxy, an admin on the LAN | `10.64.0.7` | `10.64.0.7` | none | `10.64.0.7` |
+| The same, with a client that sends `X-Forwarded-For: 192.0.2.1` itself | `10.64.0.7` | `10.64.0.7` | `192.0.2.1`, unverified | `10.64.0.7 (X-Forwarded-For 192.0.2.1, unverified)` |
+| Docker (`docker-dual/`) as shipped | the nginx container, e.g. `172.18.0.3` | `172.18.0.3` | `10.64.0.7`, unverified | `172.18.0.3 (X-Forwarded-For 10.64.0.7, unverified)` |
+| Docker with nginx trusted (below) | `172.30.96.10` | `10.64.0.7` | `10.64.0.7`, trusted | `10.64.0.7 via trusted proxy 172.30.96.10` |
+| Host nginx site ([13.5](#135-nginx)) with `PROVISION_ADMIN_TRUSTED_PROXIES=127.0.0.1` | `127.0.0.1` | `10.64.0.7` | `10.64.0.7`, trusted | `10.64.0.7 via trusted proxy 127.0.0.1` |
+| Over a VPN with NAT | the VPN gateway | the VPN gateway | | the VPN gateway |
+
+**Docker.** In the shipped stack every admin request reaches the server from nginx, and
+the compose file sets no trusted proxy. The log then records the nginx container as the
+peer, and the `X-Forwarded-For` that nginx passes on as **unverified**. In this stack its
+last entry is in fact the address nginx saw (nginx appends it, and the server container
+is not published), but the server cannot tell it apart from a header that a process on
+the compose network wrote itself. To have the address recorded as verified, give nginx a
+fixed address and list it in `PROVISION_ADMIN_TRUSTED_PROXIES`, for example with a
+`docker-compose.override.yml` next to `docker-compose.yml` (compose reads it by itself;
+the shipped files stay as they are):
+
+```yaml
+services:
+  nginx:
+    networks:
+      default:
+        ipv4_address: 172.30.96.10
+  llama-dual:
+    environment:
+      PROVISION_ADMIN_TRUSTED_PROXIES: "172.30.96.10"
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.96.0/24
+          gateway: 172.30.96.1
+```
+
+Pick a subnet that is free on the host, then `docker compose down` and
+`docker compose up -d` (the network is created again; the models load again). With
+`-f docker-compose.yml` on the command line compose does not read the override file:
+name it too (`-f docker-compose.yml -f docker-compose.override.yml`). The access rule
+stays in nginx ([4.1](#41-address-allow-list-nginx)): without
+`PROVISION_ADMIN_ALLOW_FROM` the trusted proxy changes only what the activity log
+records, and the startup note in the log and in Diagnostics says so
+([4.3](#43-built-in-address-allow-list-hosts-without-nginx)). Requests made on the
+Docker host itself then show the gateway address (`172.30.96.1`), as in the nginx log.
+
+**What a recorded address proves.** It is the address the request came from, or the one
+a trusted proxy vouched for; nothing more. Every account on an allowed host, every
+process that can reach the server past nginx, and every trusted proxy address can act
+under any address it can send from or claim ([4.1](#41-address-allow-list-nginx),
+[4.3](#43-built-in-address-allow-list-hosts-without-nginx)). The `User-Agent` is written
+by the client and proves nothing.
+
+### 18.3 Refused requests
+
+A request that the server answers with `401` (no or a wrong admin key) or `403` (the
+server's own allow-list, [4.3](#43-built-in-address-allow-list-hosts-without-nginx)) is
+recorded as `access.refused`, also when the early check of the upload chunk route
+([16.7](#167-limits-and-memory)) refuses it before its body is read. So that a stream of
+refused requests can neither fill the disk nor push the record of a real change out of
+the log:
+
+- **Merged.** Refusals of one client, for one path, with one status and reason are one
+  record per 60 seconds, with a `count` and the time of the first and the last request.
+  `reason` is `no_key` or `wrong_key` for a `401`, and `not_allowed` or
+  `allow_list_locked` (an invalid entry locks `/admin`) for a `403`; `code` is the error
+  type. The record is written at once with the first request; when its 60 seconds are
+  over, the final count is written as an update of the same record (in the file a second
+  line with `group` set to the record's `seq`). A crash loses at most the count of the
+  last minute.
+- **The status probe.** Every page load of the web UI calls `GET /admin/status`, so the
+  `403` answers of the probe are merged per path, status and reason over all clients
+  (`probe: true`), with the number of clients and a sample of their addresses (actor
+  "browsers of refused addresses").
+- **Capped.** At most 60 new refusal records start in a minute, and at most 256 merge
+  windows are open at once. Beyond that, the rest of the minute goes into one summary,
+  `access.refused_more`, with the count, the number of clients (up to 256 counted), a
+  sample of 8 addresses and up to 16 paths.
+- **Apart.** Refusals have a file and a memory ring of their own
+  ([18.5](#185-storage-rotation-and-retention)): however many there are, they never
+  replace a change record.
+
+The status probe without a key is not a refusal (it answers `200` with
+`"authorized": false`). Other early answers of the chunk route (`409`, `411`, `413`,
+`415`, `429`) are part of an upload and are not recorded.
+
+### 18.4 What cannot be recorded
+
+The admin layer does not move or wrap the routes that existed before
+([2](#2-what-stays-public-by-design)), so it cannot see who uses them. Not in this log:
+
+- who called `POST /models` (download), `DELETE /models`, `POST /models/load`,
+  `POST /models/unload` or caused an automatic load: only their effects appear, as the
+  `observed` records of [18.1](#181-what-is-recorded) with the actor "public API
+  (unknown)";
+- inference requests (chat, completions, embeddings, ...);
+- requests that nginx refused: they never reach the server; see the nginx log
+  (`docker compose logs nginx`; host: the access log of the site);
+- requests that `--api-key` refused: that check runs before the admin layer;
+- what was changed on the host: an edited `models.ini`, files dropped into or removed
+  from the models directory by hand (the rescan updates the model list and records
+  nothing; `model.removed` comes only from `DELETE /models`), edited state files;
+- requests that only read (see [18.1](#181-what-is-recorded));
+- records that were kept in memory only and lost at a restart
+  ([18.6](#186-when-the-log-cannot-be-written)).
+
+### 18.5 Storage, rotation and retention
+
+| File in the admin state directory | Content |
+|---|---|
+| `admin-audit.jsonl` | the records of the kinds `change` and `server`, one JSON object per line, oldest first |
+| `admin-audit-refusals.jsonl` | the `refusal` records ([18.3](#183-refused-requests)) |
+| `admin-audit-observed.jsonl` | the `observed` records ([18.1](#181-what-is-recorded)) |
+| `admin-audit.jsonl.1`, `admin-audit-refusals.jsonl.1`, `admin-audit-observed.jsonl.1` | the previous generation of each |
+
+A file is created with its first record. The `audit.persisted_again` record of a file
+([18.6](#186-when-the-log-cannot-be-written)) is written into that file, so the refusal
+and the observed file can hold a `server` record too.
+
+- **Written once per record.** Each record is appended and synced to disk (`fsync`) at
+  once; admin actions are rare, so this costs nothing noticeable. A write that fails is
+  cut back. A line cut anyway (a crash in the middle of a write, or a write whose cut
+  failed too) stays on a line of its own: the next record starts on a new line, and the
+  cut one is listed as `unreadable` ([12.19](#1219-get-adminaudit)). On Linux the files
+  have mode `0600` (the server also sets it on an older file it owns); on Windows they
+  take the access list of the state directory ([3.5](#35-outside-docker)).
+- **A line is at most 4 KiB.** Longer details are replaced by
+  `{"truncated": true, "text": ...}` with the first KiB of their JSON text. A record
+  that still does not fit keeps only `seq`, `kind`, `action`, `result`, `ts`, `time` and
+  `"truncated": true`.
+- **Numbering.** `seq` numbers the records of all three files in the order they were
+  recorded, and goes on across restarts (the server reads the last number back from the
+  files).
+- **Rotation.** When a file would grow past 4 MiB it becomes `.1` (an older `.1` is
+  replaced) and a new file is started. The log therefore holds the last 4 to 8 MiB of
+  change records, several thousand admin actions, and as much again of refusals and of
+  observed records: at most 24 MiB in all. There is no time limit: the size alone bounds
+  how far back the log goes and how long addresses are kept. `GET /admin/storage` lists
+  the files with their size (`audit`).
+- **Restarts and updates** keep the files, like the rest of the admin state (a Docker
+  volume, `/var/lib/provision-llm-admin` on a host). Each start adds `audit.started`.
+- **Reset.** The reset of [11](#11-storage) (removing `admin-state.json*`,
+  `admin-models.json*` and `admin.key`) leaves the log alone. To clear it, stop the
+  server and remove `admin-audit*.jsonl*` as well; removing the whole state volume
+  removes it too.
+- **Backup.** The files are plain JSON lines. Copy them with the rest of the state
+  directory ([14.1](#141-every-update-record-the-image-and-back-up-the-admin-state)), or
+  download them from the Activity tab or with `GET /admin/audit?format=jsonl`.
+- Do not edit the files while the server runs: it appends to them. The server never
+  reads them to decide anything except the next `seq`; a line it cannot read at all is
+  skipped.
+
+### 18.6 When the log cannot be written
+
+The log never holds up an admin action and never makes one fail. When the state
+directory is not writable at start-up, or a write fails later (a full disk, a removed
+volume, an I/O error):
+
+- the records go to memory instead: a ring of the last 1000 records for each file (the
+  changes, the refusals and the observed records; each file is written or kept in
+  memory on its own); what was written to disk before stays there;
+- `GET /admin/status` carries the warning `audit_not_persisted` and the `audit` object
+  ([12.1](#121-get-adminstatus)) with the error and since when; the Diagnostics item
+  "Audit log" ([10](#10-diagnostics)) says the same; `GET /admin/audit` answers
+  `"persisted": false`;
+- the Activity tab shows a banner that the log is kept in memory only;
+- the server tries the file again every minute. When a write works again, it first
+  writes what the ring holds, in order, then records `audit.persisted_again` in that
+  file with the time the problem started and how many records the full ring had to drop
+  (`lost`). Every file that was kept in memory gets one such record, also when its ring
+  was empty: after a state directory that could not be written at start-up there are
+  three. The record exists only once it is on disk: while nothing can be written, no
+  such record appears;
+- records still in memory when the server stops are lost. Download the log first if
+  they matter.
+
+The same holds for a state directory that is missing or not writable at start-up: once
+it is fixed ([3.1](#31-server-environment-variables), the Diagnostics item "Admin state
+directory"), the server writes to it within a minute, without a restart.
+
+### 18.7 In the panel
+
+Admin page, **Activity** tab (shown when the server lists the feature `audit`, see
+[12.1](#121-get-adminstatus)):
+
+- a table with the newest records first and the columns **Time** (local time, the UTC
+  time as a tooltip), **Actor**, **Action**, **Target** and **Result**; on a phone each
+  record is one block. Above it, how many records there are ("Showing 100 of 1180
+  records").
+- **Actor**: the client address; under it "via trusted proxy 127.0.0.1" when the address
+  came from a trusted proxy, or the `X-Forwarded-For` value with the badge **via proxy,
+  unverified** when the peer is not a trusted proxy
+  ([18.2](#182-who-addresses-and-proxies)). Records of the server itself show "Server",
+  the `observed` ones "Public API" (caller unknown), a merged record of several clients
+  "Several clients" or "Browsers of refused addresses" with the number of clients.
+- **Action**: what happened, in words ("Model settings changed", "Request refused", ...;
+  the action name as a tooltip; a change that was answered with an error reads
+  "... failed"), with a one-line summary, and the badges **counting** (a merged record
+  whose minute is not over: **Refresh** shows the final count) and **memory only** (not
+  on disk yet, [18.6](#186-when-the-log-cannot-be-written)).
+- Click the time of a record to open its details: **Details**, **Who** (client address,
+  TCP peer, `X-Forwarded-For`, note, `User-Agent`), **Record** (number, kind, action,
+  time, where it is kept) and **Raw record (JSON)** with **Copy record**.
+- Filters: the kind (**All**, **Changes**, **Server**, **Public API**, **Refusals**;
+  several can be on at once), the action (**All actions**, **Settings**, **Uploads**,
+  **Deletes**, **Downloads**, **Failed starts**, **GPU re-detection**, **Refused
+  requests**, **Audit log**) and the result (**Any result**, **OK**, **Errors and
+  failures**, **Refused**). **Clear filters** shows everything again.
+- **Refresh** reads the newest records again; **Load more (N older)** fetches the next
+  100 older ones.
+- **Download JSONL** saves the records that match the current filters as a JSON-lines
+  file, oldest first ([12.19](#1219-get-adminaudit)); without filters, the whole log.
+- While the log is kept in memory, a banner "The audit log is kept in memory only" says
+  since when and why, and how many records were already dropped
+  ([18.6](#186-when-the-log-cannot-be-written)).
+
+The tab only reads: nothing in it changes or removes records.
+
+### 18.8 Privacy
+
+- **Never recorded:** the admin key (`X-Admin-Key`), the `Authorization` header (the
+  server's `--api-key`), `HF_TOKEN` or any other token, request bodies, and paths
+  outside the models directory. As a second line of defence the server replaces the
+  admin key and `HF_TOKEN` by `[redacted]` wherever they would appear in a record, and in
+  the line the server log prints for each record (`admin: audit: ...`); a value is
+  replaced before it is cut, so no part of a key is left either.
+  Settings values are the ones of [6.1](#61-which-models-and-which-settings) and
+  [5](#5-settings): device names, numbers, model ids.
+- **Recorded:** client addresses, `X-Forwarded-For`, the `User-Agent`, model ids, upload
+  and file names (relative to the models directory), file sizes and SHA-256 values,
+  and settings values. Client addresses can be personal data where you operate: the
+  size limit of [18.5](#185-storage-rotation-and-retention) is the only retention limit;
+  remove the files to clear it.
+- **Who can read it:** whoever has the admin key (`GET /admin/audit`, the Activity tab),
+  and the accounts that can read the admin state directory (on a host the service
+  account and root; in Docker everyone who can run `docker` on the host).
+- Values from the request cannot start a new record or hide in one: the target (model
+  id, upload name, path), the `User-Agent` and `X-Forwarded-For` keep printable ASCII
+  only (every other byte becomes `?`) and are cut; everything is stored as JSON strings,
+  and the panel shows every value as text.
+- The record of an unfinished upload in the state directory (`uploads/<id>.json`, [11](#11-storage))
+  keeps the actor of the admin who created it, for the records the checks write later;
+  it is removed with that record, at the latest 24 hours after the upload ended.
+
+### 18.9 With curl
+
+```bash
+# the newest 50 records
+curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/audit?limit=50" | jq .
+
+# the next older page: before = next_before of the previous answer
+curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/audit?limit=50&before=1180" | jq .
+
+# only the refused requests; every upload action; deletions and removed projectors
+curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/audit?kind=refusal" | jq .
+curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/audit?action=upload" | jq .
+curl -s -H "X-Admin-Key: $KEY" "$BASE/admin/audit?action=model.delete,model.remove_projector" | jq .
+
+# the whole log as a file
+curl -s -H "X-Admin-Key: $KEY" -o admin-audit.jsonl "$BASE/admin/audit?format=jsonl"
+```

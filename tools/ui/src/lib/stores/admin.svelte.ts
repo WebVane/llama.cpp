@@ -18,6 +18,7 @@
 
 import { browser } from '$app/environment';
 import {
+	ADMIN_AUDIT,
 	ADMIN_FEED_REOPEN_REFRESH_MIN_MS,
 	ADMIN_GPU_REFRESH,
 	ADMIN_KEY_STORAGE_KEY,
@@ -62,6 +63,7 @@ import type {
 	ApiModelsSseDownloadData,
 	ApiModelsSseEvent
 } from '$lib/types';
+import type { ApiAdminAuditStatus } from '$lib/types/admin-audit';
 import { ApiError, cacheModelIds, resolveDownloadResult } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
@@ -217,6 +219,27 @@ class AdminStore {
 	/** Pinned model ids in effect, from the last settings snapshot. */
 	get pinnedIds(): string[] {
 		return this.settings?.pinned ?? [];
+	}
+
+	/**
+	 * A fresher `audit` object than the one of the last status probe (every
+	 * GET /admin/audit answer carries one): keeps the audit_not_persisted
+	 * warning of the page in step without another probe.
+	 */
+	applyAuditStatus(audit: ApiAdminAuditStatus): void {
+		const status = this.status;
+
+		if (!status?.authorized || !audit || typeof audit.persisted !== 'boolean') return;
+
+		if (JSON.stringify(status.audit) === JSON.stringify(audit)) return;
+
+		const warnings = (status.warnings ?? []).filter(
+			(code) => code !== ADMIN_AUDIT.NOT_PERSISTED_WARNING
+		);
+
+		if (!audit.persisted) warnings.push(ADMIN_AUDIT.NOT_PERSISTED_WARNING);
+
+		this.status = { ...status, audit, warnings };
 	}
 
 	/**

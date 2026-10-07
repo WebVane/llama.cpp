@@ -280,6 +280,8 @@ export interface ApiAdminDeletePreview {
 	files: ApiAdminDeleteFile[];
 	/** At most 100 listed; n_kept has the full count */
 	kept: ApiAdminDeleteKept[];
+	/** `kept` lists fewer entries than n_kept (absent on an older server) */
+	kept_truncated?: boolean;
 	/** folder_keeps_other_model | running */
 	warnings: string[];
 	dry_run: true;

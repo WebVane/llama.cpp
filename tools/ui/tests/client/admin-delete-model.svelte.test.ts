@@ -105,7 +105,69 @@ describe('DialogAdminDeleteModel', () => {
 			.element(page.getByTestId('delete-kept'))
 			.toHaveTextContent('not part of this model');
 		await expect.element(page.getByTestId('delete-kept')).toHaveTextContent('qwen/README.md');
+		await expect.element(page.getByTestId('admin-delete-model')).toHaveTextContent('stays because');
 		expect(calls[0]).toMatchObject({ dry_run: true, model: 'qwen', projector_only: false });
+	});
+
+	it('heads the preview with what will happen, not with what happened', async () => {
+		await open();
+
+		await expect
+			.element(page.getByTestId('delete-files-heading'))
+			.toHaveTextContent(/^Will be deleted \(2 files, /);
+
+		await page.getByTestId('delete-projector-only').click();
+		await expect
+			.element(page.getByTestId('delete-files-heading'))
+			.toHaveTextContent(/^Will be removed \(1 file, /);
+	});
+
+	it('lists a projector or draft every model uses as kept, not as a reason the folder stays', async () => {
+		answer = (body) =>
+			body.dry_run
+				? preview({
+						files: [{ bytes: 4_000_000, path: 'qwen/qwen.gguf', role: 'model' }],
+						folder_removed: true,
+						kept: [{ bytes: 900_000, kind: 'file', path: 'mmproj-shared.gguf', shared: true }],
+						kept_bytes: 900_000,
+						n_files: 1,
+						n_kept: 1,
+						total_bytes: 4_000_000
+					})
+				: result();
+		await open();
+
+		const kept = page.getByTestId('delete-kept');
+
+		await expect.element(kept).toHaveTextContent('Kept: used by every model');
+		await expect.element(kept).toHaveTextContent('mmproj-shared.gguf');
+		await expect.element(kept.getByText('used by every model', { exact: true })).toBeVisible();
+		await expect
+			.element(page.getByTestId('admin-delete-model'))
+			.toHaveTextContent('is removed too');
+		await expect
+			.element(page.getByTestId('admin-delete-model'))
+			.not.toHaveTextContent('stays because');
+	});
+
+	it('counts every kept entry when the server lists only the first 100', async () => {
+		const kept = Array.from({ length: 100 }, (_, i) => ({
+			bytes: 10,
+			kind: 'file' as const,
+			path: `qwen/notes-${String(i).padStart(3, '0')}.txt`
+		}));
+
+		answer = (body) =>
+			body.dry_run
+				? preview({ kept, kept_bytes: 2500, kept_truncated: true, n_kept: 250 })
+				: result();
+		await open();
+
+		const box = page.getByTestId('delete-kept');
+
+		await expect.element(box).toHaveTextContent('(250 entries');
+		await expect.element(box).toHaveTextContent('... and 150 more.');
+		expect(document.querySelectorAll('[data-testid="delete-kept"] li')).toHaveLength(100);
 	});
 
 	it('deletes only after the id is typed exactly', async () => {

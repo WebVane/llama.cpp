@@ -291,6 +291,17 @@ export function summarizeDiagnosticValue(item: ApiAdminDiagnosticItem): string {
 			return String(record.path ?? '');
 		case 'model_settings':
 			return `${record.entries ?? 0} saved model${record.entries === 1 ? '' : 's'}${record.read_only ? ', read-only' : ''}`;
+		case 'audit': {
+			// stage 3 M3: {persisted, error, since, in_memory, lost, max_bytes, ring_max, files}
+			if (record.persisted === false) {
+				return `in memory only (${Number(record.in_memory) || 0} records)`;
+			}
+
+			const files = Array.isArray(record.files) ? (record.files as Record<string, unknown>[]) : [];
+			const bytes = files.reduce((sum, file) => sum + (Number(file.bytes) || 0), 0);
+
+			return `written to the state directory (${files.length} file${files.length === 1 ? '' : 's'}, ${formatBytes(bytes)})`;
+		}
 		default:
 			return formatDiagnosticValue(value);
 	}

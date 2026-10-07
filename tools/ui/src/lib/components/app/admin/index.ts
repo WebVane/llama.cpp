@@ -14,7 +14,8 @@
  *
  * Renders one of four states driven by the GET /admin/status probe:
  * checking, "Admin API is not available from this address" (with Retry),
- * the admin key form, or the panel itself with its Models and Settings tabs.
+ * the admin key form, or the panel itself with its Models and Settings tabs
+ * (and the Activity tab of the audit log when the server lists `audit`).
  */
 export { default as AdminScreen } from './AdminScreen.svelte';
 

@@ -878,6 +878,8 @@ export function describeModelWarning(code: string, row?: ApiAdminModelSettingsRo
 	switch (code) {
 		case 'apply_error':
 			return `A saved value could not be applied: ${row?.apply_error || 'see the server log'}.`;
+		case 'audit_not_persisted':
+			return 'The audit log cannot be written to the state directory: new records are kept in memory only and are lost when the server restarts. The Activity tab has the details.';
 		case 'ctx_above_train':
 			return 'The context is larger than the model was trained for (times the slots): quality may drop beyond the trained length.';
 		case 'default_device_not_present':

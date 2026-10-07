@@ -388,6 +388,13 @@ def test_access_forwarded_for_from_a_trusted_proxy():
     assert status == 403 and body["error"]["type"] == "admin_forbidden"
     assert body["error"]["message"].endswith(" 127.0.0.1")
     n_refused += 1
+    # ... and twice with the same spelling, in either order (a client line before or after the proxy's own line)
+    for lines in ([("X-Forwarded-For", "203.0.113.9"), ("X-Forwarded-For", "10.64.0.7")],
+                  [("X-Forwarded-For", "10.64.0.7"), ("X-Forwarded-For", "203.0.113.9")]):
+        status, body = _raw_status(lines)
+        assert status == 403 and body["error"]["type"] == "admin_forbidden", (lines, status, body)
+        assert body["error"]["message"].endswith(" 127.0.0.1")
+        n_refused += 1
 
     # with the key: status and diagnostics report what the server sees
     res = _request("GET", "/admin/status", key=ADMIN_KEY, headers={"X-Forwarded-For": "10.64.0.7"})
@@ -445,15 +452,18 @@ def test_access_wide_trusted_ranges_are_reported():
 
 
 def test_access_trusted_proxies_without_allow_list():
-    """PROVISION_ADMIN_TRUSTED_PROXIES alone switches nothing on: a warning, any address may use /admin"""
+    """PROVISION_ADMIN_TRUSTED_PROXIES alone switches no restriction on: a warning, any address may use /admin
+    (the trusted proxies still name the client the audit log records)"""
     _enable(PROVISION_ADMIN_TRUSTED_PROXIES="127.0.0.1")
     server.start()
 
     assert _request("GET", "/admin/status", headers={"X-Forwarded-For": "203.0.113.9"}).status_code == 200
     item = _diagnostic()
-    assert item["status"] == "warning" and "has no effect without PROVISION_ADMIN_ALLOW_FROM" in item["hint"]
+    warning = ("PROVISION_ADMIN_TRUSTED_PROXIES without PROVISION_ADMIN_ALLOW_FROM only affects the client address the "
+               "audit log records: any address may use /admin")
+    assert item["status"] == "warning" and warning in item["hint"]
     assert item["value"]["enabled"] is False and item["value"]["trusted_proxies"] == ["127.0.0.1"]
-    assert "PROVISION_ADMIN_TRUSTED_PROXIES has no effect without PROVISION_ADMIN_ALLOW_FROM" in _log_text()
+    assert warning in _log_text()
 
 
 def test_access_environment_not_passed_to_children():

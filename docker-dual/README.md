@@ -409,18 +409,26 @@ Full description, API reference and upgrade checklist:
   connection, a reload or a restart) land in `./models-rw/local` as well, and
   only after the server has checked them. Unfinished uploads live in
   `./models-rw/local/.provision-upload/`: leave that folder alone, the server
-  cleans it up. The server gives uploaded files the owner of `./models-rw/local`.
+  cleans it up. The server gives uploaded files the owner and group of
+  `./models-rw/local` (it runs as root in the container) and makes them
+  group-writable.
   Without the `/models-rw` mount the panel shows the upload as unavailable. The
   shipped nginx front door needs no change for uploads; a proxy of your own in
   front of it may need a larger body limit for `/admin/`, see
   [`docs/provision-admin.md`](../docs/provision-admin.md#169-behind-a-reverse-proxy).
 - Models in `./models-rw/local` (uploaded or dropped in) can be deleted in the
   panel (**Delete files**): only the files the model uses, other files in its
-  folder stay. **Remove projector** drops only the projector of a model.
-  Downloaded models keep their **Delete**.
-<!-- s3-recheck: UI labels "Upload GGUF", "Delete files...", "Remove projector"; owner of uploaded files in Docker. -->
+  folder stay. In the same dialog, **Remove only the projector** drops only the
+  projector of a model. Downloaded models keep their **Delete**.
   Settings (`admin-state.json`), per-model settings (`admin-models.json`) and
   the generated key live in the `llama-admin-state` volume.
+- The **Activity** tab shows what was changed through the admin API, refused
+  admin requests and some effects of the public model routes (the log is
+  `admin-audit*.jsonl` in the same volume). In this stack the server sees every
+  request coming from nginx, so it records nginx as the address and the real
+  one, from `X-Forwarded-For`, as unverified. To record it as verified, give
+  nginx a fixed address and trust it, see
+  [`docs/provision-admin.md`](../docs/provision-admin.md#182-who-addresses-and-proxies).
 - Before every image update note the image digest (the CI tags are rolling,
   `docker compose pull` leaves no older image behind) and back up the admin
   state; `LLAMA_DUAL_IMAGE=<repo>@sha256:...` is the way back:
@@ -478,11 +486,12 @@ The admin layer is enabled by the compose file, not by the image: a plain
 - **`/admin/...` answers 403** &mdash; the client address is not in
   `ADMIN_ALLOW_RULES`. `docker compose logs nginx` shows the address nginx
   saw (`access forbidden by rule, client: ...`).
-- **The Upload tab of "Add model" is disabled** &mdash; the server has no
-  writable models directory: `/models-rw` is not mounted (an older compose
-  file), `./models-rw/local` is missing, or it is not writable. The tab names
-  the reason; fix it and run `docker compose up -d` again.
-- **An upload stops with "Disk full"** &mdash; the filesystem of
+- **The Upload GGUF tab of "Add model" shows a reason instead of the drop
+  zone** &mdash; the server has no writable models directory: `/models-rw` is
+  not mounted (an older compose file), `./models-rw/local` is missing, or it is
+  not writable. The tab names the reason; fix it and run `docker compose up -d`
+  again.
+- **An upload stops with "The disk is full"** &mdash; the filesystem of
   `./models-rw` is full (it often also holds the admin state volume and the
   Docker images). Free space, then press **Resume**; or **Cancel**, which frees
   what was received.

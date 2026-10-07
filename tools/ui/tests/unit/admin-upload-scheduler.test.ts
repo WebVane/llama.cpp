@@ -625,8 +625,7 @@ describe('AdminUploadScheduler', () => {
 		// the last chunk (2 MiB) drops four times: a flaky network, not a size limit
 		const t = setup([10 * MIB], {
 			hooks: [
-				(request) =>
-					request.offset === 8 * MIB && drops++ < 4 ? { body: null, status: 0 } : null
+				(request) => (request.offset === 8 * MIB && drops++ < 4 ? { body: null, status: 0 } : null)
 			]
 		});
 

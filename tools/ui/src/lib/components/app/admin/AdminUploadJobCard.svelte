@@ -158,8 +158,7 @@
 	let renameProblem = $derived(renameValue ? validateModelName(renameValue.trim()) : 'empty');
 	/** The checks wait for a shorter name (Windows, split model): its longest length */
 	let nameLimit = $derived(
-		job.phase === AdminUploadJobPhase.READY &&
-			session?.blocked_by === AdminUploadBlock.CHECK_FAILED
+		job.phase === AdminUploadJobPhase.READY && session?.blocked_by === AdminUploadBlock.CHECK_FAILED
 			? uploadNameLimit(session.blocked)
 			: null
 	);

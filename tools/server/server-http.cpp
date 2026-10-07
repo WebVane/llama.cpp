@@ -612,6 +612,17 @@ static std::map<std::string, std::string> get_headers(const httplib::Request & r
     return headers;
 }
 
+// provision-admin: every X-Forwarded-For line in order, whatever its spelling (get_headers() keeps the last line of
+// each spelling only, so the /admin allow-list could not tell that the header was sent more than once)
+static std::vector<std::string> get_forwarded_for(const httplib::Request & req) {
+    std::vector<std::string> lines;
+    const auto range = req.headers.equal_range("X-Forwarded-For");
+    for (auto it = range.first; it != range.second; ++it) {
+        lines.push_back(it->second);
+    }
+    return lines;
+}
+
 static std::string build_query_string(const httplib::Request & req) {
     std::string qs;
     for (const auto & [key, value] : req.params) {
@@ -679,6 +690,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         request->remote_addr = req.remote_addr; // provision-admin: client address for the /admin allow-list
+        request->forwarded_for = get_forwarded_for(req); // provision-admin: see server-http.h
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
@@ -731,6 +743,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
             req.is_connection_closed
         });
         request->remote_addr = req.remote_addr; // provision-admin: client address for the /admin allow-list
+        request->forwarded_for = get_forwarded_for(req); // provision-admin: see server-http.h
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
@@ -750,6 +763,7 @@ void server_http_context::set_pre_body_handler(const std::string & path, const p
             }
             server_http_req request{ get_params(req), get_headers(req), req.path, build_query_string(req), "", {}, req.is_connection_closed };
             request.remote_addr = req.remote_addr;
+            request.forwarded_for = get_forwarded_for(req); // provision-admin: see server-http.h
             std::shared_ptr<void> hold;
             server_http_res_ptr refused = handler(request, hold);
             if (hold) {
@@ -779,6 +793,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         request->remote_addr = req.remote_addr; // provision-admin: client address for the /admin allow-list
+        request->forwarded_for = get_forwarded_for(req); // provision-admin: see server-http.h
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
@@ -938,6 +953,7 @@ void server_http_context::register_gcp_compat() const {
                         {},
                         req.should_stop,
                         req.remote_addr, // provision-admin: same client address as the outer request
+                        req.forwarded_for, // provision-admin: and the same X-Forwarded-For lines
                     };
 
                     server_http_res_ptr internal_res = handlers.at(dispatch_path)(internal_req);

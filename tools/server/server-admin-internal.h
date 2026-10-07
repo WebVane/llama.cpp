@@ -166,11 +166,28 @@ void                  admin_internal_dir_space(const std::filesystem::path & dir
 std::string           admin_internal_client_text(const server_http_req & req); // the client address as the allow-list sees it
 
 //
-// audit hook (stage 3, milestone M3 stores the records and shows them; until then they are only logged)
+// audit (stage 3, milestone M3: the store is server-admin-audit.cpp, GET /admin/audit, the Activity tab)
 //
 // One call per admin action with its outcome. Never blocks for long and never throws. req is the request that
-// caused it (nullptr for an action of the server itself, e.g. an expired upload); details carries no secrets
-// (no key, no token, no request body, no paths outside models_dir).
+// caused it (kind "change"; nullptr = an action of the server itself, kind "server", e.g. an expired upload);
+// details carries no secrets (no key, no token, no request body, no paths outside models_dir).
 //
 void admin_audit(const server_http_req * req, const std::string & action, const std::string & target,
                  const std::string & result, const json & details = json::object());
+
+// the client of req as the audit records it: TCP peer, the client the trusted-proxy rules give (also with the
+// allow-list off), the raw X-Forwarded-For (trusted only when the peer is a trusted proxy), User-Agent (capped)
+json admin_audit_actor(const server_http_req & req);
+
+// a change done later on behalf of a client (actor from admin_audit_actor(), kept e.g. with an upload session)
+void admin_audit_for(const json & actor, const std::string & action, const std::string & target,
+                     const std::string & result, const json & details = json::object());
+
+// an effect of the public API seen on the model event feed (actor "public API (unknown)")
+void admin_audit_observed(const std::string & action, const std::string & target, const std::string & result,
+                          const json & details = json::object());
+
+// a handler that is about to change something names its action first: when it then fails (an error answer or
+// an exception) before it called admin_audit() for that action, the route wrapper records it with result
+// "error" and the status and error type. Read-only requests (dry runs, checks) do not call it.
+void admin_audit_intent(const server_http_req & req, const std::string & action, const std::string & target);

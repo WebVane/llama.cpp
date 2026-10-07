@@ -89,6 +89,7 @@
 		validateModelSettingsDraft,
 		withFailedSettings
 	} from '$lib/utils';
+	import { keepFocusOffDialogClose } from '$lib/utils/admin-dialog-focus';
 	import { onDestroy, onMount, untrack } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
@@ -1081,6 +1082,7 @@
 			event.preventDefault();
 			contentNode?.focus();
 		}}
+		onfocusin={(event) => keepFocusOffDialogClose(event, contentNode)}
 		tabindex={-1}
 	>
 		<Dialog.Header class="gap-1 text-left">

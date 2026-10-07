@@ -1,4 +1,5 @@
 <script lang="ts">
+	import AdminActivityTab from './AdminActivityTab.svelte';
 	import AdminDiagnostics from './AdminDiagnostics.svelte';
 	import AdminKeyForm from './AdminKeyForm.svelte';
 	import AdminModelsTab from './AdminModelsTab.svelte';
@@ -11,7 +12,7 @@
 	import * as Alert from '$lib/components/ui/alert';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
-	import { ADMIN_TABS, ICON_CLASS_DEFAULT, ROUTES } from '$lib/constants';
+	import { ADMIN_AUDIT, ADMIN_TABS, ICON_CLASS_DEFAULT, ROUTES } from '$lib/constants';
 	import { AdminFeature, AdminProbeState, AdminTab, KeyboardKey } from '$lib/enums';
 	import { adminStore, modelsStore } from '$lib/stores';
 	import {
@@ -37,8 +38,20 @@
 		adminStore.settings?.models_max ?? adminStore.status?.models?.max ?? null
 	);
 	let stateInfo = $derived(adminStore.status?.state);
-	let statusWarnings = $derived(adminStore.isAuthorized ? (adminStore.status?.warnings ?? []) : []);
+	// the Activity tab explains audit_not_persisted in its own banner
+	let statusWarnings = $derived(
+		adminStore.isAuthorized
+			? (adminStore.status?.warnings ?? []).filter(
+					(code) => !(activeTab === AdminTab.ACTIVITY && code === ADMIN_AUDIT.NOT_PERSISTED_WARNING)
+				)
+			: []
+	);
 	let showDiagnostics = $derived(adminStore.hasFeature(AdminFeature.DIAGNOSTICS));
+	let showActivity = $derived(adminStore.hasFeature(AdminFeature.AUDIT));
+	// a tab with a feature only when the server has it (a newer page against an older server)
+	let tabs = $derived(
+		ADMIN_TABS.filter((tab) => !tab.feature || adminStore.hasFeature(tab.feature))
+	);
 	// a refused address (HTTP 403) without a saved key: nothing to explain, back to the chat
 	let refused = $derived(
 		!isChecking && !adminStore.isAvailable && adminStore.forbidden && !adminStore.hasSavedKey()
@@ -46,6 +59,13 @@
 
 	$effect(() => {
 		if (refused) untrack(() => void goto(ROUTES.START, { replaceState: true }));
+	});
+
+	// the server no longer lists the feature of the tab shown (another server, a key change)
+	$effect(() => {
+		if (adminStore.isAuthorized && !tabs.some((tab) => tab.id === activeTab)) {
+			untrack(() => (activeTab = AdminTab.MODELS));
+		}
 	});
 
 	// the GPU cards refresh on a timer only while the Models tab is the one shown
@@ -77,7 +97,7 @@
 
 	/** Arrow keys, Home and End move between the tabs (WAI-ARIA tabs pattern). */
 	function handleTabKeydown(event: KeyboardEvent, index: number) {
-		const count = ADMIN_TABS.length;
+		const count = tabs.length;
 
 		let next: number;
 
@@ -104,7 +124,7 @@
 
 		event.preventDefault();
 
-		const tab = ADMIN_TABS[next].id;
+		const tab = tabs[next].id;
 
 		selectTab(tab);
 		tabButtons[tab]?.focus();
@@ -229,7 +249,7 @@
 			class="inline-flex w-fit rounded-lg border bg-muted/40 p-0.5"
 			role="tablist"
 		>
-			{#each ADMIN_TABS as tab, index (tab.id)}
+			{#each tabs as tab, index (tab.id)}
 				<button
 					bind:this={tabButtons[tab.id]}
 					aria-controls="admin-panel-{tab.id}"
@@ -252,7 +272,7 @@
 			{/each}
 		</div>
 
-		<!-- both panels stay mounted: switching tabs must not throw away unsaved settings -->
+		<!-- the panels stay mounted: switching tabs must not throw away unsaved settings -->
 		<div
 			aria-labelledby="admin-tab-{AdminTab.MODELS}"
 			hidden={activeTab !== AdminTab.MODELS}
@@ -280,5 +300,17 @@
 				</div>
 			</div>
 		</div>
+
+		{#if showActivity}
+			<div
+				aria-labelledby="admin-tab-{AdminTab.ACTIVITY}"
+				hidden={activeTab !== AdminTab.ACTIVITY}
+				id="admin-panel-{AdminTab.ACTIVITY}"
+				role="tabpanel"
+			>
+				<!-- reads the newest records each time it is shown -->
+				<AdminActivityTab visible={activeTab === AdminTab.ACTIVITY} />
+			</div>
+		{/if}
 	{/if}
 </div>

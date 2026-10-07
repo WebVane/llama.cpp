@@ -22,6 +22,7 @@ import {
 	draftContext,
 	draftWarnings,
 	effectiveDraftSetting,
+	failureMentionsProjector,
 	formatTokensShort,
 	isInstanceAfterFailure,
 	modelRoleOf,
@@ -486,6 +487,59 @@ describe('texts', () => {
 				warnings: []
 			})
 		).toHaveLength(3);
+	});
+
+	it('points at the projector when the output says it could not be used', () => {
+		// what llama.cpp prints when the mmproj does not fit the model (mtmd.cpp, server-context.cpp)
+		const tail = [
+			'srv    load_model: loading model',
+			'mtmd_init_from_file: error: mismatch between text model (n_embd = 64) and mmproj (n_embd = 1152)',
+			"srv    load_model: failed to load multimodal model, 'C:\\models\\m\\mmproj-m.gguf'"
+		];
+		const generic = {
+			code: AdminFailureCode.MODEL_LOAD_FAILED,
+			hint: 'check that the file exists and is a complete GGUF file',
+			hints: [],
+			line: 'srv    load_model: failed to load model',
+			message: 'The model file could not be loaded'
+		};
+
+		expect(failureMentionsProjector(generic, tail)).toBe(true);
+		expect(failureMentionsProjector(generic, ['clip_model_loader: model name: x'])).toBe(false);
+		expect(failureMentionsProjector({ ...generic, line: 'clip_init: failed to load model' })).toBe(
+			true
+		);
+		expect(failureMentionsProjector(null, ['srv load_model: loaded multimodal model'])).toBe(false);
+
+		const removable = describeFailureReason(generic, { lines: tail, projectorRemovable: true });
+
+		expect(removable.hint).toMatch(
+			/Delete files\.\.\. -> Remove only the projector keeps the model/
+		);
+		expect(removable.hint).not.toMatch(/complete GGUF file/);
+		expect(describeFailureReason(generic, { lines: tail }).hint).toMatch(
+			/check the projector set for it/
+		);
+		expect(describeFailureReason(null, { lines: tail, projectorRemovable: true }).hint).toMatch(
+			/^The projector \(mmproj\) may not match this model.* Show the output for details\.$/
+		);
+
+		// no projector line: the server's hint stays; memory problems keep their own hint
+		expect(describeFailureReason(generic, { lines: [], projectorRemovable: true }).hint).toBe(
+			generic.hint
+		);
+		expect(
+			describeFailureReason(
+				{
+					code: AdminFailureCode.OUT_OF_MEMORY,
+					hint: 'lower the context',
+					hints: [],
+					line: 'clip: failed to allocate compute buffer',
+					message: 'Out of GPU memory'
+				},
+				{ lines: tail, projectorRemovable: true }
+			).hint
+		).toMatch(/^lower the context/);
 	});
 });
 

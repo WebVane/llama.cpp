@@ -7,6 +7,7 @@
 #include "server-admin.h"
 #include "server-admin-internal.h"
 #include "server-admin-upload.h"
+#include "server-admin-audit.h"
 
 #include "server-common.h"
 #include "server-http.h"
@@ -2003,6 +2004,8 @@ static void admin_models_startup_revert(admin_context & ctx) {
         changed = true;
         SRV_WRN("admin: model %s: settings in phase '%s' at startup are not applied again, using its last good settings\n",
                 id.c_str(), was.c_str());
+        admin_audit(nullptr, "model_settings.reverted_at_startup", id, "ok",
+                    { {"phase", was}, {"to", e.last_good.has_value() ? "last_good" : "models_ini"} });
     }
     if (changed && !ctx.models_file.read_only) {
         std::string error;
@@ -2935,9 +2938,10 @@ static admin_access admin_access_from_env(const std::string & allow_from, const 
                                                acc.warnings);
 
     if (allow_ok && acc.allow.empty()) {
-        // off: any address may use /admin
+        // off: any address may use /admin. The trusted proxies still name the client the audit log records
         if (!trusted_ok || !acc.trusted.empty()) {
-            acc.warnings.push_back("PROVISION_ADMIN_TRUSTED_PROXIES has no effect without PROVISION_ADMIN_ALLOW_FROM");
+            acc.warnings.push_back("PROVISION_ADMIN_TRUSTED_PROXIES without PROVISION_ADMIN_ALLOW_FROM only affects "
+                                   "the client address the audit log records: any address may use /admin");
             SRV_WRN("admin: %s\n", acc.warnings.back().c_str());
         }
         return acc;
@@ -3019,6 +3023,22 @@ static bool admin_parse_forwarded_hop(const std::string & hop, admin_ip & out) {
     return admin_parse_ip(addr.substr(0, addr.find('%')), out);
 }
 
+// every X-Forwarded-For line of the request in order, whatever the spelling of its name: req.forwarded_for (filled
+// by server-http.cpp, where `headers` keeps only the last line of each spelling); the header map is the fallback for
+// a request built without it
+static std::vector<std::string> admin_forwarded_lines(const server_http_req & req) {
+    if (!req.forwarded_for.empty()) {
+        return req.forwarded_for;
+    }
+    std::vector<std::string> lines;
+    for (const auto & [name, value] : req.headers) {
+        if (admin_to_lower(name) == "x-forwarded-for") {
+            lines.push_back(value);
+        }
+    }
+    return lines;
+}
+
 // The address the allow-list is checked against: the TCP peer, or, only when the peer is a trusted
 // proxy, the first address of X-Forwarded-For that is not a trusted proxy, counted from the right
 // (every proxy appends the address it got the request from; what the client wrote itself is left
@@ -3039,23 +3059,16 @@ static admin_client admin_client_of(const admin_access & acc, const server_http_
         return c;
     }
 
-    const std::string * forwarded = nullptr;
-    int n_forwarded = 0;
-    for (const auto & [name, value] : req.headers) {
-        if (admin_to_lower(name) == "x-forwarded-for") {
-            forwarded = &value;
-            n_forwarded++;
-        }
-    }
-    if (n_forwarded == 0 || admin_strip(*forwarded).empty()) {
+    const std::vector<std::string> lines = admin_forwarded_lines(req);
+    if (lines.empty() || (lines.size() == 1 && admin_strip(lines[0]).empty())) {
         c.note = "the trusted proxy sent no X-Forwarded-For";
         return c;
     }
-    if (n_forwarded > 1) {
+    if (lines.size() > 1) {
         c.note = "X-Forwarded-For was sent more than once";
         return c;
     }
-    const std::vector<std::string> hops = string_split<std::string>(*forwarded, ',');
+    const std::vector<std::string> hops = string_split<std::string>(lines[0], ',');
     for (size_t i = hops.size(); i-- > 0; ) {
         admin_ip hop;
         if (!admin_parse_forwarded_hop(admin_strip(hops[i]), hop)) {
@@ -3191,6 +3204,7 @@ void server_admin_init(common_params & params) {
     const std::string env_trusted   = admin_getenv("PROVISION_ADMIN_TRUSTED_PROXIES");
     const std::string model_devices = admin_getenv("MODEL_DEVICES"); // only read, stays in the environment
     admin_upload_read_env(); // stage 3: the test-only PROVISION_ADMIN_TEST_* hooks of the upload code
+    admin_audit_read_env();  // stage 3 M3: ... and of the audit log
 
     // always, also when the layer is disabled: the key must not reach a child process
     admin_scrub_env();
@@ -3233,6 +3247,10 @@ void server_admin_init(common_params & params) {
         } else if (!existed) {
             admin_restrict_dir(ctx.state_dir); // it holds the admin key
         }
+        // the audit log (stage 3 M3): first, so that everything below can be recorded (startup revert)
+        admin_audit_store_init(ctx.state_dir, !ec && fs::is_directory(ctx.state_dir, ec), std::string(llama_build_info()));
+        admin_audit_add_secret(admin_getenv("HF_TOKEN")); // never in a record (it stays in the environment)
+        admin_audit_add_secret(env_key);
     }
 
     admin_load_state(ctx);
@@ -3259,6 +3277,7 @@ void server_admin_init(common_params & params) {
     ctx.locked_device = ctx.model_devices.star;
 
     admin_resolve_key(ctx, env_key, env_key_file);
+    admin_audit_add_secret(ctx.key);
 
     // per-model settings: applied by the first load_models() in the server_models constructor
     admin_models_load(ctx);
@@ -4019,15 +4038,140 @@ static server_http_res_ptr admin_check_access(const admin_context & ctx, const s
     return nullptr;
 }
 
+//
+// audit identity and hooks (stage 3 M3; the store is server-admin-audit.cpp)
+//
+
+// a header value for the audit: secrets replaced first (so that a cut cannot leave part of one), printable ASCII
+// only, cut
+static std::string admin_audit_text(const std::string & s, size_t max_len) {
+    std::string out;
+    for (char ch : admin_audit_redact_text(s)) {
+        if (out.size() >= max_len) {
+            out += "...";
+            break;
+        }
+        const unsigned char u = (unsigned char) ch;
+        out += u >= 0x20 && u < 0x7f ? ch : '?';
+    }
+    return out;
+}
+
+static json admin_audit_actor_of(const admin_access & acc, const server_http_req & req, const admin_client & c) {
+    const std::vector<std::string> lines = admin_forwarded_lines(req);
+    const std::string forwarded = admin_join(lines); // every line, in order
+    const size_t n_forwarded = lines.size();
+    std::string agent;
+    for (const auto & [name, value] : req.headers) {
+        if (admin_to_lower(name) == "user-agent") {
+            agent = value;
+        }
+    }
+    admin_ip peer_ip;
+    const bool peer_known   = admin_parse_ip(req.remote_addr.substr(0, req.remote_addr.find('%')), peer_ip);
+    const bool peer_trusted = peer_known && admin_ip_in(acc.trusted, peer_ip);
+    const std::string peer  = peer_known ? admin_ip_to_string(peer_ip) : admin_audit_text(c.peer, 64);
+    json a = {
+        {"type",      "client"},
+        {"peer",      peer.empty() ? std::string("unix socket") : peer},
+        {"client",    c.known ? c.address : std::string()},
+        {"via_proxy", c.via_forwarded},
+    };
+    std::string label;
+    if (c.via_forwarded) {
+        label = c.address + " via trusted proxy " + peer;
+    } else {
+        label = c.known ? c.address : (peer.empty() ? std::string("unknown (unix socket)") : peer);
+    }
+    if (n_forwarded > 0) {
+        // what the client side of the peer claims: verified only hop by hop from trusted proxies
+        a["forwarded_for"]     = admin_audit_text(forwarded, 128);
+        a["forwarded_trusted"] = peer_trusted;
+        if (!peer_trusted) {
+            label += " (X-Forwarded-For " + admin_audit_text(forwarded, 64) + ", unverified)";
+        }
+    }
+    if (!c.note.empty()) {
+        a["note"] = c.note;
+    }
+    if (!agent.empty()) {
+        a["user_agent"] = admin_audit_text(agent, 128);
+    }
+    a["label"] = label;
+    return a;
+}
+
+json admin_audit_actor(const server_http_req & req) {
+    const admin_access & acc = admin_ctx().access;
+    return admin_audit_actor_of(acc, req, admin_client_of(acc, req));
+}
+
+// a refused /admin request (401 / 403); probe: the no-key GET /admin/status
+static void admin_audit_refused(const server_http_req & req, int status, const char * code, const char * reason, bool probe) {
+    try {
+        const admin_access & acc = admin_ctx().access;
+        const admin_client c = admin_client_of(acc, req);
+        admin_audit_store_refusal(admin_audit_actor_of(acc, req, c), c.known ? c.address : c.peer, req.path, status, code,
+                                  reason, probe);
+    } catch (...) {
+        // never fails a request
+    }
+}
+
+static const char * admin_key_refusal_reason(const server_http_req & req) {
+    for (const auto & [name, value] : req.headers) {
+        if (admin_to_lower(name) == ADMIN_KEY_HEADER) {
+            return "wrong_key";
+        }
+    }
+    return "no_key";
+}
+
+// the change a handler is about to make (admin_audit_intent): recorded with result "error" when the handler fails
+struct admin_audit_pending {
+    const server_http_req * req = nullptr;
+    std::string action;
+    std::string target;
+};
+static thread_local admin_audit_pending t_admin_audit_pending; // one handler at a time per HTTP thread
+
+void admin_audit_intent(const server_http_req & req, const std::string & action, const std::string & target) {
+    t_admin_audit_pending.req    = &req;
+    t_admin_audit_pending.action = action;
+    t_admin_audit_pending.target = target;
+}
+
+static void admin_audit_route_done(const server_http_req & req, const server_http_res * res) {
+    admin_audit_pending p;
+    std::swap(p, t_admin_audit_pending);
+    if (p.req != &req || p.action.empty() || res == nullptr || res->status < 400) {
+        return;
+    }
+    try {
+        std::string code;
+        const json body = json::parse_no_throw(res->data);
+        if (!body.is_discarded() && body.is_object() && body.contains("error") && body.at("error").is_object()) {
+            code = admin_json_str(body.at("error"), "type");
+        }
+        admin_audit(&req, p.action, p.target, "error", { {"status", res->status}, {"code", code} });
+    } catch (...) {
+        // never fails a request
+    }
+}
+
 using admin_handler_t = std::function<server_http_res_ptr(admin_context &, const server_http_req &)>;
 
 // never throws: every failure becomes an error response
 static server_http_context::handler_t admin_wrap(admin_handler_t handler, bool need_key) {
     return [handler = std::move(handler), need_key](const server_http_req & req) -> server_http_res_ptr {
         admin_context & ctx = admin_ctx();
+        t_admin_audit_pending = admin_audit_pending();
+        server_http_res_ptr res;
         try {
             server_http_res_ptr refused = admin_check_access(ctx, req);
             if (refused) {
+                // the probe (no key) is called by every browser of a refused address: merged per path, not per address
+                admin_audit_refused(req, 403, "admin_forbidden", ctx.access.locked ? "allow_list_locked" : "not_allowed", !need_key);
                 return refused;
             }
             for (const auto & [name, value] : req.headers) {
@@ -4043,21 +4187,24 @@ static server_http_context::handler_t admin_wrap(admin_handler_t handler, bool n
                 }
                 if (auth != ADMIN_AUTH_OK) {
                     SRV_WRN("admin: rejected %s (missing or wrong X-Admin-Key)\n", req.path.c_str());
+                    admin_audit_refused(req, 401, "admin_key_required", admin_key_refusal_reason(req), false);
                     return admin_res_error(401, "admin_key_required", "a valid X-Admin-Key header is required");
                 }
             }
-            return handler(ctx, req);
+            res = handler(ctx, req);
         } catch (const admin_http_error & e) {
-            return admin_res_error(e.status, e.type, e.what(), e.param, e.extra);
+            res = admin_res_error(e.status, e.type, e.what(), e.param, e.extra);
         } catch (const std::invalid_argument & e) {
-            return admin_res_error(400, "invalid_request_error", e.what());
+            res = admin_res_error(400, "invalid_request_error", e.what());
         } catch (const std::exception & e) {
             SRV_ERR("admin: %s failed: %s\n", req.path.c_str(), e.what());
-            return admin_res_error(500, "server_error", e.what());
+            res = admin_res_error(500, "server_error", e.what());
         } catch (...) {
             SRV_ERR("admin: %s failed: unknown error\n", req.path.c_str());
-            return admin_res_error(500, "server_error", "unknown error");
+            res = admin_res_error(500, "server_error", "unknown error");
         }
+        admin_audit_route_done(req, res.get());
+        return res;
     };
 }
 
@@ -4147,8 +4294,9 @@ static server_http_res_ptr admin_handle_status(admin_context & ctx, const server
     out["ip_allowlist"]  = ctx.access.enabled; // PROVISION_ADMIN_ALLOW_FROM applies
 
     // stage 2 (additive): what this server supports, so that a newer UI bundle can tell
-    out["features"] = json::array({ "model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete" });
+    out["features"] = json::array({ "model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete", "audit" });
     out["upload"]   = admin_upload_status_json(); // stage 3: {available, reason, message}
+    out["audit"]    = admin_audit_status_json();  // stage 3 M3: {persisted, error, since, in_memory, lost, ...}
     std::string default_device;
     {
         std::lock_guard<std::mutex> lk(ctx.mtx_state);
@@ -4165,6 +4313,9 @@ static server_http_res_ptr admin_handle_status(admin_context & ctx, const server
     json warnings = json::array();
     if (admin_default_device_missing(default_device, admin_build_devices(ctx))) {
         warnings.push_back("default_device_not_present");
+    }
+    if (!out["audit"].value("persisted", true)) {
+        warnings.push_back("audit_not_persisted"); // the audit log is kept in memory only
     }
     out["warnings"] = warnings;
     return admin_res_json(200, out);
@@ -4234,8 +4385,16 @@ static server_http_res_ptr admin_handle_get_settings(admin_context & ctx, const 
     return admin_res_json(200, admin_settings_json(ctx, admin_refresh(ctx, false)));
 }
 
+// a value as the audit records it: at most 128 bytes of JSON (secrets replaced before the cut)
+static json admin_audit_value(const json & v) {
+    const json clean = admin_audit_redact_json(v);
+    const std::string text = safe_json_to_str(clean);
+    return text.size() <= 128 ? clean : json(admin_cut(text, 125));
+}
+
 static server_http_res_ptr admin_handle_post_settings(admin_context & ctx, const server_http_req & req) {
     server_models & models = ctx.routes->models;
+    admin_audit_intent(req, "settings.update", "settings");
     const json body = admin_parse_body_object(req);
 
     // one settings change at a time: validate -> persist -> apply
@@ -4346,6 +4505,29 @@ static server_http_res_ptr admin_handle_post_settings(admin_context & ctx, const
     if (!reload_error.empty()) {
         out["reload_error"] = reload_error;
     }
+
+    // the audit: what changed (stored values, old -> new)
+    json changes = json::object();
+    auto audit_change = [&](const char * key, const json & from, const json & to) {
+        if (from != to) {
+            changes[key] = { {"from", admin_audit_value(from)}, {"to", admin_audit_value(to)} };
+        }
+    };
+    audit_change("models_max", models_max_before, next.models_max.has_value() ? *next.models_max : models_max_before);
+    audit_change("default_device", device_before, device_after);
+    audit_change("pinned", saved.pinned.has_value() ? json(*saved.pinned) : json(ctx.env_pinned),
+                 next.pinned.has_value() ? json(*next.pinned) : json(ctx.env_pinned));
+    json requested_keys = json::array();
+    for (const auto & [key, value] : body.items()) {
+        if (requested_keys.size() < 16) {
+            requested_keys.push_back(admin_audit_text(key, 64));
+        }
+    }
+    json audit_details = { {"changed", !changes.empty()}, {"changes", changes}, {"keys", requested_keys} };
+    if (!reload_error.empty()) {
+        audit_details["reload_failed"] = true;
+    }
+    admin_audit(&req, "settings.update", "settings", "ok", audit_details);
     return admin_res_json(200, out);
 }
 
@@ -4416,6 +4598,7 @@ static server_http_res_ptr admin_handle_storage(admin_context & ctx, const serve
     for (const auto & [key, value] : uploads.items()) {
         out[key] = value;
     }
+    out["audit"] = admin_audit_storage_json(); // stage 3 M3: the audit files in the state directory
     return admin_res_json(200, out);
 }
 
@@ -6858,7 +7041,8 @@ static server_http_res_ptr admin_handle_gpus(admin_context & ctx, const server_h
 }
 
 // runs the inventory helper again (it briefly creates a context on every GPU)
-static server_http_res_ptr admin_handle_gpus_rescan(admin_context & ctx, const server_http_req &) {
+static server_http_res_ptr admin_handle_gpus_rescan(admin_context & ctx, const server_http_req & req) {
+    admin_audit_intent(req, "gpus.rescan", "gpus");
     {
         // check and reserve in one step: two requests close together must not run two helpers
         std::shared_ptr<admin_job> alive;
@@ -6898,6 +7082,8 @@ static server_http_res_ptr admin_handle_gpus_rescan(admin_context & ctx, const s
     } else {
         SRV_WRN("admin: device inventory re-detection failed (%s): %s\n", inv.error.c_str(), inv.message.c_str());
     }
+    admin_audit(&req, "gpus.rescan", "gpus", inv.ok ? "ok" : "failed",
+                { {"devices", inv.devices.size()}, {"error", inv.ok ? json(nullptr) : json(inv.error)} });
     return admin_res_json(200, admin_gpus_body(ctx, true));
 }
 
@@ -7255,6 +7441,13 @@ static server_http_res_ptr admin_handle_diagnostics(admin_context & ctx, const s
             json({ {"file", admin_path_to_utf8(admin_models_path(ctx))}, {"entries", f.entries.size()}, {"read_only", f.read_only},
                    {"backup_loaded", f.backup_loaded}, {"error", f.error}, {"problems", f.problems} }),
             f.read_only ? "fix or remove the file, then restart the server" : ""));
+    }
+    {
+        std::string status;
+        std::string hint;
+        json value;
+        admin_audit_diagnostics(status, value, hint); // stage 3 M3
+        items.push_back(admin_diag_item("audit", "Audit log", status, value, hint));
     }
     // only while a helper hangs: the fit check and Re-detect GPUs answer 409 check_stuck / rescan_stuck until it exits
     {
@@ -7814,15 +8007,38 @@ static json admin_previous_json(const admin_kv & before, const admin_kv & after)
     return out;
 }
 
+// the audit: per-model settings old -> new (only the keys that differ)
+static json admin_audit_kv_changes(const admin_kv & before, const admin_kv & after) {
+    json changes = json::object();
+    for (const auto & [key, value] : before) {
+        const auto it = after.find(key);
+        if (it == after.end() || it->second != value) {
+            changes[key] = { {"from", admin_audit_value(value)}, {"to", it == after.end() ? json(nullptr) : admin_audit_value(it->second)} };
+        }
+    }
+    for (const auto & [key, value] : after) {
+        if (!before.count(key)) {
+            changes[key] = { {"from", nullptr}, {"to", admin_audit_value(value)} };
+        }
+    }
+    return changes;
+}
+
 static server_http_res_ptr admin_handle_post_model_settings(admin_context & ctx, const server_http_req & req) {
     server_models & models = ctx.routes->models;
+    admin_audit_intent(req, "model_settings.update", "");
     const json body = admin_parse_body_object(req);
+    if (body.contains("model") && body.at("model").is_string()) {
+        admin_audit_intent(req, admin_body_bool(body, "reset") ? "model_settings.reset" : "model_settings.update",
+                           body.at("model").get<std::string>());
+    }
     if (!body.contains("model") || !body.at("model").is_string() || body.at("model").get<std::string>().empty()) {
         throw admin_bad_param("model", "model must be a model id");
     }
     const std::string requested = body.at("model").get<std::string>();
     const bool reset   = admin_body_bool(body, "reset");
     const bool restart = admin_body_bool(body, "restart");
+    const char * const audit_action = reset ? "model_settings.reset" : "model_settings.update";
     const json settings = body.contains("settings") ? body.at("settings") : json(nullptr);
     if (!reset && !settings.is_object()) {
         throw admin_bad_param("settings", "settings must be an object of {key: value | null}");
@@ -7859,6 +8075,8 @@ static server_http_res_ptr admin_handle_post_model_settings(admin_context & ctx,
             }
             SRV_INF("admin: removed the saved settings of %s (not in the model list)\n", id.c_str());
             result["changed"] = true;
+            admin_audit(&req, audit_action, id, "ok", { {"changed", true}, {"changes", admin_audit_kv_changes(old_settings, admin_kv())},
+                                                        {"model_listed", false} });
             return admin_res_json(200, {
                 {"model",    json({ {"id", id}, {"exists", false}, {"overrides", json::object()} })},
                 {"result",   result},
@@ -7949,6 +8167,8 @@ static server_http_res_ptr admin_handle_post_model_settings(admin_context & ctx,
             }
         }
         in = admin_rows_gather(ctx);
+        admin_audit(&req, audit_action, id, "ok", { {"changed", false}, {"stored", stored_differs},
+                                                    {"changes", admin_audit_kv_changes(old_settings, next)} });
         return admin_res_json(200, {
             {"model",    admin_model_row(ctx, *meta, in, false)},
             {"result",   result},
@@ -8126,6 +8346,19 @@ static server_http_res_ptr admin_handle_post_model_settings(admin_context & ctx,
 
     const std::optional<server_model_meta> after = models.get_meta(id);
     in = admin_rows_gather(ctx);
+    {
+        json audit_details = {
+            {"changed",     true},
+            {"changes",     admin_audit_kv_changes(old_settings, next)},
+            {"was_running", running},
+            {"restart",     restart},
+            {"restarted",   result.value("restarted", false)},
+        };
+        if (!result.value("load_error", std::string()).empty()) {
+            audit_details["load_failed"] = true;
+        }
+        admin_audit(&req, audit_action, id, "ok", audit_details);
+    }
     return admin_res_json(200, {
         {"model",    admin_model_row(ctx, after.has_value() ? *after : *meta, in, false)},
         {"result",   result},
@@ -8458,6 +8691,11 @@ static void admin_revert(admin_context & ctx, const std::string & id, const json
     SRV_WRN("admin: model %s failed to start %d times in a row with its saved settings (%s), reverted to %s\n",
             id.c_str(), ADMIN_MAX_FAILURES, admin_json_str(reason, "code").c_str(),
             had_last_good ? "its last good settings" : "its models.ini values");
+    admin_audit(nullptr, "model_settings.reverted", id, "ok", {
+        {"reason",   admin_json_str(reason, "code")},
+        {"failures", ADMIN_MAX_FAILURES},
+        {"to",       had_last_good ? "last_good" : "models_ini"},
+    });
     if (ctx.stop_threads.load()) {
         return;
     }
@@ -8530,6 +8768,15 @@ static void admin_on_model_exit(admin_context & ctx, const std::string & id, int
     }
     SRV_WRN("admin: model %s %s (%s): %s\n", id.c_str(), was_loaded ? "stopped with an error" : "failed to start",
             r.code.c_str(), r.line.c_str());
+    if (!was_loaded) {
+        // who started it is unknown (autoload, POST /models/load, or a restart from the panel)
+        admin_audit_observed("model.start_failed", id, "failed", {
+            {"reason",            r.code},
+            {"exit_code",         exit_code},
+            {"failures",          failures},
+            {"settings_reverted", revert},
+        });
+    }
     if (revert) {
         admin_revert(ctx, id, reason);
     }
@@ -8580,6 +8827,16 @@ static void admin_on_event(admin_context & ctx, const json & data) {
     }
     const json d = data.contains("data") && data.at("data").is_object() ? data.at("data") : json::object();
     const std::string status = admin_json_str(d, "status");
+    // effects of the public routes (POST /models, DELETE /models): the audit records them without a client
+    if (event == "download_finished" || event == "download_failed") {
+        admin_audit_observed(event == "download_finished" ? "download.finished" : "download.failed", model,
+                             event == "download_finished" ? "ok" : "failed");
+        return;
+    }
+    if (event == "model_remove") {
+        admin_audit_observed("model.removed", model, "ok");
+        return;
+    }
     if (event == "model_status") {
         if (status == "loading") {
             admin_on_status(ctx, model, "loading", 0, true); // load() spawned a child
@@ -8597,6 +8854,7 @@ static void admin_events_thread() {
     server_models & models = ctx.routes->models;
     while (!ctx.stop_threads.load()) {
         admin_upload_tick(); // stage 3: wakes the upload worker when its sweep is due (cheap, deletes nothing here)
+        admin_audit_tick();  // stage 3 M3: merged refusals whose window ended, a retry after a write error
         server_task_result_ptr res = models.sse.recv_with_timeout({ ctx.sse_id }, 1);
         if (res == nullptr) {
             continue;
@@ -8629,6 +8887,7 @@ static void admin_stop_threads() {
     ctx.stop_threads.store(true);
     ctx.cv_facts.notify_all();
     admin_upload_stop(); // stage 3: the upload worker calls into server_models too
+    admin_audit_flush(); // stage 3 M3: the open merge windows of refusals
     try {
         if (ctx.th_events.joinable()) {
             ctx.th_events.join();
@@ -8940,6 +9199,7 @@ void server_admin_register_routes(server_http_context & ctx_http, server_models_
     std::vector<std::string> paths_upload;
     admin_upload_init(routes.params);
     admin_upload_register(ctx_http, paths_upload);
+    admin_audit_register(ctx_http, paths_upload); // stage 3 M3: GET /admin/audit
 
     // Keep the admin handlers out of the generic handler table: the Vertex AI
     // compat route (/predict, server_http_context::register_gcp_compat) dispatches
@@ -8969,6 +9229,7 @@ server_http_res_ptr admin_internal_refusal(const server_http_req & req) {
     try {
         server_http_res_ptr refused = admin_check_access(ctx, req);
         if (refused) {
+            admin_audit_refused(req, 403, "admin_forbidden", ctx.access.locked ? "allow_list_locked" : "not_allowed", false);
             return refused;
         }
         const admin_auth auth = admin_check_key(ctx, req);
@@ -8978,6 +9239,7 @@ server_http_res_ptr admin_internal_refusal(const server_http_req & req) {
         }
         if (auth != ADMIN_AUTH_OK) {
             SRV_WRN("admin: rejected %s (missing or wrong X-Admin-Key)\n", req.path.c_str());
+            admin_audit_refused(req, 401, "admin_key_required", admin_key_refusal_reason(req), false);
             return admin_res_error(401, "admin_key_required", "a valid X-Admin-Key header is required");
         }
     } catch (const std::exception & e) {
@@ -9353,16 +9615,43 @@ std::string admin_internal_client_text(const server_http_req & req) {
     return client.peer.empty() ? std::string("unknown") : admin_cut(client.peer, 64);
 }
 
-void admin_audit(const server_http_req * req, const std::string & action, const std::string & target,
-                 const std::string & result, const json & details) {
-    // milestone M3 keeps these records in <state>/admin-audit.jsonl and shows them in an Activity tab;
-    // until then the hook only logs one line per action
+// one log line per record, then the store (server-admin-audit.cpp); the log line gets the same secrets replaced as
+// the record (before anything is cut)
+static void admin_audit_record(const std::string & kind, const json & actor, const std::string & action, const std::string & target,
+                               const std::string & result, const json & details) {
     try {
-        const std::string who = req != nullptr ? admin_internal_client_text(*req) : std::string("server");
-        const std::string extra = details.is_object() && !details.empty() ? " " + admin_cut(details.dump(), 512) : std::string();
-        SRV_INF("admin: audit: %s %s -> %s (by %s)%s\n", action.c_str(), admin_cut(target, 128).c_str(), result.c_str(),
+        const std::string who   = actor.is_object() ? admin_audit_redact_text(admin_json_str(actor, "label")) : std::string();
+        const std::string extra = details.is_object() && !details.empty()
+                                ? " " + admin_cut(safe_json_to_str(admin_audit_redact_json(details)), 512) : std::string();
+        SRV_INF("admin: audit: %s %s -> %s (by %s)%s\n", action.c_str(), admin_audit_text(target, 128).c_str(), result.c_str(),
                 who.c_str(), extra.c_str());
+        admin_audit_store_add(kind, actor, action, target, result, details);
     } catch (...) {
         // never fails an admin action
     }
+}
+
+void admin_audit(const server_http_req * req, const std::string & action, const std::string & target,
+                 const std::string & result, const json & details) {
+    try {
+        if (req != nullptr && t_admin_audit_pending.req == req && t_admin_audit_pending.action == action) {
+            t_admin_audit_pending = admin_audit_pending(); // recorded: the wrapper does not record it again
+        }
+        const json actor = req != nullptr ? admin_audit_actor(*req) : json({ {"type", "server"}, {"label", "server"} });
+        admin_audit_record(req != nullptr ? "change" : "server", actor, action, target, result, details);
+    } catch (...) {
+        // never fails an admin action
+    }
+}
+
+void admin_audit_for(const json & actor, const std::string & action, const std::string & target,
+                     const std::string & result, const json & details) {
+    admin_audit_record("change", actor.is_object() ? actor : json({ {"type", "unknown"}, {"label", "unknown"} }), action,
+                       target, result, details);
+}
+
+void admin_audit_observed(const std::string & action, const std::string & target, const std::string & result,
+                          const json & details) {
+    // the public routes stay untouched (no identity there): only the effect is known
+    admin_audit_record("observed", { {"type", "public_api"}, {"label", "public API (unknown)"} }, action, target, result, details);
 }

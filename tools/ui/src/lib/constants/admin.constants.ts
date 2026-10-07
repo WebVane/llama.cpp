@@ -5,6 +5,7 @@
 import { STORAGE_APP_NAME } from './storage.constants';
 import {
 	AdminFailureCode,
+	AdminFeature,
 	AdminFitVerdict,
 	AdminLockSource,
 	AdminModelRole,
@@ -14,6 +15,12 @@ import {
 	ServerModelSource,
 	ServerModelStatus
 } from '$lib/enums';
+import {
+	AdminAuditActionGroup,
+	AdminAuditKind,
+	AdminAuditResult,
+	AdminAuditResultGroup
+} from '$lib/enums/admin.enums';
 
 /** Header carrying the admin key. Only AdminService sends it. */
 export const ADMIN_KEY_HEADER = 'X-Admin-Key';
@@ -141,9 +148,11 @@ export const ADMIN_REFRESH_DEBOUNCE_MS = 400;
  */
 export const ADMIN_FEED_REOPEN_REFRESH_MIN_MS = 3_000;
 
-export const ADMIN_TABS: { id: AdminTab; label: string }[] = [
+/** Tabs of the admin page; a tab with a `feature` is shown only when the server lists it. */
+export const ADMIN_TABS: { feature?: AdminFeature; id: AdminTab; label: string }[] = [
 	{ id: AdminTab.MODELS, label: 'Models' },
-	{ id: AdminTab.SETTINGS, label: 'Settings' }
+	{ id: AdminTab.SETTINGS, label: 'Settings' },
+	{ feature: AdminFeature.AUDIT, id: AdminTab.ACTIVITY, label: 'Activity' }
 ];
 
 export const ADMIN_MODEL_SOURCE_LABELS: Record<ServerModelSource, string> = {
@@ -483,4 +492,242 @@ export const ADMIN_GGUF_FILE_TYPES: Record<number, string> = {
 	39: 'NVFP4',
 	40: 'Q1_0',
 	41: 'Q2_0'
+};
+
+/*
+ * Stage 3, milestone M3: the audit log of admin actions (Activity tab).
+ */
+
+/** GET ?before=&limit=&kind=&action=&result=[&format=jsonl]: the audit log, newest first. */
+export const API_ADMIN_AUDIT = '/admin/audit';
+
+export const ADMIN_AUDIT = {
+	/** Name of the downloaded file when the answer does not name one */
+	DOWNLOAD_NAME: 'provision-admin-audit.jsonl',
+	/** The server's largest `limit` */
+	LIMIT_MAX: 500,
+	/** Warning of GET /admin/status: the audit log is held in memory only */
+	NOT_PERSISTED_WARNING: 'audit_not_persisted',
+	/** Records per request ("Load more" asks for the next ones) */
+	PAGE_SIZE: 100,
+	/** Changed keys named in the one-line summary of a record before "+N more" */
+	SUMMARY_CHANGES_MAX: 3,
+	/**
+	 * Width of the Activity panel (rem) below which the records are cards:
+	 * the four fixed columns take 39rem, the Action column keeps 17rem. Also
+	 * the min-width of the table (min-w-[56rem] in AdminActivityTab).
+	 */
+	TABLE_MIN_REM: 56,
+	/** Panel width (rem) from which Actor and Target get their full width */
+	TABLE_WIDE_REM: 64
+} as const;
+
+/** Client-side timeouts of the audit routes. */
+export const ADMIN_AUDIT_TIMEOUTS = {
+	/** The raw log of the three files (up to about 24 MiB) */
+	DOWNLOAD_MS: 120_000,
+	LIST_MS: 20_000
+} as const;
+
+/** Names of the kinds in the filter and the details. */
+export const ADMIN_AUDIT_KIND_LABELS: Record<AdminAuditKind, string> = {
+	[AdminAuditKind.CHANGE]: 'Changes',
+	[AdminAuditKind.OBSERVED]: 'Public API',
+	[AdminAuditKind.REFUSAL]: 'Refusals',
+	[AdminAuditKind.SERVER]: 'Server'
+};
+
+/** Order of the kind filter. */
+export const ADMIN_AUDIT_KIND_ORDER: AdminAuditKind[] = [
+	AdminAuditKind.CHANGE,
+	AdminAuditKind.SERVER,
+	AdminAuditKind.OBSERVED,
+	AdminAuditKind.REFUSAL
+];
+
+/** What each kind holds (tooltips of the kind filter). */
+export const ADMIN_AUDIT_KIND_HINTS: Record<AdminAuditKind, string> = {
+	[AdminAuditKind.CHANGE]:
+		'Changes made on this page or through the /admin routes with the admin key',
+	[AdminAuditKind.OBSERVED]:
+		'Effects of the public model API (downloads, removed models, failed starts); who caused them is not known',
+	[AdminAuditKind.REFUSAL]:
+		'Requests to /admin refused for a missing or wrong key or a refused address, merged per minute',
+	[AdminAuditKind.SERVER]:
+		'What the server did by itself: settings reverted after failed starts, expired uploads, log started'
+};
+
+export const ADMIN_AUDIT_RESULT_LABELS: Record<AdminAuditResult, string> = {
+	[AdminAuditResult.ERROR]: 'Error',
+	[AdminAuditResult.FAILED]: 'Failed',
+	[AdminAuditResult.OK]: 'OK',
+	[AdminAuditResult.REFUSED]: 'Refused',
+	[AdminAuditResult.REJECTED]: 'Rejected'
+};
+
+/** The action filter: each group asks the server for these action names (a name also matches `name.*`). */
+export const ADMIN_AUDIT_ACTION_GROUPS: Record<
+	AdminAuditActionGroup,
+	{ actions: string[]; label: string }
+> = {
+	[AdminAuditActionGroup.ACCESS]: { actions: ['access'], label: 'Refused requests' },
+	[AdminAuditActionGroup.ALL]: { actions: [], label: 'All actions' },
+	[AdminAuditActionGroup.AUDIT_LOG]: { actions: ['audit'], label: 'Audit log' },
+	[AdminAuditActionGroup.DELETES]: {
+		actions: ['model.delete', 'model.remove_projector', 'model.removed'],
+		label: 'Deletes'
+	},
+	[AdminAuditActionGroup.DOWNLOADS]: { actions: ['download'], label: 'Downloads' },
+	[AdminAuditActionGroup.GPUS]: { actions: ['gpus'], label: 'GPU re-detection' },
+	[AdminAuditActionGroup.SETTINGS]: { actions: ['settings', 'model_settings'], label: 'Settings' },
+	[AdminAuditActionGroup.STARTS]: { actions: ['model.start_failed'], label: 'Failed starts' },
+	[AdminAuditActionGroup.UPLOADS]: { actions: ['upload'], label: 'Uploads' }
+};
+
+/** Order of the action filter. */
+export const ADMIN_AUDIT_ACTION_GROUP_ORDER: AdminAuditActionGroup[] = [
+	AdminAuditActionGroup.ALL,
+	AdminAuditActionGroup.SETTINGS,
+	AdminAuditActionGroup.UPLOADS,
+	AdminAuditActionGroup.DELETES,
+	AdminAuditActionGroup.DOWNLOADS,
+	AdminAuditActionGroup.STARTS,
+	AdminAuditActionGroup.GPUS,
+	AdminAuditActionGroup.ACCESS,
+	AdminAuditActionGroup.AUDIT_LOG
+];
+
+/** The result filter: each group asks the server for these results. */
+export const ADMIN_AUDIT_RESULT_GROUPS: Record<
+	AdminAuditResultGroup,
+	{ label: string; results: AdminAuditResult[] }
+> = {
+	[AdminAuditResultGroup.ALL]: { label: 'Any result', results: [] },
+	[AdminAuditResultGroup.OK]: { label: 'OK', results: [AdminAuditResult.OK] },
+	[AdminAuditResultGroup.PROBLEMS]: {
+		label: 'Errors and failures',
+		results: [AdminAuditResult.ERROR, AdminAuditResult.FAILED, AdminAuditResult.REJECTED]
+	},
+	[AdminAuditResultGroup.REFUSED]: { label: 'Refused', results: [AdminAuditResult.REFUSED] }
+};
+
+/** Order of the result filter. */
+export const ADMIN_AUDIT_RESULT_GROUP_ORDER: AdminAuditResultGroup[] = [
+	AdminAuditResultGroup.ALL,
+	AdminAuditResultGroup.OK,
+	AdminAuditResultGroup.PROBLEMS,
+	AdminAuditResultGroup.REFUSED
+];
+
+/** What an action is, in words; an action not listed here shows its name. */
+export const ADMIN_AUDIT_ACTION_LABELS: Record<string, string> = {
+	'access.refused': 'Request refused',
+	'access.refused_more': 'More refused requests',
+	'audit.persisted_again': 'Audit log written again',
+	'audit.started': 'Audit log started',
+	'download.failed': 'Download failed',
+	'download.finished': 'Download finished',
+	'gpus.rescan': 'GPUs re-detected',
+	'model.delete': 'Model files deleted',
+	'model.remove_projector': 'Projector removed',
+	'model.removed': 'Model removed',
+	'model.start_failed': 'Model failed to start',
+	'model_settings.reset': 'Model settings reset',
+	'model_settings.reverted': 'Model settings reverted',
+	'model_settings.reverted_at_startup': 'Model settings reverted at startup',
+	'model_settings.update': 'Model settings changed',
+	'observed.more': 'More public API events',
+	'settings.update': 'Settings changed',
+	'upload.cancel': 'Upload cancelled',
+	'upload.create': 'Upload started',
+	'upload.expired': 'Upload expired',
+	'upload.published': 'Upload published',
+	'upload.rejected': 'Upload rejected',
+	'upload.resumed_after_restart': 'Upload resumed after a restart',
+	'upload.swept': 'Abandoned upload removed',
+	'upload.takeover': 'Upload taken over'
+};
+
+/** A change route that answered with an error: "<attempt> failed". */
+export const ADMIN_AUDIT_ATTEMPT_LABELS: Record<string, string> = {
+	'gpus.rescan': 'GPU re-detection',
+	'model.delete': 'Delete of the model files',
+	'model.remove_projector': 'Projector removal',
+	'model_settings.reset': 'Model settings reset',
+	'model_settings.update': 'Model settings change',
+	'settings.update': 'Settings change',
+	'upload.cancel': 'Upload cancel',
+	'upload.create': 'Upload start',
+	'upload.takeover': 'Upload takeover'
+};
+
+/** `details.reason` of a refused request. */
+export const ADMIN_AUDIT_REFUSAL_REASONS: Record<string, string> = {
+	allow_list_locked: 'the allow-list is invalid, /admin is locked',
+	no_key: 'no admin key',
+	not_allowed: 'address not allowed',
+	wrong_key: 'wrong admin key'
+};
+
+/** `details.to` of reverted settings. */
+export const ADMIN_AUDIT_REVERT_TARGETS: Record<string, string> = {
+	last_good: 'the settings that last worked',
+	models_ini: 'the models.ini values'
+};
+
+/** Names of the detail fields; a field not listed here shows its key. */
+export const ADMIN_AUDIT_DETAIL_LABELS: Record<string, string> = {
+	arch: 'Architecture',
+	bytes: 'Size',
+	changed: 'Changed anything',
+	clients: 'Clients',
+	code: 'Code',
+	count: 'Times',
+	devices: 'Devices found',
+	error: 'Error',
+	exit_code: 'Exit code',
+	failures: 'Failed starts',
+	file: 'File (index)',
+	files: 'Files',
+	first: 'First',
+	folder: 'Folder',
+	folder_removed: 'Folder removed',
+	foreign: 'Of another server',
+	id: 'Upload session',
+	items: 'Items',
+	keys: 'Fields sent',
+	last: 'Last',
+	layout: 'Layout',
+	load_failed: 'Load failed',
+	lost: 'Records lost',
+	max_bytes: 'Rotation size',
+	model_listed: 'Model listed',
+	name: 'Name',
+	not_persisted_since: 'Not written since',
+	note: 'Note',
+	paths: 'Files (in the models directory)',
+	persisted: 'Written to disk',
+	phase: 'Phase',
+	pin_removed: 'Pin removed',
+	probe: 'Status probe',
+	projector_only: 'Projector only',
+	reason: 'Reason',
+	reload_failed: 'Model list reload failed',
+	restart: 'Restart asked for',
+	restarted: 'Restarted',
+	sample: 'Some of the clients',
+	settings: 'Placement',
+	settings_removed: 'Saved settings removed',
+	settings_reverted: 'Settings reverted',
+	sha256: 'SHA-256',
+	state: 'State',
+	status: 'HTTP status',
+	stopped: 'Stopped first',
+	store: 'Store',
+	stored: 'Saved entry rewritten',
+	text: 'Text',
+	to: 'Reverted to',
+	truncated: 'Cut to fit',
+	version: 'Version',
+	was_running: 'Was running'
 };

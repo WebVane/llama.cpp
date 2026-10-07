@@ -8,6 +8,7 @@
 	import { adminStore } from '$lib/stores';
 	import type { ApiAdminModelLog } from '$lib/types';
 	import { isInstanceAfterFailure } from '$lib/utils';
+	import { keepFocusOffDialogClose } from '$lib/utils/admin-dialog-focus';
 	import { untrack } from 'svelte';
 
 	interface Props {
@@ -80,6 +81,7 @@
 			event.preventDefault();
 			contentNode?.focus();
 		}}
+		onfocusin={(event) => keepFocusOffDialogClose(event, contentNode)}
 		tabindex={-1}
 	>
 		<Dialog.Header class="text-left">

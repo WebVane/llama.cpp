@@ -3,7 +3,7 @@
   "info": {
     "title": "Provision LLM Engine API",
     "version": "1.0.0",
-    "description": "OpenAI-compatible + native endpoints exposed by the Provision LLM Engine (llama-server). Served by the server itself, so \"Try it out\" runs same-origin (no CORS setup needed). In router mode, send a known model id in the `model` field (e.g. `qwen2.5-chat`, `gte-qwen2-embed`).\n\n**Licensed builds** (image `:release`): endpoints tagged _counted_ are metered by the license subsystem. A request is charged one unit per result it produces (a `prompt` / `input` / `documents` array or `n` > 1 counts per element) and only when a 2xx result is delivered; errors and requests the client abandons are not charged. The trial allows 50 requests per install; after that, or with no / an expired license, counted endpoints return HTTP 403 with an `error.license` block and `X-License-Mode` / `X-License-Used` / `X-License-Limit` headers until the product is activated via `POST /license/activate`. Endpoints tagged _exempt_ (health, metadata, tokenize, models, slots, `/license/*`) never consume the budget. Unlicensed builds (`:dev`) have no counter and answer 404 on `/license/*`.\n\nMany routes have aliases (legacy / non-`v1` forms); the canonical path is documented and its aliases are listed in the route description.\n\n**Admin API** (`/admin/*`, tag _Admin_): present only when the server runs in router mode with `PROVISION_ADMIN=1` (otherwise these paths answer 404). In the Docker deployment, and with the host nginx site of `deploy/linux/`, the nginx front door forwards `/admin` (and `/cors-proxy`) only for allow-listed client addresses and answers 403 to everyone else. Every endpoint except the `GET /admin/status` probe also needs the admin key in the `X-Admin-Key` header (use **Authorize**). Loading, unloading, downloading and deleting downloaded models keep using the public model routes (`/models`, `/models/load`, `/models/unload`); the settings, the upload of GGUF files (`/admin/models/upload*`) and the deletion of models of the models directory (`/admin/models/delete`) are protected by the admin key. Admin endpoints never consume the license budget."
+    "description": "OpenAI-compatible + native endpoints exposed by the Provision LLM Engine (llama-server). Served by the server itself, so \"Try it out\" runs same-origin (no CORS setup needed). In router mode, send a known model id in the `model` field (e.g. `qwen2.5-chat`, `gte-qwen2-embed`).\n\n**Licensed builds** (image `:release`): endpoints tagged _counted_ are metered by the license subsystem. A request is charged one unit per result it produces (a `prompt` / `input` / `documents` array or `n` > 1 counts per element) and only when a 2xx result is delivered; errors and requests the client abandons are not charged. The trial allows 50 requests per install; after that, or with no / an expired license, counted endpoints return HTTP 403 with an `error.license` block and `X-License-Mode` / `X-License-Used` / `X-License-Limit` headers until the product is activated via `POST /license/activate`. Endpoints tagged _exempt_ (health, metadata, tokenize, models, slots, `/license/*`) never consume the budget. Unlicensed builds (`:dev`) have no counter and answer 404 on `/license/*`.\n\nMany routes have aliases (legacy / non-`v1` forms); the canonical path is documented and its aliases are listed in the route description.\n\n**Admin API** (`/admin/*`, tag _Admin_): present only when the server runs in router mode with `PROVISION_ADMIN=1` (otherwise these paths answer 404). In the Docker deployment, and with the host nginx site of `deploy/linux/`, the nginx front door forwards `/admin` (and `/cors-proxy`) only for allow-listed client addresses and answers 403 to everyone else. Every endpoint except the `GET /admin/status` probe also needs the admin key in the `X-Admin-Key` header (use **Authorize**). Loading, unloading, downloading and deleting downloaded models keep using the public model routes (`/models`, `/models/load`, `/models/unload`); the settings, the upload of GGUF files (`/admin/models/upload*`) and the deletion of models of the models directory (`/admin/models/delete`) are protected by the admin key. Changes made through `/admin`, refused admin requests, actions of the server itself and some effects of the public model routes are recorded in an activity log (`GET /admin/audit`). Admin endpoints never consume the license budget."
   },
   "servers": [
     { "url": "/", "description": "This server" }
@@ -13,7 +13,7 @@
     { "name": "Anthropic", "description": "Anthropic Messages-compatible routes" },
     { "name": "Server", "description": "Native llama-server / router routes" },
     { "name": "License", "description": "License status and online activation (licensed builds only, image `:release`)" },
-    { "name": "Admin", "description": "Admin API: runtime settings, per-model settings with a fit check, GPU memory, model output tails, diagnostics, storage, download pre-flight, resumable GGUF upload and deletion of models of the models directory (router mode with `PROVISION_ADMIN=1` only; behind the nginx allow-list in the Docker and host deployments, or the server's own address allow-list `PROVISION_ADMIN_ALLOW_FROM` on a host without nginx)" }
+    { "name": "Admin", "description": "Admin API: runtime settings, per-model settings with a fit check, GPU memory, model output tails, diagnostics, storage, download pre-flight, resumable GGUF upload, deletion of models of the models directory and the activity log of admin actions (router mode with `PROVISION_ADMIN=1` only; behind the nginx allow-list in the Docker and host deployments, or the server's own address allow-list `PROVISION_ADMIN_ALLOW_FROM` on a host without nginx)" }
   ],
   "paths": {
     "/v1/chat/completions": {
@@ -604,7 +604,7 @@
                 "schema": { "$ref": "#/components/schemas/AdminStatus" },
                 "examples": {
                   "probe": { "summary": "No key / wrong key", "value": { "admin": true, "authorized": false, "key_configured": true } },
-                  "authorized": { "summary": "Valid key", "value": { "admin": true, "authorized": true, "key_configured": true, "version": 1, "key_source": "generated", "features": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete"], "models": { "max": 3, "running": 2, "total": 5 }, "state": { "dir": "/var/lib/provision-llm-admin", "writable": true, "error": "", "model_settings": { "file": "/var/lib/provision-llm-admin/admin-models.json", "error": "", "read_only": false, "backup_loaded": false, "entries": 1 } }, "download": { "available": true, "offline": false }, "upload": { "available": true, "reason": null, "message": null }, "dirs": { "cache": "/models-rw/hf", "models_dir": "/models-rw/local", "preset": "/config/models.ini" }, "license_build": false, "ip_allowlist": false, "warnings": [] } }
+                  "authorized": { "summary": "Valid key", "value": { "admin": true, "authorized": true, "key_configured": true, "version": 1, "key_source": "generated", "features": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete", "audit"], "models": { "max": 3, "running": 2, "total": 5 }, "state": { "dir": "/var/lib/provision-llm-admin", "writable": true, "error": "", "model_settings": { "file": "/var/lib/provision-llm-admin/admin-models.json", "error": "", "read_only": false, "backup_loaded": false, "entries": 1 } }, "download": { "available": true, "offline": false }, "upload": { "available": true, "reason": null, "message": null }, "audit": { "persisted": true, "error": null, "since": null, "in_memory": 0, "lost": 0, "max_bytes": 4194304, "ring_max": 1000 }, "dirs": { "cache": "/models-rw/hf", "models_dir": "/models-rw/local", "preset": "/config/models.ini" }, "license_build": false, "ip_allowlist": false, "warnings": [] } }
                 }
               }
             }
@@ -691,7 +691,7 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/AdminStorage" },
-                "example": { "dirs": [{ "kind": "cache", "path": "/models-rw/hf", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 }, { "kind": "models_dir", "path": "/models-rw/local", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 }, { "kind": "state", "path": "/var/lib/provision-llm-admin", "exists": true, "writable": true, "total_bytes": 100000000000, "free_bytes": 60000000000 }], "partial_downloads": [], "uploads": [{ "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "substate": null, "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 1258291200, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T10:20:00Z", "error": null, "blocked": null, "expires_at": "2026-10-09T10:20:00Z", "bytes": 1258291200 }], "upload_staging": { "path": "/models-rw/local/.provision-upload", "bytes": 1258291200, "trash_bytes": 0 } }
+                "example": { "dirs": [{ "kind": "cache", "path": "/models-rw/hf", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 }, { "kind": "models_dir", "path": "/models-rw/local", "exists": true, "writable": true, "total_bytes": 480000000000, "free_bytes": 120000000000 }, { "kind": "state", "path": "/var/lib/provision-llm-admin", "exists": true, "writable": true, "total_bytes": 100000000000, "free_bytes": 60000000000 }], "partial_downloads": [], "uploads": [{ "id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "substate": null, "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 1258291200, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T10:20:00Z", "error": null, "blocked": null, "expires_at": "2026-10-09T10:20:00Z", "bytes": 1258291200 }], "upload_staging": { "path": "/models-rw/local/.provision-upload", "bytes": 1258291200, "trash_bytes": 0 }, "audit": {"persisted": true, "total_bytes": 5263772, "max_bytes": 4194304, "files": [{"name": "admin-audit.jsonl", "bytes": 1069056, "store": "changes"}, {"name": "admin-audit.jsonl.1", "bytes": 4194120, "store": "changes"}, {"name": "admin-audit-refusals.jsonl", "bytes": 184, "store": "refusals"}, {"name": "admin-audit-observed.jsonl", "bytes": 412, "store": "observed"}]} }
               }
             }
           },
@@ -967,7 +967,7 @@
       "get": {
         "tags": ["Admin"],
         "summary": "What the server found on this machine (exempt)",
-        "description": "Deployment (Docker or host), server version, GPU backend libraries next to the binary, GPU inventory result and time, vendor tool (path, version, last error), how memory is matched to GPUs, whether the router itself stays off the GPUs, state directory (path, writable, persistent), admin key source, whether requests arrive through a proxy, the server's own `/admin` address allow-list (`ip_allowlist`: on or off, its entries, the trusted proxies, and the address this very request was seen from), `MODEL_DEVICES`. Every item has a status (`ok`, `warning`, `error`, `info`) and a one-line hint. While a fit check or inventory helper hangs (stopped, not exited), an item `stuck_helpers` (status `error`) is added at the end. **Exempt** from the trial budget.",
+        "description": "Deployment (Docker or host), server version, GPU backend libraries next to the binary, GPU inventory result and time, vendor tool (path, version, last error), how memory is matched to GPUs, whether the router itself stays off the GPUs, state directory (path, writable, persistent), admin key source, whether requests arrive through a proxy, the server's own `/admin` address allow-list (`ip_allowlist`: on or off, its entries, the trusted proxies, and the address this very request was seen from), `MODEL_DEVICES`, the per-model settings file, and the activity log (`audit`: written to the state directory or kept in memory, and why). Every item has a status (`ok`, `warning`, `error`, `info`) and a one-line hint. With `PROVISION_ADMIN_TRUSTED_PROXIES` set but no `PROVISION_ADMIN_ALLOW_FROM`, the `ip_allowlist` item warns that the trusted proxies then only affect the client address the activity log records. While a fit check or inventory helper hangs (stopped, not exited), an item `stuck_helpers` (status `error`) is added at the end. **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "responses": {
           "200": {
@@ -990,8 +990,7 @@
       "get": {
         "tags": ["Admin"],
         "summary": "Uploads: availability, limits and the uploads of this server, or one upload (exempt)",
-        "description": "Without `id`: whether GGUF files can be uploaded on this server (`available`; else `reason`: `no_models_dir`, `models_dir_missing`, `not_writable`, `staging_unusable`, `staging_other_filesystem`, and `message`), the fixed `limits`, every upload of this server (from every browser and admin, finished ones for 24 h, so a client that lost its files can offer to continue), `staging_bytes`, and whether the placement of an upload can be saved (`settings_writable`).\n\nWith `?id=<upload id>`: one upload with everything a client needs to continue it. Per file: `offset` (the bytes the server accepted; the next chunk starts here), `durable_offset` (on disk at the last checkpoint; after a restart of the server `offset` goes back to it), `complete`, `dropped`, `role`, `sha256`, `head_crc32` (CRC-32 of the first MiB, to compare with a file picked again), `final_name`, `header` (the header check of that file) and `error` (why the file cannot be used). The upload: `state` `receiving`, `checking` (`substate` `queued`, `hashing` with `progress`, `classifying`, `load_check`), `ready` (`blocked_by` `manual`, `name_taken`, `publish_error`, `check_failed`, `sha256_mismatch`, `settings_not_saved`, `settings_invalid`; details in `blocked`), `publishing`, `published` (`result`), `rejected` (`error`), `cancelled`, `expired`; plus `checks`, `plan`, `facts`, `warnings`, `last_activity`, `expires_at` (72 h without progress, counted while the server runs), `idle_ms` and `last_client_idle_ms`.\n\nThe upload routes never answer 404 for an upload (the server replaces the body of every 404); an unknown or removed upload is 410 `upload_gone`. **Exempt** from the trial budget.",
-        "x-s3-recheck": "aligned with tools/server/server-admin-upload.cpp while it was being written: re-check every field, and the shapes of plan / facts / result",
+        "description": "Without `id`: whether GGUF files can be uploaded on this server (`available`; else `reason`: `no_models_dir`, `models_dir_missing`, `not_writable`, `staging_unusable`, `staging_other_filesystem`, and `message`), the fixed `limits`, every upload of this server (from every browser and admin, finished ones for 24 h, so a client that lost its files can offer to continue), `staging_bytes`, and whether the placement of an upload can be saved (`settings_writable`).\n\nWith `?id=<upload id>`: one upload with everything a client needs to continue it. Per file: `offset` (the bytes the server accepted; the next chunk starts here), `durable_offset` (on disk at the last checkpoint; after a restart of the server `offset` goes back to it), `complete`, `dropped`, `role`, `sha256` (computed while the file is received), `head_crc32` (CRC-32 of the first MiB, to compare with a file picked again; null while the server does not know it: then probe with `verify=1` of the chunk route), `final_name`, `header` (the header check of that file: `state`, and once the metadata was read `arch` and `type` as `general.architecture` / `general.type` of the file, `split`, and a `message` only with a warning or a refusal) and `error` (why the file cannot be used). The upload: `state` `receiving`, `checking` (`substate` `queued`, `hashing` with `progress`, `classifying`, `load_check`), `ready` (`blocked_by` `manual`, `name_taken`, `publish_error`, `check_failed`, `sha256_mismatch`, `settings_not_saved`, `settings_invalid`; details in `blocked`), `publishing`, `published` (`result`), `rejected` (`error`), `cancelled`, `expired`; plus `checks` (one per file whose header check started; `message` empty while all is well), `plan` (the final layout), `facts` (what the checks read), `warnings`, `last_activity`, `expires_at` (72 h without progress, counted while the server runs; set while `receiving` or `ready`), `idle_ms` and `last_client_idle_ms`.\n\nThe upload routes never answer 404 for an upload (the server replaces the body of every 404); an unknown or removed upload is 410 `upload_gone`. **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "parameters": [
           { "name": "id", "in": "query", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" }, "description": "One upload (32 hexadecimal characters, from the create answer or the `sessions` list)" }
@@ -1005,7 +1004,7 @@
                 "examples": {
                   "overview": { "summary": "Without id", "value": {"available": true, "reason": null, "message": null, "limits": {"chunk_max": 16777216, "chunk_default": 8388608, "chunk_min": 245760, "max_sessions": 4, "max_writers": 4, "max_files": 256, "ttl_h": 72, "ttl_s": 259200, "max_header_bytes": 67108864}, "sessions": [{"id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "receiving", "substate": null, "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 1258291200, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T10:20:00Z", "error": null, "blocked": null, "expires_at": "2026-10-09T10:20:00Z"}], "staging_bytes": 1258291200, "models_dir": "/models-rw/local", "settings_writable": true, "settings_error": null} },
                   "unavailable": { "summary": "No models directory", "value": {"available": false, "reason": "no_models_dir", "message": "this server has no --models-dir: uploads need one (Docker: mount /models-rw; host: add --models-dir to PROVISION_LLM_ARGS), then restart", "limits": {"chunk_max": 16777216, "chunk_default": 8388608, "chunk_min": 245760, "max_sessions": 4, "max_writers": 4, "max_files": 256, "ttl_h": 72, "ttl_s": 259200, "max_header_bytes": 67108864}, "sessions": [], "staging_bytes": 0, "models_dir": null, "settings_writable": true, "settings_error": null} },
-                  "session": { "summary": "?id= of an upload being hashed", "value": {"id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "checking", "substate": "hashing", "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 3341008960, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T11:02:00Z", "error": null, "blocked": null, "expires_at": null, "files": [{"index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856, "offset": 2489757856, "durable_offset": 2489757856, "complete": true, "dropped": false, "role": "model", "sha256": null, "sha256_expected": null, "head_crc32": "4a3b2c1d", "final_name": null, "header": {"state": "ok", "arch": "gemma3", "type": "model", "message": "gemma3, 3.9B parameters, Q4_K_M, trained context 131072"}, "error": null}, {"index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104, "offset": 851251104, "durable_offset": 851251104, "complete": true, "dropped": false, "role": "projector", "sha256": null, "sha256_expected": null, "head_crc32": "9e8f7a6b", "final_name": null, "header": {"state": "ok", "arch": "clip", "type": "mmproj", "message": "projector: vision"}, "error": null}], "settings": {"device": "CUDA1", "ctx-size": "16384"}, "settings_mode": "replace", "plan": null, "facts": null, "result": null, "warnings": [], "idle_ms": 0, "last_client_idle_ms": 1500, "recovered": false, "recovered_without_record": false, "record_persisted": true, "chunk_max": 16777216, "chunk_default": 8388608, "progress": {"done_bytes": 1610612736, "total_bytes": 3341008960}, "checks": [{"step": "header", "file": 0, "status": "ok", "message": "gemma3, 3.9B parameters, Q4_K_M, trained context 131072"}, {"step": "header", "file": 1, "status": "ok", "message": "projector: vision"}]} }
+                  "session": { "summary": "?id= of an upload in its load check", "value": {"id": "9f1c2b7e4a6d4c0e8b3a5f2d1e0c9b8a", "name": "gemma-3-4b", "state": "checking", "substate": "load_check", "blocked_by": null, "total_bytes": 3341008960, "received_bytes": 3341008960, "n_files": 2, "auto_publish": true, "created": "2026-10-06T10:00:00Z", "last_activity": "2026-10-06T11:02:00Z", "error": null, "blocked": null, "expires_at": null, "files": [{"index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856, "offset": 2489757856, "durable_offset": 2489757856, "complete": true, "dropped": false, "role": "model", "sha256": "2f4c8f1e9b0d7a6c5e3b1a9d8c7f6e5d4c3b2a19f8e7d6c5b4a3928170615243", "sha256_expected": null, "head_crc32": "4a3b2c1d", "final_name": "gemma-3-4b.gguf", "header": {"state": "ok", "arch": "gemma3", "type": "model"}, "error": null}, {"index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104, "offset": 851251104, "durable_offset": 851251104, "complete": true, "dropped": false, "role": "projector", "sha256": "8d1e5a7c3b9f2e4d6a8c0b1f3e5d7c9a2b4f6e8d0c1a3b5e7f9d2c4b6a8e0f13", "sha256_expected": null, "head_crc32": "9e8f7a6b", "final_name": "mmproj-gemma-3-4b.gguf", "header": {"state": "ok", "arch": "clip", "type": "mmproj"}, "error": null}], "settings": {"device": "CUDA1", "ctx-size": "16384"}, "settings_mode": "replace", "plan": {"layout": "folder", "target": "gemma-3-4b", "id": "gemma-3-4b", "files": [{"index": 0, "final_name": "gemma-3-4b.gguf", "role": "model", "split_no": null}, {"index": 1, "final_name": "mmproj-gemma-3-4b.gguf", "role": "projector", "split_no": null}]}, "facts": {"arch": "gemma3", "name": "Gemma 3 4b It", "n_params": 3880263168, "n_ctx_train": 131072, "n_layer": 34, "file_type": 15, "n_tensors": 444}, "result": null, "warnings": [], "idle_ms": 0, "last_client_idle_ms": 1500, "recovered": false, "recovered_without_record": false, "record_persisted": true, "chunk_max": 16777216, "chunk_default": 8388608, "progress": null, "checks": [{"step": "header", "file": 0, "status": "ok", "message": ""}, {"step": "header", "file": 1, "status": "ok", "message": ""}]} }
                 }
               }
             }
@@ -1024,8 +1023,7 @@
       "post": {
         "tags": ["Admin"],
         "summary": "Create the upload of one model, or check it (dry run) (exempt)",
-        "description": "One upload is one model: a single GGUF file, or a complete split set, plus at most one projector (`mmproj`). Draft models are not supported (400 `unsupported_file`).\n\n- `name` becomes the model id: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; refused without regard to case: containing `mmproj` or `.gguf`, starting with `mtp-` / `dspark-` / `dflash-` / `eagle3-`, containing `-NNNNN-of-NNNNN`, ending in `.`, Windows reserved names (400 `invalid_name` with `reason`). It must be unique, without regard to case, among the ids and aliases of the model list, the entries of the models directory as the scanner names them, and the other unfinished uploads (409 `name_taken` with `by`); checked again at update and right before publishing.\n- `files`: 1 to 256, each at least 24 bytes; `name` is only shown and used for matching after a reload, never as a path; an optional `sha256` (64 hex characters) is compared after the last byte (a mismatch makes the upload wait as `ready` / `sha256_mismatch`).\n- `settings`: per-model settings (as `POST /admin/models/settings`, including the lock rules: 409 `field_locked`), saved as the model's per-model settings right before its files become visible, so its first start uses them. `settings_mode` `replace` (default) drops saved settings of an earlier model with this id, `keep` uses them again (`existing_settings` shows them).\n- `auto_publish` (default true): publish as soon as the checks pass.\n- `dry_run`: check only, nothing is created (200, `upload.id` null).\n\n`warnings` never block (disk space is warn-only): `not_enough_space`, `larger_than_disk`, `shares_disk_with_state`, `record_not_persisted`. The files are then sent with `POST /admin/models/upload/chunk`. **Exempt** from the trial budget.",
-        "x-s3-recheck": "the create answer (upload = the full upload view; existing_settings only when present; the shape of locks) and the by values of name_taken",
+        "description": "One upload is one model: a single GGUF file, or a complete split set, plus at most one projector (`mmproj`). Draft models are not supported (400 `unsupported_file`, `reason` `draft`, `file`).\n\n- `name` becomes the model id: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; refused without regard to case: containing `mmproj` or `.gguf`, starting with `mtp-` / `dspark-` / `dflash-` / `eagle3-`, containing `-NNNNN-of-NNNNN`, ending in `.`, Windows reserved names (400 `invalid_name` with `reason`). It must be unique, without regard to case, among the ids and aliases of the model list, the entries of the models directory as the scanner names them, and the other unfinished uploads (409 `name_taken` with `by`: `model`, `preset`, `alias`, `file`, `upload`; `other`, the name it collides with; `case_variant`); checked again at update and right before publishing.\n- `files`: 1 to 256, each at least 24 bytes; `name` is only shown and used for matching after a reload, never as a path; an optional `sha256` (64 hex characters) is compared after the last byte (a mismatch makes the upload wait as `ready` / `sha256_mismatch`).\n- `settings`: per-model settings (as `POST /admin/models/settings`, including the lock rules: 409 `field_locked`; `locks` shows the locks for this id, worked out from `[*]` and the router command line), saved as the model's per-model settings right before its files become visible, so its first start uses them. `settings_mode` `replace` (default) drops saved settings of an earlier model with this id, `keep` uses them again with `settings` on top (`existing_settings` shows them). Either way the entry is saved again as `pending`, so the first start of the new files is a trial with the automatic revert.\n- `auto_publish` (default true): publish as soon as the checks pass.\n- `dry_run`: check only, nothing is created (200, `upload.id` null; not counted against the 4 unfinished uploads).\n\n`warnings` never block (disk space is warn-only): `not_enough_space`, `larger_than_disk`, `shares_disk_with_state` (Linux), `state_not_writable` (with settings the publish stops at `settings_not_saved`), `record_not_persisted`, and the value warnings of `POST /admin/models/settings`. The files are then sent with `POST /admin/models/upload/chunk`. **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "requestBody": {
           "required": true,
@@ -1046,7 +1044,7 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/AdminUploadCreated" },
-                "example": {"upload": {"id": null, "name": "gemma-3-4b", "chunk_max": 16777216, "chunk_default": 8388608, "files": [{"index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856}, {"index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104}], "settings": {}}, "disk": {"free_bytes": 120000000000, "total_bytes": 480000000000, "needed_bytes": 3341008960, "other_uploads_bytes": 0, "shares_disk_with": []}, "warnings": [], "locks": {}}
+                "example": {"upload": {"id": null, "name": "gemma-3-4b", "chunk_max": 16777216, "chunk_default": 8388608, "files": [{"index": 0, "name": "gemma-3-4b-it-Q4_K_M.gguf", "size": 2489757856}, {"index": 1, "name": "mmproj-gemma-3-4b-it-f16.gguf", "size": 851251104}], "settings": {"ctx-size": "16384"}}, "disk": {"free_bytes": 120000000000, "total_bytes": 480000000000, "needed_bytes": 3341008960, "other_uploads_bytes": 0, "shares_disk_with": []}, "warnings": [], "locks": {"flash-attn": {"by": "router_cli", "value": "on"}}, "existing_settings": {"ctx-size": "8192"}}
               }
             }
           },
@@ -1060,11 +1058,11 @@
             }
           },
           "400": {
-            "description": "`invalid_request_error` (`param`): a field missing or out of its rules (number or size of the files, the format of `sha256`, a setting). `invalid_name` (`reason`: `empty`, `too_long`, `charset`, `mmproj`, `gguf`, `draft_prefix`, `shard_suffix`, `trailing_dot`, `reserved`). `unsupported_file`: a draft model",
+            "description": "`invalid_request_error` (`param`): a field missing or out of its rules (number or size of the files, the format of `sha256`, a setting). `invalid_name` (`param` `name`, `reason`: `empty`, `too_long`, `charset`, `mmproj`, `gguf`, `draft_prefix`, `shard_suffix`, `trailing_dot`, `reserved`). `unsupported_file` (`reason` `draft`, `file`): a draft model",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
-                "example": { "error": { "code": 400, "message": "the name must not contain \"mmproj\"", "type": "invalid_name", "reason": "mmproj" } }
+                "example": { "error": { "code": 400, "message": "the name must not contain 'mmproj' (such files are taken as projectors)", "type": "invalid_name", "param": "name", "reason": "mmproj" } }
               }
             }
           },
@@ -1072,11 +1070,11 @@
           "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
           "404": { "$ref": "#/components/responses/AdminDisabled" },
           "409": {
-            "description": "`upload_unavailable` (`reason`, see `GET`); `name_taken` (`by`); `field_locked` (`param`); `too_many_uploads` (4 unfinished uploads; `sessions` lists them)",
+            "description": "`upload_unavailable` (`reason`, see `GET`); `name_taken` (`by`, `other`, `case_variant`); `field_locked` (`param`); `too_many_uploads` (4 unfinished uploads; `sessions` lists them)",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
-                "example": { "error": { "code": 409, "message": "the name 'qwen2.5-chat' is taken by a model", "type": "name_taken", "by": "model" } }
+                "example": { "error": { "code": 409, "message": "the name 'qwen2.5-chat' is already used (model)", "type": "name_taken", "param": "name", "by": "model", "case_variant": false, "other": "qwen2.5-chat" } }
               }
             }
           },
@@ -1088,14 +1086,14 @@
       "post": {
         "tags": ["Admin"],
         "summary": "Append one chunk of a file of an upload (exempt)",
-        "description": "The body is the raw bytes `offset .. offset + length - 1` of file `file` (at most `chunk_max`, 16 MiB; `Content-Type: application/octet-stream`; a `Content-Length` is required, no chunked transfer encoding). The server handles a chunk only once it has the whole body, so its offset moves by whole chunks only and sending a chunk again is always safe:\n\n- `offset` equal to the server's offset: appended.\n- `offset` before it: the part the server already has is compared byte for byte with what it stored (409 `content_mismatch` when it differs: not the same file); the rest is appended. Sending the first MiB and up to 1 MiB before the offset after a reload proves that a file picked again is the same.\n- `offset` after it: 409 `offset_mismatch` with the server's `offset`.\n\n`X-Upload-Client` names the sender (a random id per browser tab, kept for the tab session); a chunk from another sender within 30 s of the last one is 409 `other_client_active` unless `takeover=1`. `X-Chunk-CRC32` (optional) is checked before the bytes are stored (400 `crc_mismatch`). The first chunk of a file shows whether it is GGUF (422 `not_gguf`) and starts the header check; a file it finds unusable gets 422 `file_rejected` (only that file: drop it with `update` or cancel), a model it cannot accept rejects the upload within seconds (unsupported architecture, projector as the model, inconsistent split set).\n\nAnswered before the body is read: no or a wrong key, an address the allow-list refuses, no `Content-Length` (411), a `Content-Length` above `chunk_max` (413 `chunk_too_large`, JSON; a 413 without this JSON comes from a proxy: send smaller chunks), an upload that is busy or over, another sender, a chunk of this upload already on its way (409 `chunk_in_progress`), too many chunks at once (429 `upload_slots_busy`). Every answer of 400 or above closes the connection; a client that is still sending may see a reset connection and then asks `GET /admin/models/upload?id=` where to continue. Also expect upstream's 503 while the server starts and 401 from `--api-key`. **Exempt** from the trial budget.",
-        "x-s3-recheck": "the early-refusal set of the pre-body hook (spec B.5c) and the 422 file_rejected path",
+        "description": "The body is the raw bytes `offset .. offset + length - 1` of file `file` (at most `chunk_max`, 16 MiB; `Content-Type: application/octet-stream`). The server handles a chunk only once it has the whole body, so its offset moves by whole chunks only and sending a chunk again is always safe:\n\n- `offset` equal to the server's offset: appended.\n- `offset` before it: the part the server already has is compared byte for byte with what it stored (409 `content_mismatch` with the `offset` of the block that differs: not the same file); the rest, if any, is appended. A chunk wholly inside the stored bytes is answered 200 and writes nothing.\n- `offset` after it: 409 `offset_mismatch` with the server's `offset`.\n\n`verify=1` only compares and never writes (answer `verified`, `verified_bytes`): the way to check that a file picked again (after a reload, or by a script that continues an upload) is the one the server has, usually the first MiB (when `head_crc32` is null or not used) and the MiB before the server's offset. A body beyond the server's offset is not compared and not stored; a probe does not make its sender the one that writes.\n\n`X-Upload-Client` names the sender (a random id per browser tab, kept for the tab session); a chunk from another sender within 30 s of the last one is 409 `other_client_active` unless `takeover=1` (a probe is refused the same way). `X-Chunk-CRC32` (optional) is checked before the bytes are stored (400 `crc_mismatch`). The first chunk of a file shows whether it is GGUF (422 `not_gguf`; what was stored of that file is discarded). Once its metadata has arrived the header check runs in the background: a file it finds unusable is marked (`file_error`), and its chunks then get 422 `file_rejected` (`file`, `reason`: the code, e.g. `adapter`; only that file: drop it with `update` or cancel); a model it cannot accept rejects the upload within seconds (unsupported architecture, inconsistent split set).\n\nAnswered before the body is read, in this order: an address the allow-list refuses (403), no or a wrong key (401; 503 without a key), a missing `Content-Length` or any `Transfer-Encoding`, also `chunked` next to a `Content-Length` (411), a `Content-Encoding` other than `identity` (415), a `Content-Length` above `chunk_max` (413 `chunk_too_large`, JSON; a 413 without this JSON comes from a proxy: send smaller chunks), a malformed `id` (400), an upload that is over (410) or busy (409 `upload_busy`), another sender (409 `other_client_active`), a chunk of this upload already on its way (409 `chunk_in_progress`), too many chunks at once (429 `upload_slots_busy`). Every answer of 400 or above closes the connection; a client that is still sending may see a reset connection, or behind a proxy a 502 that is not the server's JSON, and then asks `GET /admin/models/upload?id=` where to continue. Also expect upstream's 503 while the server starts and 401 from `--api-key`. **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "parameters": [
           { "name": "id", "in": "query", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" }, "description": "The upload" },
           { "name": "file", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 255 }, "description": "`index` of the file in the upload" },
           { "name": "offset", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64", "minimum": 0 }, "description": "Byte offset of the first byte of the body in the file" },
           { "name": "takeover", "in": "query", "required": false, "schema": { "type": "string", "enum": ["1"] }, "description": "`1` = make this sender the one that writes, although another one wrote within the last 30 s" },
+          { "name": "verify", "in": "query", "required": false, "schema": { "type": "string", "enum": ["1"] }, "description": "`1` = only compare the body with the stored bytes, write nothing (answer `AdminUploadVerifyResult`)" },
           { "name": "X-Upload-Client", "in": "header", "required": true, "schema": { "type": "string", "maxLength": 128 }, "description": "Random id of the sending browser tab or script" },
           { "name": "X-Chunk-CRC32", "in": "header", "required": false, "schema": { "type": "string", "pattern": "^[0-9a-fA-F]{8}$" }, "description": "CRC-32 (IEEE, as in zip and gzip) of the body, 8 hexadecimal digits" }
         ],
@@ -1109,11 +1107,14 @@
         },
         "responses": {
           "200": {
-            "description": "Stored (or compared, when the whole chunk was already there)",
+            "description": "Stored (or compared, when the whole chunk was already there); with `verify=1`: compared",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/AdminUploadChunkResult" },
-                "example": { "offset": 16777216, "durable_offset": 0, "file_complete": false, "state": "receiving", "file": 0, "received_bytes": 16777216, "total_bytes": 3341008960, "file_error": null }
+                "schema": { "anyOf": [{ "$ref": "#/components/schemas/AdminUploadChunkResult" }, { "$ref": "#/components/schemas/AdminUploadVerifyResult" }] },
+                "examples": {
+                  "stored": { "summary": "A chunk", "value": { "offset": 16777216, "durable_offset": 0, "file_complete": false, "state": "receiving", "file": 0, "received_bytes": 16777216, "total_bytes": 3341008960, "file_error": null } },
+                  "verified": { "summary": "verify=1 of the first MiB", "value": { "verified": true, "verified_bytes": 1048576, "offset": 10485760, "durable_offset": 10485760, "file_complete": false, "state": "receiving" } }
+                }
               }
             }
           },
@@ -1125,7 +1126,7 @@
           "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
           "404": { "$ref": "#/components/responses/AdminDisabled" },
           "409": {
-            "description": "`offset_mismatch` (`offset`: where the server is), `content_mismatch` (the bytes sent again differ: not the same file), `chunk_in_progress` (another chunk of this upload is on its way), `other_client_active` (`idle_ms`; another sender wrote within 30 s: send `takeover=1`), `upload_busy` (`state`: the upload is being checked or published, or waits as ready), `file_dropped` (the file was dropped from the upload)",
+            "description": "`offset_mismatch` (`offset`: where the server is), `content_mismatch` (`offset`: the bytes sent again differ: not the same file), `chunk_in_progress` (another chunk of this upload is on its way), `other_client_active` (`idle_ms`; another sender wrote within 30 s: send `takeover=1`), `upload_busy` (`state`: the upload is being checked or published, or waits as ready), `file_dropped` (the file was dropped from the upload)",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -1135,7 +1136,7 @@
           },
           "410": { "$ref": "#/components/responses/AdminUploadGone" },
           "411": {
-            "description": "`length_required`: the chunk has no `Content-Length` (chunked transfer encoding is not accepted)",
+            "description": "`length_required`: the chunk has no `Content-Length`, or it has a `Transfer-Encoding` (also `chunked` next to a `Content-Length`)",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "413": {
@@ -1148,24 +1149,29 @@
             }
           },
           "415": {
-            "description": "`unsupported_media_type`: the body is not `application/octet-stream`",
+            "description": "`unsupported_media_type`: the body is not `application/octet-stream`, or it has a `Content-Encoding` other than `identity`",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "422": {
-            "description": "`not_gguf` (`file`): the file does not start with `GGUF` and version 2 or 3; `file_rejected` (`file`, `code`): the check found the file unusable. Only that file is affected; the rest of the upload stays",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+            "description": "`not_gguf` (`file`, `reason` `not_gguf`): the file does not start with `GGUF` and version 2 or 3; `file_rejected` (`file`, `reason`: the code, e.g. `adapter`, `imatrix`, `projector_bad_metadata`, `projector_without_modality`, `malformed`, `header_too_large`): the header check found the file unusable. Only that file is affected; the rest of the upload stays",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 422, "message": "this file cannot be used: this is an adapter (LoRA / control vector), not a model (drop it from the upload or cancel)", "type": "file_rejected", "file": 2, "reason": "adapter" } }
+              }
+            }
           },
           "429": {
             "description": "`upload_slots_busy` (`retry_after_s`): 4 chunks are being received already",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "500": {
-            "description": "`write_failed`: an error while writing other than a full disk; the chunk is discarded, the upload is kept",
+            "description": "`write_failed` (`offset`): an error while writing or reading the staged file other than a full disk; the chunk is discarded, the upload is kept",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "503": { "$ref": "#/components/responses/AdminKeyUnavailable" },
           "507": {
-            "description": "`disk_full` (`free_bytes`, `offset`, `durable_offset`): the disk is full or a quota is reached; the chunk is discarded, the upload is kept. Free space, then continue from `offset`",
+            "description": "`disk_full` (`free_bytes`, `offset`, `durable_offset`): the disk is full or a quota is reached, or the chunk does not fit into the free space (checked before it is written); the chunk is discarded, the upload is kept. Free space, then continue from `offset`",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -1180,8 +1186,7 @@
       "post": {
         "tags": ["Admin"],
         "summary": "Change an upload: name, settings, expected SHA-256, drop files (exempt)",
-        "description": "Only while the upload is `receiving` or `ready`. A new `name` is checked as at create (409 `name_taken`); nothing is uploaded again, which is how an upload waiting as `ready` / `name_taken` is renamed. `settings` replaces the settings of the upload; `settings_mode` and `auto_publish` as at create. `files` sets (or with an empty string removes) the expected SHA-256 of files by `index`; `drop_files` takes files out of the upload (for example one that is not GGUF) and deletes their data at once; when the files that are left are all complete the checks start. 409 `upload_busy` while it is being checked or published, 410 once it is over. **Exempt** from the trial budget.",
-        "x-s3-recheck": "files[] / drop_files and the answer shape",
+        "description": "Only while the upload is `receiving` or `ready`. A new `name` is checked as at create (409 `name_taken`); nothing is uploaded again, which is how an upload waiting as `ready` / `name_taken` is renamed. `settings` replaces the settings of the upload; `settings_mode` and `auto_publish` as at create. `files` sets (or with an empty string removes) the expected SHA-256 of files by `index`; `drop_files` takes files out of the upload (for example one that is not GGUF) and deletes their data at once; when the files that are left are all complete the checks start. An upload that waits as `ready` stays there: send `publish` next. Refused: dropping every file (400, cancel instead); dropping a file once the checks have arranged the files under their final names (409 `upload_busy` with `staged: true`: cancel and upload again without that file); 409 `upload_busy` while it is being checked or published, 410 once it is over. **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "requestBody": {
           "required": true,
@@ -1209,7 +1214,7 @@
           "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
           "404": { "$ref": "#/components/responses/AdminDisabled" },
           "409": {
-            "description": "`name_taken` (`by`), `field_locked` (`param`), `upload_busy` (`state`)",
+            "description": "`name_taken` (`by`, `other`, `case_variant`), `field_locked` (`param`), `upload_busy` (`state`; `staged: true` for a drop after the files were arranged for publishing)",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "410": { "$ref": "#/components/responses/AdminUploadGone" },
@@ -1221,8 +1226,7 @@
       "post": {
         "tags": ["Admin"],
         "summary": "Publish an upload that waits as ready, or run its checks again (exempt)",
-        "description": "For an upload in `ready`: `manual` (auto_publish off), after a rename (`name_taken`), after a `publish_error`. For `check_failed` and `sha256_mismatch` the checks run again; `ignore_sha256_mismatch: true` accepts a SHA-256 that differs from the expected one (publish anyway). `without_settings: true` publishes without the upload's settings (`settings_not_saved`; the model then starts with its inherited values). Publishing: the name is checked again, the settings are saved as the model's per-model settings, the files become visible with one rename that never replaces anything, and the model list is rebuilt; the model then appears not loaded. Answers 202 at once (`publishing` or `checking`): follow it with `GET /admin/models/upload?id=`. An upload that is already published answers 200; one that is publishing or checking answers with its state. **Exempt** from the trial budget.",
-        "x-s3-recheck": "ignore_sha256_mismatch / without_settings and the answer shape",
+        "description": "For an upload in `ready`: `manual` (auto_publish off, or rebuilt without its record), after a rename (`name_taken`), after a `publish_error` or a `settings_invalid`. For `check_failed` and `sha256_mismatch` the checks run again (Retry; the SHA-256 is not computed again); `ignore_sha256_mismatch: true` accepts a SHA-256 that differs from the expected one (publish anyway). `without_settings: true` publishes without the upload's settings (`settings_not_saved`, `settings_invalid`; the model then starts with its inherited values). Publishing also switches `auto_publish` on. Publishing: the name is checked again, the settings are checked again and saved as the model's per-model settings (phase `pending`), the files become visible with one rename that never replaces anything (a failed rename puts the previous settings entry back), and the model list is rebuilt; the model then appears not loaded. Answers 202 at once (`publishing` or `checking`): follow it with `GET /admin/models/upload?id=`. An upload that is already published answers 200; one that is publishing or checking answers 202 with its state; 409 `upload_busy` while it is still receiving, 410 for a rejected, cancelled or expired one. **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "requestBody": {
           "required": true,
@@ -1265,7 +1269,7 @@
       "post": {
         "tags": ["Admin"],
         "summary": "Cancel an upload and delete its data (exempt)",
-        "description": "Ends an upload that is not published yet and deletes its data at once (`freed_bytes`). An upload that is already over answers 200 with `cancelled` false or true and `freed_bytes` 0. **Exempt** from the trial budget.",
+        "description": "Ends an upload that is not published yet and deletes its data at once (`cancelled`, `freed_bytes`). An upload that is being checked stops after the current step; one that is being published is refused (409). An upload that is already over answers 200 with `freed_bytes` 0 (`cancelled` is true only when it had been cancelled). **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "requestBody": {
           "required": true,
@@ -1301,8 +1305,7 @@
       "post": {
         "tags": ["Admin"],
         "summary": "Delete a model of the models directory, or only its projector (exempt)",
-        "description": "For models with source `models_dir` (uploaded or dropped in by hand); downloaded models keep `DELETE /models`, sections of `models.ini` are changed in `models.ini` (409 `not_deletable`). Only the files the model uses are deleted: its GGUF file or every shard of a split model, its projector and its draft model. Other entries of its folder stay (`kept`); the folder is removed only when it is empty afterwards. `projector_only` (Remove projector) deletes only the projector file; the model stays.\n\n- `dry_run`: only report (`files`, `n_files`, `total_bytes`; `kept`, at most 100 listed; `running`, `pinned`, `has_settings`, `warnings`).\n- A running model is refused (409 `model_running`) unless `stop`; then it is stopped first with a deadline of its stop timeout + 10 s (504 `stop_timeout`, nothing deleted).\n- `remove_settings` (default true) also removes the model's saved per-model settings, its pin and what the server cached about it.\n\nThe files are moved into a trash folder inside the models directory first (out of the model list at once), the model list is rebuilt, and the trash is deleted in the background (`trash_left`). An unknown id is 409 `not_deletable` with `reason` `not_found` (never 404). **Exempt** from the trial budget.",
-        "x-s3-recheck": "aligned with up_handle_delete in server-admin-upload.cpp while it was being written: re-check every field and reason",
+        "description": "For models with source `models_dir` (uploaded or dropped in by hand); downloaded models keep `DELETE /models`, sections of `models.ini` are changed in `models.ini` (409 `not_deletable`). Only what the models directory gives this model is deleted: its GGUF file or every shard of a split model, and for a model in a folder the projector and draft model in that folder. Other entries of its folder stay (`kept`), and so does a projector or draft model that every model gets (a draft on the router command line, a projector or draft in the `[*]` section of `models.ini`: `kept` with `shared: true`); the folder is removed only when it is empty afterwards. `projector_only` (Remove projector) deletes only the model's own projector file; the model stays with its settings and pin.\n\n- `dry_run`: only report (`files`, `n_files`, `total_bytes`; `kept`, at most 100 listed, `n_kept` (all entries that stay), `kept_truncated`, `kept_bytes`; `folder`, `folder_removed`; `running`, `status`, `pinned`, `has_settings`, `warnings`).\n- A running model is refused (409 `model_running`) unless `stop`; then it is stopped first with a deadline of its stop timeout + 10 s (504 `stop_timeout`, nothing deleted).\n- `remove_settings` (default true; ignored with `projector_only`) also removes the model's saved per-model settings, its pin and what the server cached about it.\n\nThe files are moved into a trash folder inside the models directory first (out of the model list at once), the model list is rebuilt, and the trash is deleted in the background (`trash_left`). An unknown id, or a model that is still being downloaded, is 409 `not_deletable` with `reason` `not_found` (never 404). **Exempt** from the trial budget.",
         "security": [{ "AdminKey": [] }],
         "requestBody": {
           "required": true,
@@ -1324,7 +1327,7 @@
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/AdminModelDeleteResult" },
                 "examples": {
-                  "dry": { "summary": "Dry run", "value": {"model": "gemma-3-4b", "source": "models_dir", "projector_only": false, "files": [{"path": "gemma-3-4b/gemma-3-4b.gguf", "bytes": 2489757856, "role": "model"}, {"path": "gemma-3-4b/mmproj-gemma-3-4b.gguf", "bytes": 851251104, "role": "projector"}], "n_files": 2, "total_bytes": 3341008960, "kept": [{"path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file"}], "n_kept": 1, "kept_bytes": 5120, "folder": "gemma-3-4b", "folder_removed": false, "running": false, "status": "unloaded", "pinned": false, "has_settings": true, "warnings": []} },
+                  "dry": { "summary": "Dry run", "value": {"model": "gemma-3-4b", "source": "models_dir", "projector_only": false, "files": [{"path": "gemma-3-4b/gemma-3-4b.gguf", "bytes": 2489757856, "role": "model"}, {"path": "gemma-3-4b/mmproj-gemma-3-4b.gguf", "bytes": 851251104, "role": "projector"}], "n_files": 2, "total_bytes": 3341008960, "kept": [{"path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file"}, {"path": "mtp-shared-draft.gguf", "bytes": 52428800, "kind": "file", "shared": true}], "n_kept": 2, "kept_truncated": false, "kept_bytes": 52433920, "folder": "gemma-3-4b", "folder_removed": false, "running": false, "status": "unloaded", "pinned": false, "has_settings": true, "warnings": [], "dry_run": true} },
                   "deleted": { "summary": "Deleted", "value": {"model": "gemma-3-4b", "deleted": true, "freed_bytes": 3341008960, "files": [{"path": "gemma-3-4b/gemma-3-4b.gguf", "bytes": 2489757856, "role": "model"}, {"path": "gemma-3-4b/mmproj-gemma-3-4b.gguf", "bytes": 851251104, "role": "projector"}], "kept": [{"path": "gemma-3-4b/README.md", "bytes": 5120, "kind": "file"}], "folder_removed": false, "settings_removed": true, "pin_removed": false, "trash_left": true, "reload_error": null} }
                 }
               }
@@ -1338,7 +1341,7 @@
           "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
           "404": { "$ref": "#/components/responses/AdminDisabled" },
           "409": {
-            "description": "`model_running` (send `stop: true`), `not_deletable` (`reason`: `not_found`, `cache`, `preset`, `no_projector`, `outside_models_dir`, `symlink`, `missing`, `other_filesystem`, `no_models_dir`, `no_file`)",
+            "description": "`model_running` (send `stop: true`), `not_deletable` (`reason`: `not_found`, `cache`, `preset` (a `models.ini` section, or a model whose model file `models.ini` or the router command line sets instead of the one the models directory gives it), `no_projector` (no projector of its own: none, or the one every model gets), `outside_models_dir`, `symlink`, `missing`, `other_filesystem`, `no_models_dir`, `no_file`), `upload_unavailable` (`reason`: the models directory cannot be used for the trash right now)",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" },
@@ -1347,7 +1350,7 @@
             }
           },
           "500": {
-            "description": "`server_error`: the trash folder could not be created or the model's folder could not be opened",
+            "description": "`server_error`: the trash folder could not be created, the model's folder could not be opened, or a file could not be moved (what was moved is put back)",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "503": { "$ref": "#/components/responses/AdminKeyUnavailable" },
@@ -1355,6 +1358,54 @@
             "description": "`stop_timeout`: the running model did not stop within its stop timeout + 10 s; nothing was deleted",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
+        }
+      }
+    },
+    "/admin/audit": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Activity log of admin actions (exempt)",
+        "description": "The activity log, newest record first, one page at a time. Kinds and their actions: `change`, an admin request with the key that changes something, with its outcome (`settings.update`, `model_settings.update`, `model_settings.reset`, `gpus.rescan`, `upload.create`, `upload.takeover`, `upload.cancel`, `upload.published`, `upload.rejected`, `model.delete`, `model.remove_projector`; result `error` with `status` and `code` (the error type) when the request failed and changed nothing; `upload.published` and `upload.rejected` are recorded when the checks end, with the actor of the admin who created the upload); `refusal`, `401` / `403` answers (`access.refused`, merged per client, path, status and reason for 60 s; the no-key status probe merged over all clients; at most 60 new records a minute and 256 open windows, the rest in one `access.refused_more` summary; kept in a file of their own so that they never push a change out of the log); `server`, actions of the server itself (`upload.expired`, `upload.resumed_after_restart`, `upload.swept` (recorded once the removal is done: `ok`, or `failed` once and then `ok` when a later sweep removed the folder), `model_settings.reverted`, `model_settings.reverted_at_startup`, `audit.started`, `audit.persisted_again`); `observed`, effects of the public model routes seen on the model status feed, actor \"public API (unknown)\" (`download.finished`, `download.failed`, `model.removed` (only from `DELETE /models`; files removed from the models directory by hand leave no record), `model.start_failed`; at most 30 a minute, the rest in one `observed.more`; a file of their own as well). Results: `ok`, `error`, `failed` (a GPU re-detection, a download or a model start did not work), `rejected`, `refused`. Read-only requests and single upload chunks are not recorded; who called the public routes (`/models`, `/models/load`, `/models/unload`) is not known. Never stored: `X-Admin-Key`, `Authorization`, `HF_TOKEN`, request bodies, paths outside the models directory.\n\nA merged record is written at once with its first request and updated when its window ends; the page shows its latest version (`count`, `updated_seq`; `open` while it still counts) under the `seq` of its first line, so paging with `before` is stable.\n\nStored in `<admin state dir>/admin-audit.jsonl` (changes and server records), `admin-audit-refusals.jsonl` and `admin-audit-observed.jsonl`, each rotated to `.1` at 4 MiB (at most 24 MiB in all), lines of at most 4 KiB, each record synced to disk. When a file cannot be written its records go to a ring of the last 1000 in memory, one ring per file (`persisted: false`, warning `audit_not_persisted`); the file is tried again every minute, and once a write works the ring is written in order, then one `audit.persisted_again` into that file (recorded only once it is on disk; also for a file whose ring was empty). The admin action itself never fails or waits because of the log.\n\n`format=jsonl` answers the lines themselves as a file (`application/x-ndjson`, `Content-Disposition: attachment`): every line of the three files, their `.1` and the memory rings, sorted by `seq` (oldest first); a merged record that ended with its first line and, when it counted more than one request, its update (`group` = the `seq` of its first line); a window still counting at the place of its first line, with its current count (its update follows when it ends); the filters and `before` apply, `limit` does not. This route itself is not recorded. **Exempt** from the trial budget.",
+        "security": [{ "AdminKey": [] }],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 }, "description": "Records per page" },
+          { "name": "before", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 }, "description": "Only records older than this one: the `next_before` of the previous page. Leave it out for the newest records" },
+          { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" }, "example": "change,server", "description": "Only these kinds, separated by commas: `change`, `refusal`, `server`, `observed` (another value: 400)" },
+          { "name": "action", "in": "query", "required": false, "schema": { "type": "string" }, "example": "upload", "description": "Only these actions, separated by commas. A name also matches the actions below it: `upload` (or `upload.*`) matches `upload.create`, `upload.published`, ..." },
+          { "name": "result", "in": "query", "required": false, "schema": { "type": "string" }, "example": "error,refused", "description": "Only these results, separated by commas: `ok`, `error`, `failed`, `rejected`, `refused`" },
+          { "name": "format", "in": "query", "required": false, "schema": { "type": "string", "enum": ["json", "jsonl"], "default": "json" }, "description": "`jsonl`: the lines of the log as a file instead of a page" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of records (newest first), or with `format=jsonl` the lines of the log (oldest first)",
+            "headers": { "Content-Disposition": { "schema": { "type": "string" }, "description": "`format=jsonl` only: `attachment; filename=\"provision-admin-audit.jsonl\"`" } },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdminAuditPage" },
+                "examples": {
+                  "page": {"summary": "A page (Docker stack as shipped: the peer is nginx, X-Forwarded-For unverified)", "value": {"entries": [{"seq": 1204, "id": "1204", "kind": "change", "action": "model_settings.update", "result": "ok", "ts": 1791364364381, "time": "2026-10-07T09:12:44Z", "target": "qwen2.5-chat", "actor": {"type": "client", "peer": "172.18.0.3", "client": "172.18.0.3", "via_proxy": false, "forwarded_for": "10.64.0.7", "forwarded_trusted": false, "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0", "label": "172.18.0.3 (X-Forwarded-For 10.64.0.7, unverified)"}, "details": {"changed": true, "changes": {"ctx-size": {"from": null, "to": "32768"}}, "was_running": true, "restart": true, "restarted": true}, "persisted": true, "open": false}, {"seq": 1201, "id": "1201", "kind": "refusal", "action": "access.refused", "result": "refused", "ts": 1791364152410, "time": "2026-10-07T09:09:12Z", "target": "/admin/settings", "actor": {"type": "client", "peer": "10.64.1.9", "client": "10.64.1.9", "via_proxy": false, "user_agent": "curl/8.5.0", "label": "10.64.1.9"}, "details": {"status": 401, "code": "admin_key_required", "reason": "wrong_key", "probe": false, "count": 12, "first": "2026-10-07T09:09:12Z", "last": "2026-10-07T09:10:02Z"}, "count": 12, "updated_seq": 1203, "persisted": true, "open": false}, {"seq": 1200, "id": "1200", "kind": "observed", "action": "download.finished", "result": "ok", "ts": 1791363330120, "time": "2026-10-07T08:55:30Z", "target": "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", "actor": {"type": "public_api", "label": "public API (unknown)"}, "details": {}, "persisted": true, "open": false}], "next_before": "1200", "matched": 1180, "persisted": true, "audit": {"persisted": true, "error": null, "since": null, "in_memory": 0, "lost": 0, "max_bytes": 4194304, "ring_max": 1000}, "warnings": []}},
+                  "memory": {"summary": "Kept in memory (the state directory is not writable)", "value": {"entries": [{"seq": 7, "id": "7", "kind": "server", "action": "audit.started", "result": "ok", "ts": 1791367260000, "time": "2026-10-07T10:01:00Z", "target": "", "actor": {"type": "server", "label": "server"}, "details": {"version": "b11168-a6bf2acb8", "persisted": false, "max_bytes": 4194304}, "persisted": false, "open": false}], "next_before": null, "matched": 1, "persisted": false, "audit": {"persisted": false, "error": "the admin state directory cannot be written", "since": "2026-10-07T10:01:00Z", "in_memory": 1, "lost": 0, "max_bytes": 4194304, "ring_max": 1000}, "warnings": ["audit_not_persisted"]}}
+                }
+              },
+              "application/x-ndjson": {
+                "schema": { "type": "string", "description": "One record per line, as in the files: the fields of `AdminAuditEntry` without `id`, `persisted`, `open`, `updated_seq`, plus `group` on the update of a merged record; a window still counting is its current state, without `group`, at the place of its first line" },
+                "example": "{\"seq\":1,\"kind\":\"server\",\"action\":\"audit.started\",\"result\":\"ok\",\"ts\":1790841600000,\"time\":\"2026-10-01T08:00:00Z\",\"target\":\"\",\"actor\":{\"type\":\"server\",\"label\":\"server\"},\"details\":{\"version\":\"b11168-a6bf2acb8\",\"persisted\":true,\"max_bytes\":4194304}}\n{\"seq\":2,\"kind\":\"refusal\",\"action\":\"access.refused\",\"result\":\"refused\",\"ts\":1790841790200,\"time\":\"2026-10-01T08:03:10Z\",\"target\":\"/admin/settings\",\"actor\":{\"type\":\"client\",\"peer\":\"10.64.1.9\",\"client\":\"10.64.1.9\",\"via_proxy\":false,\"user_agent\":\"curl/8.5.0\",\"label\":\"10.64.1.9\"},\"details\":{\"status\":401,\"code\":\"admin_key_required\",\"reason\":\"no_key\",\"probe\":false,\"count\":1,\"first\":\"2026-10-01T08:03:10Z\",\"last\":\"2026-10-01T08:03:10Z\"},\"count\":1}\n{\"seq\":3,\"kind\":\"refusal\",\"action\":\"access.refused\",\"result\":\"refused\",\"group\":2,\"ts\":1790841790200,\"time\":\"2026-10-01T08:03:10Z\",\"target\":\"/admin/settings\",\"actor\":{\"type\":\"client\",\"peer\":\"10.64.1.9\",\"client\":\"10.64.1.9\",\"via_proxy\":false,\"user_agent\":\"curl/8.5.0\",\"label\":\"10.64.1.9\"},\"details\":{\"status\":401,\"code\":\"admin_key_required\",\"reason\":\"no_key\",\"probe\":false,\"count\":3,\"first\":\"2026-10-01T08:03:10Z\",\"last\":\"2026-10-01T08:03:41Z\"},\"count\":3}\n"
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request_error` (`param`: `before`, `limit`, `kind` or `format`)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": 400, "message": "limit must be between 1 and 500", "type": "invalid_request_error", "param": "limit" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AdminKeyRequired" },
+          "403": { "$ref": "#/components/responses/AdminAddressNotAllowed" },
+          "404": { "$ref": "#/components/responses/AdminDisabled" },
+          "503": { "$ref": "#/components/responses/AdminKeyUnavailable" }
         }
       }
     }
@@ -1388,7 +1439,7 @@
         }
       },
       "AdminKeyRequired": {
-        "description": "The `X-Admin-Key` header is missing or wrong",
+        "description": "The `X-Admin-Key` header is missing or wrong. Recorded in the activity log (`GET /admin/audit`, kind `refusal`), merged per client, path and status for 60 s",
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" },
@@ -1406,7 +1457,7 @@
         }
       },
       "AdminAddressNotAllowed": {
-        "description": "`admin_forbidden`: the client address is not on the `/admin` allow-list. Answered by the nginx front door (Docker: `ADMIN_ALLOW_RULES`; host: the `geo` allow-list of `deploy/linux/nginx-provision-llm.conf`), where the request never reaches the server, or by the server's own allow-list (`PROVISION_ADMIN_ALLOW_FROM`, off by default; `X-Forwarded-For` is used only from the reverse proxies in `PROVISION_ADMIN_TRUSTED_PROXIES`), whose message names the address the server saw. The server's allow-list applies to every `/admin` route, the status probe included, before the key check; while one of its entries cannot be read, every `/admin` request is refused (fail closed)",
+        "description": "`admin_forbidden`: the client address is not on the `/admin` allow-list. Answered by the nginx front door (Docker: `ADMIN_ALLOW_RULES`; host: the `geo` allow-list of `deploy/linux/nginx-provision-llm.conf`), where the request never reaches the server, or by the server's own allow-list (`PROVISION_ADMIN_ALLOW_FROM`, off by default; `X-Forwarded-For` is used only from the reverse proxies in `PROVISION_ADMIN_TRUSTED_PROXIES`), whose message names the address the server saw. The server's allow-list applies to every `/admin` route, the status probe included, before the key check; while one of its entries cannot be read, every `/admin` request is refused (fail closed). The server's own refusals are recorded in the activity log (`GET /admin/audit`, kind `refusal`); those of nginx never reach the server",
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" },
@@ -1487,8 +1538,8 @@
           "key_configured": { "type": "boolean", "description": "false = the server has no admin key (protected endpoints answer 503)" },
           "version": { "type": "integer", "example": 1, "description": "Version of the admin state format" },
           "key_source": { "type": "string", "enum": ["env", "file", "generated"], "description": "Where the key comes from: `PROVISION_ADMIN_KEY`, `PROVISION_ADMIN_KEY_FILE`, or `<state dir>/admin.key`" },
-          "features": { "type": "array", "items": { "type": "string" }, "example": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete"], "description": "Optional parts this server has: `model_settings` (`/admin/models/settings`), `gpus` (`/admin/gpus`), `model_log` (`/admin/models/log`), `diagnostics` (`/admin/diagnostics`), `fit_check` (`/admin/models/settings/check`), `upload` (`/admin/models/upload*`), `delete` (`/admin/models/delete`). Clients show those parts only when listed; an older server has no `features`" },
-          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`default_device_not_present`: GPU for new models names a GPU this server does not have (it is not applied)" },
+          "features": { "type": "array", "items": { "type": "string" }, "example": ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete", "audit"], "description": "Optional parts this server has: `model_settings` (`/admin/models/settings`), `gpus` (`/admin/gpus`), `model_log` (`/admin/models/log`), `diagnostics` (`/admin/diagnostics`), `fit_check` (`/admin/models/settings/check`), `upload` (`/admin/models/upload*`), `delete` (`/admin/models/delete`), `audit` (`/admin/audit`, the Activity tab). Clients show those parts only when listed; an older server has no `features`" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`default_device_not_present`: GPU for new models names a GPU this server does not have (it is not applied). `audit_not_persisted`: the activity log is kept in memory (`audit`), because the admin state directory is not writable or a write to the log failed" },
           "models": {
             "type": "object",
             "properties": {
@@ -1514,6 +1565,7 @@
             }
           },
           "upload": { "$ref": "#/components/schemas/AdminUploadAvailability" },
+          "audit": { "$ref": "#/components/schemas/AdminAuditState" },
           "dirs": {
             "type": "object",
             "properties": {
@@ -1612,6 +1664,16 @@
               "path": { "type": "string", "nullable": true },
               "bytes": { "type": "integer", "format": "int64", "description": "What the unfinished uploads take together" },
               "trash_bytes": { "type": "integer", "format": "int64", "description": "Files of deleted models that still wait in the trash" }
+            }
+          },
+          "audit": {
+            "type": "object",
+            "description": "The files of the activity log in the admin state directory (`GET /admin/audit`); absent on servers without the `audit` feature",
+            "properties": {
+              "persisted": { "type": "boolean", "description": "false while records are kept in memory" },
+              "files": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string", "example": "admin-audit.jsonl" }, "bytes": { "type": "integer", "format": "int64" }, "store": { "type": "string", "enum": ["changes", "refusals", "observed"] } } }, "description": "`admin-audit.jsonl` (`changes`), `admin-audit-refusals.jsonl` (`refusals`), `admin-audit-observed.jsonl` (`observed`) and their previous generations `.1`, as far as they exist (a file is created with its first record)" },
+              "total_bytes": { "type": "integer", "format": "int64" },
+              "max_bytes": { "type": "integer", "format": "int64", "description": "A file is rotated to `.1` when it would grow past this (4 MiB; three files with one older copy each: at most 24 MiB)" }
             }
           }
         }
@@ -2137,7 +2199,7 @@
             "items": {
               "type": "object",
               "properties": {
-                "id": { "type": "string", "example": "vendor_tool", "description": "`deployment`, `binary`, `gpu_backend`, `inventory`, `vendor_tool`, `memory_mapping`, `router_gpu_free`, `state_dir`, `admin_key`, `proxy`, `ip_allowlist`, `model_devices`, `model_settings`, and `stuck_helpers` at the end, only while a helper process hangs" },
+                "id": { "type": "string", "example": "vendor_tool", "description": "`deployment`, `binary`, `gpu_backend`, `inventory`, `vendor_tool`, `memory_mapping`, `router_gpu_free`, `state_dir`, `admin_key`, `proxy`, `ip_allowlist`, `model_devices`, `model_settings`, `audit` (the value of `AdminAuditState` plus `files`; `warning` while the activity log is kept in memory), and `stuck_helpers` at the end, only while a helper process hangs" },
                 "label": { "type": "string", "example": "GPU memory tool" },
                 "status": { "type": "string", "enum": ["ok", "warning", "error", "info"] },
                 "value": { "description": "What was found: a string, a number, a boolean, an object or null" },
@@ -2178,7 +2240,7 @@
           "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
           "name": { "type": "string", "description": "The model id it will get" },
           "state": { "type": "string", "enum": ["receiving", "checking", "ready", "publishing", "published", "rejected", "cancelled", "expired"] },
-          "substate": { "type": "string", "nullable": true, "description": "`checking`: `queued` (another upload's check runs), `hashing`, `classifying`, `load_check`" },
+          "substate": { "type": "string", "nullable": true, "description": "`checking`: `queued` (waiting for its turn: one upload is checked at a time), `hashing` (with `progress`; only when the SHA-256 is read again from disk), `classifying`, `load_check`" },
           "blocked_by": { "type": "string", "nullable": true, "enum": ["manual", "name_taken", "publish_error", "check_failed", "sha256_mismatch", "settings_not_saved", "settings_invalid", null], "description": "`ready` only: what the upload waits for; details in `blocked`" },
           "total_bytes": { "type": "integer", "format": "int64" },
           "received_bytes": { "type": "integer", "format": "int64" },
@@ -2186,9 +2248,9 @@
           "auto_publish": { "type": "boolean" },
           "created": { "type": "string", "format": "date-time" },
           "last_activity": { "type": "string", "format": "date-time" },
-          "error": { "type": "object", "nullable": true, "description": "`rejected` (or a failed step): `code`, `message`" },
-          "blocked": { "type": "object", "nullable": true, "description": "`ready`: details of `blocked_by` (e.g. `by` and `other` for `name_taken`)" },
-          "expires_at": { "type": "string", "format": "date-time", "nullable": true, "description": "When it is removed without progress; null while the server works on it" }
+          "error": { "type": "object", "nullable": true, "description": "`rejected`: `code`, `message`, `file` (the index of the file the verdict is about, or null); `expired`: `code` `expired`" },
+          "blocked": { "type": "object", "nullable": true, "description": "`ready`: `code` and `message`, and per `blocked_by`: `name_taken` `by`, `other`, `case_variant`; `sha256_mismatch` `file`, `expected`, `actual`; `check_failed` the code of why the check could not run (`timeout`, `spawn_failed`, `no_result`, `check_error`, `hash_failed`, `check_failed`, `staging_failed`; on Windows `path_too_long` with `max_name_length`; after a restart a file code such as `not_gguf` with `file`); `publish_error` `staging_failed`, `upload_unavailable`, `staging_other_filesystem`, `publish_failed` (`errno`); `settings_invalid` the settings error and `param`" },
+          "expires_at": { "type": "string", "format": "date-time", "nullable": true, "description": "When it is removed without progress; set only while it is `receiving` or `ready`" }
         }
       },
       "AdminUploadOverview": {
@@ -2216,13 +2278,13 @@
           "durable_offset": { "type": "integer", "format": "int64", "description": "Bytes known to be on disk (last checkpoint, every 256 MiB or 15 s); after a restart of the server `offset` goes back to it" },
           "complete": { "type": "boolean" },
           "dropped": { "type": "boolean", "description": "Taken out of the upload with `drop_files`" },
-          "role": { "type": "string", "nullable": true, "enum": ["model", "projector", null], "description": "From the header check; null before" },
-          "sha256": { "type": "string", "nullable": true, "description": "Known once the checks have hashed the file" },
+          "role": { "type": "string", "nullable": true, "enum": ["model", "projector", "adapter", "imatrix", null], "description": "From the file's header (a file with the architecture `clip` is the projector; `adapter` or `imatrix` for such a file, which is refused); null before" },
+          "sha256": { "type": "string", "nullable": true, "description": "Computed while the file is received, so known once it is complete (after a restart of the server read again from disk)" },
           "sha256_expected": { "type": "string", "nullable": true },
-          "head_crc32": { "type": "string", "nullable": true, "description": "CRC-32 of the first MiB (8 hex digits), once that much has arrived: compare it with a file picked again before continuing" },
-          "final_name": { "type": "string", "nullable": true, "description": "The name in the models directory, once decided" },
-          "header": { "type": "object", "description": "The header check of this file: `state` (`none`, `scanning`, `queued`, `ok`, `warning`, `failed`, `error`), and what it read: `arch`, `type`, `split` (`no`, `count`), `message`" },
-          "error": { "type": "object", "nullable": true, "description": "Why this file cannot be used (`code`, `message`)" }
+          "head_crc32": { "type": "string", "nullable": true, "description": "CRC-32 of the first MiB (8 hex digits), once that much has arrived: compare it with a file picked again before continuing; null when the server does not know it (probe with `verify=1`)" },
+          "final_name": { "type": "string", "nullable": true, "description": "The name in the models directory, once the classification has decided it" },
+          "header": { "type": "object", "description": "The header check of this file: `state` (`none`: no bytes yet, `scanning`: waiting for the rest of the metadata, `queued`, `ok`, `warning`: decided by the load check at the end, `failed`: the check could not run and runs again, `error`: refused, see `error`); once the metadata was read `arch` and `type` (`general.architecture` and `general.type` of the file, null when absent: `model`, `adapter`, `imatrix`, `mmproj`, or older values such as `clip-vision`) and `split` (`no`, `count`) for a shard; `message` only with a warning, a failure or a refusal" },
+          "error": { "type": "object", "nullable": true, "description": "Why this file cannot be used (`code`, `message`): `not_gguf`, `adapter`, `imatrix`, `projector_bad_metadata`, `projector_without_modality`, `malformed`, `header_too_large`" }
         }
       },
       "AdminUploadSession": {
@@ -2235,19 +2297,19 @@
               "files": { "type": "array", "items": { "$ref": "#/components/schemas/AdminUploadFile" } },
               "settings": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Per-model settings for the first start" },
               "settings_mode": { "type": "string", "enum": ["replace", "keep"] },
-              "plan": { "description": "The final names and roles, once the classification has decided them" },
-              "facts": { "description": "What the checks read from the files" },
-              "result": { "description": "`published`: the model and its final files; a `reload_error` when the model list could not be rebuilt (the next rescan lists the model)" },
+              "plan": { "description": "The final layout, once the classification has decided it: `layout` (`file` or `folder`), `target` (the name in the models directory), `id`, `files[]` (`index`, `final_name`, `role`, `split_no`: null for a single file)" },
+              "facts": { "description": "What the checks read about the model: `arch`, `name` (`general.name`), `n_params`, `n_ctx_train`, `n_layer`, `file_type` (`general.file_type`), `n_tensors`, `split` for a split set; after the load check also `n_vocab`, `desc`, and with a projector `vision` / `audio`" },
+              "result": { "description": "`published`: `model`, `layout`, `target`, `rename` (how the files were moved into place), `reload_error` (the model list could not be rebuilt; the next rescan lists the model), `settings_saved`, `files[]` (`name` relative to the models directory, `role`, `size`, `sha256`). An upload whose publish had finished when the server stopped shows only `model`, `target` and `recovered`" },
               "warnings": { "type": "array", "items": { "type": "string" } },
               "idle_ms": { "type": "integer", "format": "int64", "description": "Time without progress, counted while the server runs" },
               "last_client_idle_ms": { "type": "integer", "format": "int64", "nullable": true, "description": "Time since the last chunk from any sender; below 30000 another sender gets `other_client_active`" },
               "recovered": { "type": "boolean", "description": "The server took the upload over after a restart" },
-              "recovered_without_record": { "type": "boolean" },
+              "recovered_without_record": { "type": "boolean", "description": "Rebuilt from its staging hint alone (its record in the admin state directory was missing): without its settings, and it waits as `ready` / `manual` after its checks" },
               "record_persisted": { "type": "boolean", "description": "The upload's record is in the admin state directory" },
               "chunk_max": { "type": "integer" },
               "chunk_default": { "type": "integer" },
-              "progress": { "type": "object", "nullable": true, "description": "While hashing", "properties": { "done_bytes": { "type": "integer", "format": "int64" }, "total_bytes": { "type": "integer", "format": "int64" } } },
-              "checks": { "type": "array", "description": "What the checks found so far (the header check names architecture, parameters, quantization, training context)", "items": { "type": "object", "properties": { "step": { "type": "string" }, "file": { "type": "integer" }, "status": { "type": "string" }, "message": { "type": "string" } } } }
+              "progress": { "type": "object", "nullable": true, "description": "While hashing (`substate` `hashing`), else null", "properties": { "done_bytes": { "type": "integer", "format": "int64" }, "total_bytes": { "type": "integer", "format": "int64" } } },
+              "checks": { "type": "array", "description": "One entry per file whose header check has started: `step` (`header`), `file`, `status` (the `header.state` of that file), `message` (empty while all is well, otherwise the warning or the reason)", "items": { "type": "object", "properties": { "step": { "type": "string" }, "file": { "type": "integer" }, "status": { "type": "string" }, "message": { "type": "string" } } } }
             }
           }
         ]
@@ -2281,7 +2343,7 @@
       "AdminUploadCreated": {
         "type": "object",
         "properties": {
-          "upload": { "type": "object", "description": "The new upload, as `GET /admin/models/upload?id=` shows it; in a dry run only `id` (null), `name`, `files`, `settings`, `chunk_max`, `chunk_default`" },
+          "upload": { "type": "object", "description": "The new upload, as `GET /admin/models/upload?id=` shows it; in a dry run only `id` (null), `name`, `files` (`index`, `name`, `size`), `settings` (as they would be saved), `chunk_max`, `chunk_default`" },
           "disk": {
             "type": "object",
             "description": "The filesystem of the models directory",
@@ -2290,16 +2352,17 @@
               "total_bytes": { "type": "integer", "format": "int64" },
               "needed_bytes": { "type": "integer", "format": "int64", "description": "What this upload needs" },
               "other_uploads_bytes": { "type": "integer", "format": "int64", "description": "What the other unfinished uploads still need" },
-              "shares_disk_with": { "type": "array", "items": { "type": "string" }, "description": "Other data on the same filesystem: `admin_state`" }
+              "shares_disk_with": { "type": "array", "items": { "type": "string" }, "description": "Other data on the same filesystem: `admin_state` (checked on Linux only)" }
             }
           },
-          "warnings": { "type": "array", "items": { "type": "string" }, "description": "Never blocking: `not_enough_space` (larger than the free space minus what other unfinished uploads still need), `larger_than_disk`, `shares_disk_with_state` (a full disk would also stop settings from being saved), `record_not_persisted` (the record could not be written to the admin state directory)" },
-          "locks": { "type": "object", "description": "The settings that are locked for this model" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "Never blocking: `not_enough_space` (larger than the free space minus what other unfinished uploads still need), `larger_than_disk`, `shares_disk_with_state` (a full disk would also stop settings from being saved), `state_not_writable` (the admin state directory cannot be written: with settings the publish stops at `settings_not_saved`), `record_not_persisted` (the record could not be written to the admin state directory), and the value warnings of `POST /admin/models/settings` (e.g. `ctx_above_train`, `device_missing`)" },
+          "locks": { "type": "object", "description": "The settings that are locked for this model: `{ key: { by, value } }`, `by` `router_cli` (given on the router command line) or `model_devices` (the GPU of a `MODEL_DEVICES` `*=` entry in `[*]`)", "additionalProperties": { "type": "object", "properties": { "by": { "type": "string", "enum": ["router_cli", "model_devices"] }, "value": { "type": "string" } } } },
           "existing_settings": { "type": "object", "description": "Only when there are some: saved settings of an earlier model with this id (an `orphaned` entry of `GET /admin/models/settings`)" }
         }
       },
       "AdminUploadChunkResult": {
         "type": "object",
+        "required": ["offset", "durable_offset", "file_complete", "state", "file"],
         "properties": {
           "offset": { "type": "integer", "format": "int64", "description": "The file's offset on the server after this chunk" },
           "durable_offset": { "type": "integer", "format": "int64" },
@@ -2309,6 +2372,19 @@
           "received_bytes": { "type": "integer", "format": "int64", "description": "Of the whole upload" },
           "total_bytes": { "type": "integer", "format": "int64" },
           "file_error": { "type": "object", "nullable": true, "description": "Why this file cannot be used, once the header check decided so" }
+        }
+      },
+      "AdminUploadVerifyResult": {
+        "type": "object",
+        "description": "Answer of a chunk sent with `verify=1`: compared, nothing written",
+        "required": ["verified", "verified_bytes", "offset"],
+        "properties": {
+          "verified": { "type": "boolean", "description": "Always true in a 200 answer (a difference is 409 `content_mismatch`)" },
+          "verified_bytes": { "type": "integer", "format": "int64", "description": "How much of the body overlapped the stored bytes and was compared" },
+          "offset": { "type": "integer", "format": "int64", "description": "The file's offset on the server" },
+          "durable_offset": { "type": "integer", "format": "int64" },
+          "file_complete": { "type": "boolean" },
+          "state": { "type": "string" }
         }
       },
       "AdminUploadUpdateRequest": {
@@ -2321,7 +2397,7 @@
           "settings_mode": { "type": "string", "enum": ["replace", "keep"] },
           "auto_publish": { "type": "boolean" },
           "files": { "type": "array", "description": "Set the expected SHA-256 of files (an empty string removes it)", "items": { "type": "object", "required": ["index"], "properties": { "index": { "type": "integer" }, "sha256": { "type": "string" } } } },
-          "drop_files": { "type": "array", "items": { "type": "integer" }, "description": "Indexes of files to take out of the upload; their data is deleted at once" }
+          "drop_files": { "type": "array", "items": { "type": "integer" }, "description": "Indexes of files to take out of the upload; their data is deleted at once. Refused (409 `upload_busy`, `staged: true`) once the checks have arranged the files under their final names" }
         }
       },
       "AdminUploadPublishRequest": {
@@ -2330,7 +2406,7 @@
         "properties": {
           "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
           "ignore_sha256_mismatch": { "type": "boolean", "default": false, "description": "Publish although the SHA-256 differs from the expected one" },
-          "without_settings": { "type": "boolean", "default": false, "description": "Publish without the upload's settings (when they cannot be saved: `settings_not_saved`)" }
+          "without_settings": { "type": "boolean", "default": false, "description": "Publish without the upload's settings (when they cannot be saved, `settings_not_saved`, or no longer fit, `settings_invalid`)" }
         }
       },
       "AdminUploadIdRequest": {
@@ -2372,9 +2448,11 @@
           "files": { "type": "array", "description": "What is (would be) deleted, paths relative to the models directory", "items": { "type": "object", "properties": { "path": { "type": "string" }, "bytes": { "type": "integer", "format": "int64" }, "role": { "type": "string", "enum": ["model", "shard", "projector", "draft"] } } } },
           "n_files": { "type": "integer" },
           "total_bytes": { "type": "integer", "format": "int64" },
-          "kept": { "type": "array", "description": "Other entries of the model's folder that stay (not part of this model); at most 100 listed", "items": { "type": "object", "properties": { "path": { "type": "string" }, "bytes": { "type": "integer", "format": "int64", "nullable": true }, "kind": { "type": "string", "enum": ["file", "dir", "symlink"] } } } },
-          "n_kept": { "type": "integer" },
-          "kept_bytes": { "type": "integer", "format": "int64" },
+          "kept": { "type": "array", "description": "What stays: the other entries of the model's folder (not part of this model; `bytes` null for a folder) and, with `shared: true`, a projector or draft model that every model gets; at most 100 listed", "items": { "type": "object", "properties": { "path": { "type": "string" }, "bytes": { "type": "integer", "format": "int64", "nullable": true }, "kind": { "type": "string", "enum": ["file", "dir", "symlink"] }, "shared": { "type": "boolean", "description": "A projector or draft model every model gets (a draft on the router command line, `[*]` of `models.ini`): never deleted from here" } } } },
+          "dry_run": { "type": "boolean", "description": "True in the answer of a dry run" },
+          "n_kept": { "type": "integer", "description": "The number of all entries that stay; larger than the length of `kept` when that list is cut at 100" },
+          "kept_truncated": { "type": "boolean", "description": "Dry run: `kept` lists only the first 100 of `n_kept` entries" },
+          "kept_bytes": { "type": "integer", "format": "int64", "description": "The size of all files that stay" },
           "folder": { "type": "string", "nullable": true, "description": "The model's folder in the models directory; null for a top-level file" },
           "folder_removed": { "type": "boolean", "description": "The folder is (would be) empty afterwards and removed" },
           "running": { "type": "boolean", "description": "Dry run: the model is running (it would be stopped with `stop`)" },
@@ -2389,6 +2467,70 @@
           "pin_removed": { "type": "boolean" },
           "trash_left": { "type": "boolean", "description": "The files wait in the trash, which the server deletes in the background" },
           "reload_error": { "type": "string", "nullable": true, "description": "The model list could not be rebuilt afterwards; the files are gone all the same" }
+        }
+      },
+      "AdminAuditState": {
+        "type": "object",
+        "description": "Whether the activity log is written to the admin state directory (`audit` of `GET /admin/status` and `GET /admin/audit`)",
+        "properties": {
+          "persisted": { "type": "boolean", "description": "false while records of any of the three files (changes, refusals, observed) are kept in memory" },
+          "error": { "type": "string", "nullable": true, "example": "the admin state directory cannot be written", "description": "Why not; null when it is written" },
+          "since": { "type": "string", "format": "date-time", "nullable": true, "description": "Since when records are kept in memory" },
+          "in_memory": { "type": "integer", "description": "Records waiting in memory to be written (all files)" },
+          "lost": { "type": "integer", "format": "int64", "description": "Records the full memory rings dropped meanwhile" },
+          "max_bytes": { "type": "integer", "format": "int64", "example": 4194304, "description": "A file is rotated to `.1` when it would grow past this" },
+          "ring_max": { "type": "integer", "example": 1000, "description": "Records the memory ring holds (per file)" }
+        }
+      },
+      "AdminAuditActor": {
+        "type": "object",
+        "required": ["type", "label"],
+        "description": "Who caused a record. There are no user accounts: an admin request is identified by its address and `User-Agent`; whoever presents the admin key is the same admin. Header values are printable ASCII (other bytes become `?`) and cut",
+        "properties": {
+          "type": { "type": "string", "enum": ["client", "server", "public_api", "various", "unknown"], "description": "`client`: an admin request (the fields below); `server`: the server itself; `public_api`: an effect of the public model routes; `various`: a merged record of several clients (the status probe of refused browsers, the summary of a flood)" },
+          "label": { "type": "string", "example": "172.18.0.3 (X-Forwarded-For 10.64.0.7, unverified)", "description": "The actor in one line: `10.64.0.7`, `10.64.0.7 via trusted proxy 127.0.0.1`, `172.18.0.3 (X-Forwarded-For 10.64.0.7, unverified)`, `server`, `public API (unknown)`, `browsers of refused addresses`, `several clients`" },
+          "peer": { "type": "string", "example": "172.18.0.3", "description": "The TCP peer of the request; behind nginx or another proxy, the proxy (`unix socket` for a Unix socket)" },
+          "client": { "type": "string", "example": "10.64.0.7", "description": "The client address as the address logic of `PROVISION_ADMIN_ALLOW_FROM` finds it, also while that allow-list is off: the peer, or, only when the peer is listed in `PROVISION_ADMIN_TRUSTED_PROXIES`, the address taken from its `X-Forwarded-For`; empty when unknown" },
+          "via_proxy": { "type": "boolean", "description": "`client` was taken from the `X-Forwarded-For` of a trusted proxy" },
+          "forwarded_for": { "type": "string", "example": "10.64.0.7", "description": "Only when the request had one: the raw `X-Forwarded-For` (several header lines joined with `, `, in the order they arrived), at most 128 bytes" },
+          "forwarded_trusted": { "type": "boolean", "description": "With `forwarded_for`: the peer is a trusted proxy. false: the header is whatever the sender wrote (unverified)" },
+          "note": { "type": "string", "example": "X-Forwarded-For was sent more than once", "description": "Why the `X-Forwarded-For` of a trusted proxy was not used: missing, sent in more than one header line (in any spelling of its name), or an entry that is not an address" },
+          "user_agent": { "type": "string", "example": "curl/8.5.0", "description": "Only when the request had one: the `User-Agent` header, at most 128 bytes; written by the client, proves nothing" }
+        }
+      },
+      "AdminAuditEntry": {
+        "type": "object",
+        "required": ["seq", "id", "kind", "action", "result", "persisted", "open"],
+        "description": "One record of the activity log: the fields of its line in the file (at most 4 KiB) plus `id`, `persisted`, `open` and `updated_seq`. A line whose start can be read but not the rest (`unreadable`) has only `seq`, `kind`, `action`, `result`",
+        "properties": {
+          "seq": { "type": "integer", "format": "int64", "example": 1204, "description": "Numbers the records of the three files in the order they were recorded, across restarts; for a merged record the `seq` of its first line. `before` of `GET /admin/audit` refers to it" },
+          "id": { "type": "string", "example": "1204", "description": "`seq` as a string" },
+          "kind": { "type": "string", "enum": ["change", "refusal", "server", "observed"], "description": "`change`: an admin request that changes something; `refusal`: a refused admin request; `server`: an action of the server itself; `observed`: an effect of the public model routes" },
+          "action": { "type": "string", "example": "model_settings.update", "description": "`settings.update`, `model_settings.update`, `model_settings.reset`, `gpus.rescan`, `upload.create`, `upload.takeover`, `upload.cancel`, `upload.published`, `upload.rejected`, `upload.expired`, `upload.resumed_after_restart`, `upload.swept`, `model.delete`, `model.remove_projector`, `model_settings.reverted`, `model_settings.reverted_at_startup`, `audit.started`, `audit.persisted_again`, `access.refused`, `access.refused_more`, `download.finished`, `download.failed`, `model.removed` (`DELETE /models` only), `model.start_failed`, `observed.more`" },
+          "result": { "type": "string", "example": "ok", "description": "`ok`; `error`: the admin request was answered with an error and changed nothing (`details`: `status`, `code`); `failed`: the action did not work (GPU re-detection, download, model start); `rejected`: the checks refused an upload; `refused`: a `401` / `403`" },
+          "ts": { "type": "integer", "format": "int64", "example": 1791364364381, "description": "When it was recorded, in milliseconds since 1970; for a merged record its first request" },
+          "time": { "type": "string", "format": "date-time", "description": "`ts` as UTC" },
+          "target": { "type": "string", "example": "qwen2.5-chat", "description": "The model id, upload name or path the action is about (printable ASCII, at most 256 bytes); empty when there is none" },
+          "actor": { "$ref": "#/components/schemas/AdminAuditActor" },
+          "details": { "type": "object", "additionalProperties": true, "description": "Per action (docs/provision-admin.md, section 18.1): `changes` as `{key: {from, to}}` (each value at most 128 bytes of JSON), `changed`, upload `id`, `bytes`, `files`, `layout`, `sha256`, `arch`, reason `code`, deleted `paths` (relative to the models directory). A merged record: `count`, `first`, `last`, for a refusal `status`, `code`, `reason`, `probe`; with several clients `clients`, `clients_capped`, `sample` (at most 8 addresses); a summary also `items`, `items_capped` (at most 16 paths or model ids). Details that did not fit in the 4 KiB line: `truncated: true` and `text` (the first KiB of their JSON text). Never a key, a token, a request body or a path outside the models directory" },
+          "count": { "type": "integer", "format": "int64", "description": "A merged record: the requests or events it stands for" },
+          "truncated": { "type": "boolean", "description": "The record did not fit in 4 KiB even with its details cut: only `seq`, `kind`, `action`, `result`, `ts` and `time` are kept" },
+          "persisted": { "type": "boolean", "description": "false for a record that is only in memory" },
+          "open": { "type": "boolean", "description": "A merged record whose 60 s are not over: its `count` still grows" },
+          "updated_seq": { "type": "integer", "format": "int64", "description": "A merged record: the `seq` of its latest update; a window still counting (`open`) has no update yet: its own `seq`" },
+          "unreadable": { "type": "boolean", "description": "The line could not be read back (written by hand or cut by a crash; the next record still starts on a line of its own); only the head fields are given" }
+        }
+      },
+      "AdminAuditPage": {
+        "type": "object",
+        "required": ["entries", "next_before", "persisted"],
+        "properties": {
+          "entries": { "type": "array", "description": "The records, newest first", "items": { "$ref": "#/components/schemas/AdminAuditEntry" } },
+          "next_before": { "type": "string", "nullable": true, "pattern": "^[0-9]+$", "example": "1200", "description": "Send it as `before` for the next older page; null when there is nothing older (with the filters applied)" },
+          "matched": { "type": "integer", "description": "How many records match the filters and `before` in all, this page included" },
+          "persisted": { "type": "boolean", "description": "false while any of the three files of the log is kept in memory" },
+          "audit": { "$ref": "#/components/schemas/AdminAuditState" },
+          "warnings": { "type": "array", "items": { "type": "string" }, "description": "`audit_not_persisted`" }
         }
       },
       "Error": {

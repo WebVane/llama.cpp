@@ -10,7 +10,7 @@
 #   - a device that a canned inventory lists but the build does not have gives a real, cheap failed start
 #     ("invalid device"), which drives the two-phase commit and the automatic revert.
 # Tests that need a CPU-only build (or the real device inventory of one) skip themselves on a GPU build.
-# The routers of this file listen on 8380-8399 (one port per xdist worker, see _port()).
+# The routers of this file listen on 8380 and up (one port per xdist worker, see _port()).
 
 import calendar
 import glob
@@ -39,10 +39,10 @@ SETTING_KEYS = [
     "device", "ctx-size", "kv-unified-per-slot", "parallel", "n-gpu-layers", "flash-attn", "cache-type-k", "cache-type-v",
     "ubatch-size", "embeddings", "pooling", "reranking",
 ]
-FEATURES = ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete"]  # stage 3: upload, delete
+FEATURES = ["model_settings", "gpus", "model_log", "diagnostics", "fit_check", "upload", "delete", "audit"]  # stage 3: upload, delete, audit
 DIAGNOSTIC_ITEMS = [
     "deployment", "binary", "gpu_backend", "inventory", "vendor_tool", "memory_mapping", "router_gpu_free", "state_dir",
-    "admin_key", "proxy", "ip_allowlist", "model_devices", "model_settings",
+    "admin_key", "proxy", "ip_allowlist", "model_devices", "model_settings", "audit",
 ]
 MODELS_FILE = "admin-models.json"
 
@@ -99,10 +99,11 @@ ROCM_SMI_WARNINGS = ROCM_SMI.replace("rocm-smi\n", "rocm-smi\nWARNING: AMD GPU d
 
 
 def _port() -> int:
-    """8380 + the number of the xdist worker: the routers of this file never share a port"""
+    """8380 (ADMIN_MODELS_TEST_PORT_BASE moves it) + the number of the xdist worker, no modulo: the routers of this
+    file never share a port, whatever the number of workers"""
     worker = os.environ.get("PYTEST_XDIST_WORKER", "")
     n = int(worker[2:]) if worker.startswith("gw") and worker[2:].isdigit() else 0
-    return 8380 + n % 20
+    return int(os.environ.get("ADMIN_MODELS_TEST_PORT_BASE", "8380")) + n
 
 
 @pytest.fixture(autouse=True)
@@ -1374,7 +1375,7 @@ def test_models_file_corrupt_without_backup():
                   409, "model_settings_read_only")
     server.stop()
     assert _file_bytes(MODELS_FILE) == broken
-    assert sorted(os.listdir(state_dir)) == [MODELS_FILE]
+    assert sorted(n for n in os.listdir(state_dir) if not n.startswith("admin-audit")) == [MODELS_FILE]  # + the audit log
 
 
 def test_models_file_unknown_version():

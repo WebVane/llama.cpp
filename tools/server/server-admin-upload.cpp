@@ -1801,6 +1801,7 @@ struct up_session {
     json        result;            // published: final names, sizes, SHA-256
     std::vector<std::string> warnings;
     std::string creator;           // the client that created it (audit)
+    json        creator_actor;     // ... as the audit records it (admin_audit_actor), for the records the worker writes
     int64_t     created = 0;       // wall ms
     int64_t     updated = 0;       // wall ms
     int64_t     last_activity = 0; // wall ms
@@ -1861,6 +1862,11 @@ struct up_context {
     fs::path records_dir;  // <state>/uploads
     bool records_writable = false;
     std::vector<std::string> cleanup; // staging entries to remove (session folders, trash), by the worker
+    // worker thread only: abandoned folders the sweep handed to the cleanup -> the details of their upload.swept
+    // record (written once the removal is done), and the entries whose removal failed and was reported (they are
+    // retried by every sweep, but reported again only once they are gone)
+    std::map<std::string, json> swept;
+    std::set<std::string> cleanup_failed;
 
     // the identity of this router in the staging hints it writes (several routers may share one models dir)
     std::mutex  mtx_owner;      // leaf: the three fields below
@@ -2211,6 +2217,7 @@ static json up_record_json(const up_session & s) {
         {"settings_mode",  s.settings_mode},
         {"auto_publish",   s.auto_publish},
         {"creator",        s.creator},
+        {"creator_actor",  s.creator_actor.is_object() ? s.creator_actor : json(nullptr)},
         {"created",        s.created},
         {"updated",        s.updated},
         {"last_activity",  s.last_activity},
@@ -2601,6 +2608,7 @@ static void up_finish(const std::shared_ptr<up_session> & sp, up_state state, co
     std::string id;
     std::string name;
     json details = json::object();
+    json creator;
     {
         std::lock_guard<std::mutex> lk(sp->mtx);
         if (up_is_final(sp->state)) {
@@ -2613,9 +2621,14 @@ static void up_finish(const std::shared_ptr<up_session> & sp, up_state state, co
         sp->last_activity = admin_internal_wall_ms();
         id   = sp->id;
         name = sp->name;
+        creator = sp->creator_actor;
+        details["id"]    = id;
         details["bytes"] = up_received_bytes(*sp);
         if (error.is_object()) {
             details["code"] = up_json_str(error, "code");
+            if (error.contains("file") && error.at("file").is_number_integer()) {
+                details["file"] = error.at("file");
+            }
         }
     }
     up_persist(sp);
@@ -2624,7 +2637,12 @@ static void up_finish(const std::shared_ptr<up_session> & sp, up_state state, co
         u.cleanup.push_back(id);
     }
     up_wake_worker();
-    admin_audit(req, action, name, state == UP_REJECTED ? "rejected" : "ok", details);
+    const char * result = state == UP_REJECTED ? "rejected" : "ok";
+    if (req == nullptr && state == UP_REJECTED && creator.is_object()) {
+        admin_audit_for(creator, action, name, result, details); // the checks of the creator's upload refused it
+    } else {
+        admin_audit(req, action, name, result, details);
+    }
 }
 
 //
@@ -3337,6 +3355,9 @@ static server_http_res_ptr up_handle_get(const server_http_req & req) {
 static server_http_res_ptr up_handle_create(const server_http_req & req) {
     const json body = admin_internal_body_object(req);
     const bool dry_run = up_body_bool(body, "dry_run", false);
+    if (!dry_run) {
+        admin_audit_intent(req, "upload.create", up_json_str(body, "name")); // a refused create is recorded too
+    }
     up_require_available();
 
     std::vector<up_file> files;
@@ -3423,6 +3444,7 @@ static server_http_res_ptr up_handle_create(const server_http_req & req) {
     sp->auto_publish  = auto_publish;
     sp->warnings      = warnings;
     sp->creator       = admin_internal_client_text(req);
+    sp->creator_actor = admin_audit_actor(req);
     sp->created = sp->updated = sp->last_activity = admin_internal_wall_ms();
     sp->t_idle  = admin_internal_now_ms();
     int err = 0;
@@ -3642,6 +3664,7 @@ static server_http_res_ptr up_handle_update(const server_http_req & req) {
 
 static server_http_res_ptr up_handle_cancel(const server_http_req & req) {
     const json body = admin_internal_body_object(req);
+    admin_audit_intent(req, "upload.cancel", up_json_str(body, "id"));
     std::shared_ptr<up_session> sp = up_find_or_throw(up_json_str(body, "id"));
     uint64_t freed = 0;
     {
@@ -4825,8 +4848,20 @@ static void up_work_publish(const std::shared_ptr<up_session> & sp) {
         details["sha256"] = shas;
         details["arch"]   = up_json_str(sp->facts, "arch");
     }
+    json creator;
+    {
+        std::lock_guard<std::mutex> lk(sp->mtx);
+        creator = sp->creator_actor;
+        if (!sp->without_settings && !sp->settings.empty()) {
+            details["settings"] = up_kv_json(sp->settings); // the placement chosen at upload (whitelisted keys)
+        }
+    }
     up_persist(sp);
-    admin_audit(nullptr, "upload.published", id, "ok", details);
+    if (creator.is_object()) {
+        admin_audit_for(creator, "upload.published", id, "ok", details);
+    } else {
+        admin_audit(nullptr, "upload.published", id, "ok", details); // a session rebuilt without its record
+    }
     SRV_INF("admin: upload %s published as %s (%s)\n", sp->id.c_str(), id.c_str(), folder ? "folder" : "file");
     // the facts the GPU card and the fit check use
     const std::optional<server_model_meta> meta = routes->models.get_meta(id);
@@ -4870,8 +4905,29 @@ static void up_work_cleanup() {
                 ok = up_remove_tree_at(u.staging, name);
             }
         }
-        if (!ok) {
-            SRV_WRN("admin: could not remove all of %s/%s, the sweep retries\n", UP_STAGING, name.c_str());
+        // an abandoned folder is recorded when its removal is done: once when it worked, once when it failed (the
+        // sweep retries it every minute) and once more when a retry removed it
+        const auto it_swept = u.swept.find(name);
+        json swept = it_swept != u.swept.end() ? it_swept->second : json();
+        if (it_swept != u.swept.end()) {
+            u.swept.erase(it_swept);
+        }
+        const bool reported = u.cleanup_failed.count(name) > 0;
+        if (ok) {
+            if (reported) {
+                u.cleanup_failed.erase(name);
+                SRV_INF("admin: %s/%s is removed now\n", UP_STAGING, name.c_str());
+            }
+            if (swept.is_object()) {
+                admin_audit(nullptr, "upload.swept", name, "ok", swept);
+            }
+        } else if (!reported) {
+            u.cleanup_failed.insert(name);
+            SRV_WRN("admin: could not remove all of %s/%s, the sweep retries (reported again once it is gone)\n", UP_STAGING,
+                    name.c_str());
+            if (swept.is_object()) {
+                admin_audit(nullptr, "upload.swept", name, "failed", swept);
+            }
         }
     }
 }
@@ -5018,12 +5074,20 @@ static void up_work_sweep() {
         }
         probe.release();
         d.reset();
-        if (foreign) {
-            SRV_INF("admin: removing the upload folder %s/%s of another router (%s): it made no progress for longer than its expiry\n",
-                    UP_STAGING, e.name.c_str(), owner.empty() ? "unknown" : owner.c_str());
-        } else {
-            SRV_INF("admin: removing the abandoned upload folder %s/%s\n", UP_STAGING, e.name.c_str());
+        if (u.cleanup_failed.count(e.name) == 0) { // a retry of a folder that could not be removed is not logged again
+            if (foreign) {
+                SRV_INF("admin: removing the upload folder %s/%s of another router (%s): it made no progress for longer than its expiry\n",
+                        UP_STAGING, e.name.c_str(), owner.empty() ? "unknown" : owner.c_str());
+            } else {
+                SRV_INF("admin: removing the abandoned upload folder %s/%s\n", UP_STAGING, e.name.c_str());
+            }
         }
+        // recorded by up_work_cleanup() once the removal is done (this worker thread, right after the sweep)
+        u.swept[e.name] = {
+            {"folder",  std::string(UP_STAGING) + "/" + e.name}, // relative to models_dir
+            {"foreign", foreign},
+            {"name",    has_hint ? json(up_json_str(hint, "name")) : json(nullptr)},
+        };
         std::lock_guard<std::mutex> lk(u.mtx);
         u.cleanup.push_back(e.name);
     }
@@ -5296,6 +5360,9 @@ static server_http_res_ptr up_handle_delete(const server_http_req & req) {
     const bool stop           = up_body_bool(body, "stop", false);
     const bool remove_settings = up_body_bool(body, "remove_settings", true);
     const bool projector_only = up_body_bool(body, "projector_only", false);
+    if (!dry_run) {
+        admin_audit_intent(req, projector_only ? "model.remove_projector" : "model.delete", requested);
+    }
     server_models_routes * routes = admin_internal_routes();
     up_context & u = up_ctx();
 
@@ -5312,6 +5379,7 @@ static server_http_res_ptr up_handle_delete(const server_http_req & req) {
         }
         // the other entries of the folder stay: "kept, not part of this model"
         json kept = json::array();
+        size_t n_kept = 0; // all of them; the list holds the first 100
         uint64_t kept_bytes = 0;
         bool other_model = false;
         bool folder_removed = false;
@@ -5325,6 +5393,7 @@ static server_http_res_ptr up_handle_delete(const server_http_req & req) {
                         continue;
                     }
                     const uint64_t bytes = e.st.is_dir ? 0 : e.st.size; // folders are kept whole, their size is not needed
+                    n_kept++;
                     if (kept.size() < 100) {
                         kept.push_back({ {"path", folder + "/" + e.name}, {"bytes", e.st.is_dir ? json(nullptr) : json(bytes)},
                                          {"kind", e.st.is_dir ? "dir" : (e.st.is_link ? "symlink" : "file")} });
@@ -5349,6 +5418,7 @@ static server_http_res_ptr up_handle_delete(const server_http_req & req) {
                 shown = admin_internal_path_to_utf8(parent.filename()) + "/" + admin_internal_path_to_utf8(p.filename());
             }
             const uintmax_t size = fs::file_size(p, ec);
+            n_kept++;
             if (kept.size() < 100) {
                 kept.push_back({ {"path", shown}, {"bytes", ec ? json(nullptr) : json((uint64_t) size)}, {"kind", "file"}, {"shared", true} });
             }
@@ -5372,7 +5442,8 @@ static server_http_res_ptr up_handle_delete(const server_http_req & req) {
             {"projector_only", projector_only},
             {"total_bytes",    total},
             {"n_files",        files.size()},
-            {"n_kept",         kept.size()},
+            {"n_kept",         n_kept}, // all of them, the list below holds at most 100
+            {"kept_truncated", n_kept > kept.size()},
             {"kept_bytes",     kept_bytes},
             {"running",        meta.is_running()},
             {"status",         server_model_status_to_string(meta.status)},
@@ -5498,7 +5569,25 @@ static server_http_res_ptr up_handle_delete(const server_http_req & req) {
         u.cleanup.push_back(trash); // deleted by the worker (on Linux the space comes back once no child maps the file)
     }
     up_wake_worker();
-    json details = { {"bytes", freed}, {"files", (long long) files.size()}, {"projector_only", projector_only} };
+    json audit_paths = json::array();
+    for (const auto & f : files) {
+        if (audit_paths.size() < 16) {
+            audit_paths.push_back(f.rel); // relative to models_dir
+        }
+    }
+    json details = {
+        {"bytes",            freed},
+        {"files",            (long long) files.size()},
+        {"paths",            audit_paths},
+        {"projector_only",   projector_only},
+        {"stopped",          meta->is_running()},
+        {"settings_removed", forgot.value("settings_removed", false)},
+        {"pin_removed",      forgot.value("pin_removed", false)},
+        {"folder_removed",   folder_removed},
+    };
+    if (!reload_error.empty()) {
+        details["reload_failed"] = true;
+    }
     admin_audit(&req, projector_only ? "model.remove_projector" : "model.delete", id, "ok", details);
     SRV_INF("admin: %s %s (%llu bytes)\n", projector_only ? "removed the projector of" : "deleted", id.c_str(), (unsigned long long) freed);
 
@@ -5636,6 +5725,7 @@ static std::shared_ptr<up_session> up_session_from_json(const json & j, bool fro
     sp->settings_mode = up_json_str(j, "settings_mode") == "keep" ? "keep" : "replace";
     sp->auto_publish  = up_json_bool(j, "auto_publish", true);
     sp->creator       = up_json_str(j, "creator");
+    sp->creator_actor = j.contains("creator_actor") && j.at("creator_actor").is_object() ? j.at("creator_actor") : json(nullptr);
     sp->created       = up_json_i64(j, "created", 0);
     sp->updated       = up_json_i64(j, "updated", 0);
     sp->last_activity = up_json_i64(j, "last_activity", 0);

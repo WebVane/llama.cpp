@@ -1596,7 +1596,7 @@ def test_admin_corrupt_state_file(content: str):
     # reading and a rejected change leave the file alone
     _assert_error(_admin("POST", "/admin/settings", data={"models_max": 0}), 400, "invalid_request_error")
     assert _read_text(_state_file()) == content
-    assert os.listdir(state_dir) == ["admin-state.json"]
+    assert [n for n in os.listdir(state_dir) if not n.startswith("admin-audit")] == ["admin-state.json"]  # + the audit log
 
     # a successful save replaces it
     assert _post_settings({"models_max": 3})["models_max"] == 3

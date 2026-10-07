@@ -49,6 +49,8 @@ add_library(${TARGET}
     server-admin-internal.h
     server-admin-upload.cpp
     server-admin-upload.h
+    server-admin-audit.cpp
+    server-admin-audit.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 

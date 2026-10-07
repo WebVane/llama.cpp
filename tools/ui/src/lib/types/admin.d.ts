@@ -15,6 +15,7 @@ import type {
 	ServerModelSource,
 	ServerModelStatus
 } from '$lib/enums';
+import type { ApiAdminAuditStatus, ApiAdminAuditStorage } from '$lib/types/admin-audit';
 import type { ApiModelsSseDownloadFile } from '$lib/types/api';
 
 /**
@@ -46,6 +47,8 @@ export interface ApiAdminStatus {
 	warnings?: string[];
 	/** Stage 3: whether GGUF files can be uploaded into the models directory */
 	upload?: { available: boolean; reason: string | null; message: string | null };
+	/** Stage 3 M3: whether the audit log is written to the state directory (warning audit_not_persisted) */
+	audit?: ApiAdminAuditStatus;
 }
 
 /** `state.model_settings` of GET /admin/status: the per-model settings file. */
@@ -118,6 +121,8 @@ export interface ApiAdminPartialDownload {
 export interface ApiAdminStorage {
 	dirs: ApiAdminStorageDir[];
 	partial_downloads: ApiAdminPartialDownload[];
+	/** Stage 3 M3: the audit files in the state directory */
+	audit?: ApiAdminAuditStorage;
 }
 
 export interface ApiAdminDownloadCheckFile {

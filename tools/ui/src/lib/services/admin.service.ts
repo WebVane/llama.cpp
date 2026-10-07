@@ -15,10 +15,12 @@
 
 import { base } from '$app/paths';
 import {
+	ADMIN_AUDIT_TIMEOUTS,
 	ADMIN_KEY_HEADER,
 	ADMIN_TIMEOUTS,
 	ADMIN_UPLOAD_TIMEOUTS,
 	API_ADMIN,
+	API_ADMIN_AUDIT,
 	API_ADMIN_UPLOAD,
 	API_SLOTS,
 	ERROR_MESSAGES
@@ -40,6 +42,7 @@ import type {
 	ApiAdminStatus,
 	ApiAdminStorage
 } from '$lib/types';
+import type { AdminAuditDownload, ApiAdminAuditList } from '$lib/types/admin-audit';
 import type {
 	ApiAdminDeletePreview,
 	ApiAdminDeleteRequest,
@@ -53,6 +56,7 @@ import type {
 } from '$lib/types/admin-upload';
 // direct module imports, not the utils barrel: api-headers pulls in the settings
 // store, and going through the barrel makes the bundler warn about a chunk cycle
+import { auditDownloadName } from '$lib/utils/admin-audit';
 import { ApiError } from '$lib/utils/api-fetch';
 import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
 
@@ -95,6 +99,8 @@ interface AdminRequestInit {
 	body?: unknown;
 	key?: string | null;
 	method?: 'GET' | 'POST';
+	/** Read a successful answer another way than as JSON (a download) */
+	read?: (response: Response) => Promise<unknown>;
 	/** Abort the request early (a newer request replaced it) */
 	signal?: AbortSignal;
 	timeoutMs?: number;
@@ -187,6 +193,42 @@ export class AdminService {
 					: ADMIN_UPLOAD_TIMEOUTS.DELETE_MS
 			}
 		);
+	}
+
+	/**
+	 * The raw audit log (GET /admin/audit?format=jsonl): JSON lines of both
+	 * files and the memory rings, oldest first, with the filters of `query`
+	 * (`limit` does not apply).
+	 *
+	 * @param query - From buildAuditQuery(filters, { format: 'jsonl' })
+	 */
+	static async downloadAudit(key: string, query: string): Promise<AdminAuditDownload> {
+		return AdminService.request<AdminAuditDownload>(`${API_ADMIN_AUDIT}${query}`, {
+			key,
+			read: async (response) => ({
+				blob: await response.blob(),
+				filename: auditDownloadName(response.headers.get('Content-Disposition'))
+			}),
+			timeoutMs: ADMIN_AUDIT_TIMEOUTS.DOWNLOAD_MS
+		});
+	}
+
+	/**
+	 * One page of the audit log, newest first (stage 3 M3). 400 with `param`
+	 * before / limit / kind / format for a bad query.
+	 *
+	 * @param query - From buildAuditQuery(filters, { before, limit })
+	 */
+	static async getAudit(
+		key: string,
+		query: string,
+		signal?: AbortSignal
+	): Promise<ApiAdminAuditList> {
+		return AdminService.request<ApiAdminAuditList>(`${API_ADMIN_AUDIT}${query}`, {
+			key,
+			signal,
+			timeoutMs: ADMIN_AUDIT_TIMEOUTS.LIST_MS
+		});
 	}
 
 	/** Deployment, GPU backend, vendor tool, state dir... as ok / warning / error items. */
@@ -367,7 +409,7 @@ export class AdminService {
 	}
 
 	private static async request<T>(path: string, init: AdminRequestInit = {}): Promise<T> {
-		const { body, key, method = 'GET', signal, timeoutMs = ADMIN_TIMEOUTS.REQUEST_MS } = init;
+		const { body, key, method = 'GET', read, signal, timeoutMs = ADMIN_TIMEOUTS.REQUEST_MS } = init;
 		const headers: Record<string, string> =
 			body === undefined ? getAuthHeaders() : getJsonHeaders();
 
@@ -406,9 +448,16 @@ export class AdminService {
 			}
 
 			try {
-				return (await response.json()) as T;
+				return (read ? await read(response) : await response.json()) as T;
 			} catch {
-				throw new AdminApiError('Unexpected answer from the admin API', 0);
+				if (signal?.aborted) throw new AdminApiError('Cancelled', 0, ADMIN_REQUEST_CANCELLED);
+
+				throw new AdminApiError(
+					controller.signal.aborted
+						? ERROR_MESSAGES.NETWORK.TIMEOUT
+						: 'Unexpected answer from the admin API',
+					0
+				);
 			}
 		} finally {
 			clearTimeout(timer);

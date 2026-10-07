@@ -10,6 +10,7 @@
 	import { adminStore } from '$lib/stores/admin.svelte';
 	import type { ApiAdminDeletePreview, ApiAdminDeleteResult } from '$lib/types/admin-upload';
 	import { formatBytes } from '$lib/utils/admin';
+	import { keepFocusOffDialogClose } from '$lib/utils/admin-dialog-focus';
 	import { describeDeleteRefusal } from '$lib/utils/admin-upload';
 
 	interface Props {
@@ -197,6 +198,7 @@
 			event.preventDefault();
 			content?.focus();
 		}}
+		onfocusin={(event) => keepFocusOffDialogClose(event, content)}
 		tabindex={-1}
 	>
 		<Dialog.Header class="text-left">

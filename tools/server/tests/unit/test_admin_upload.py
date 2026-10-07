@@ -537,7 +537,7 @@ def test_upload_status_limits_and_features():
     assert body["settings_writable"] is True and body["settings_error"] is None
 
     status = _ok(_call("GET", "/admin/status"))
-    assert status["features"][-2:] == ["upload", "delete"]
+    assert status["features"][-3:] == ["upload", "delete", "audit"]  # stage 3 M3 added audit
     assert status["upload"] == {"available": True, "reason": None, "message": None}
 
     storage = _ok(_call("GET", "/admin/storage"))
@@ -2174,6 +2174,7 @@ def test_delete_top_level_file():
     dry = _ok(_call("POST", "/admin/models/delete", {"model": "topx", "dry_run": True}))
     assert dry == {
         "model": "topx", "source": "models_dir", "projector_only": False, "total_bytes": size, "n_files": 1, "n_kept": 0,
+        "kept_truncated": False,
         "kept_bytes": 0, "running": False, "status": "unloaded", "pinned": True, "has_settings": True, "folder": None,
         "folder_removed": False, "files": [{"path": "topx.gguf", "bytes": size, "role": "model"}], "kept": [],
         "warnings": [], "dry_run": True,

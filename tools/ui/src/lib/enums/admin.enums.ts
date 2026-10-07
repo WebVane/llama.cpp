@@ -17,6 +17,8 @@ export enum AdminProbeState {
 }
 
 export enum AdminTab {
+	/** The audit log (stage 3, only when the server lists the `audit` feature) */
+	ACTIVITY = 'activity',
 	MODELS = 'models',
 	SETTINGS = 'settings'
 }
@@ -108,6 +110,8 @@ export enum AdminStorageDirKind {
  * of the page is shown only when its feature is listed.
  */
 export enum AdminFeature {
+	/** GET /admin/audit: the audit log of admin actions, the Activity tab (stage 3) */
+	AUDIT = 'audit',
 	/** POST /admin/models/delete: delete models_dir models, remove a projector (stage 3) */
 	DELETE = 'delete',
 	DIAGNOSTICS = 'diagnostics',
@@ -417,4 +421,72 @@ export enum AdminUploadSendState {
 	UPLOADING = 'uploading',
 	/** Comparing the first bytes of a picked file with the ones on the server */
 	VERIFYING = 'verifying'
+}
+
+/*
+ * Stage 3, milestone M3: the audit log (GET /admin/audit). Imported by path
+ * ('$lib/enums/admin.enums'), not through the enums barrel.
+ */
+
+/** `kind` of an audit record. */
+export enum AdminAuditKind {
+	/** A change made through an /admin route with the admin key */
+	CHANGE = 'change',
+	/** An effect of the public model API seen on the event feed: who caused it is unknown */
+	OBSERVED = 'observed',
+	/** 401 / 403 answers of the /admin routes, merged per client, path and reason for 60 s */
+	REFUSAL = 'refusal',
+	/** Something the server did by itself (settings reverted, expired upload, audit.started) */
+	SERVER = 'server'
+}
+
+/** `result` of an audit record. */
+export enum AdminAuditResult {
+	/** A change route answered with an error */
+	ERROR = 'error',
+	/** GPU re-detection, download or model start failed */
+	FAILED = 'failed',
+	OK = 'ok',
+	/** A refused /admin request (no key, wrong key, address not allowed) */
+	REFUSED = 'refused',
+	/** An upload the server's checks rejected */
+	REJECTED = 'rejected'
+}
+
+/** `actor.type` of an audit record. */
+export enum AdminAuditActorType {
+	/** A client of an /admin route: its address (TCP peer, verified client, X-Forwarded-For) */
+	CLIENT = 'client',
+	/** The public model API: who called it is not known */
+	PUBLIC_API = 'public_api',
+	SERVER = 'server',
+	UNKNOWN = 'unknown',
+	/** A merged record of many clients */
+	VARIOUS = 'various'
+}
+
+/** Groups of actions offered by the action filter of the Activity tab. */
+export enum AdminAuditActionGroup {
+	/** Refused /admin requests */
+	ACCESS = 'access',
+	ALL = 'all',
+	/** audit.started, audit.persisted_again */
+	AUDIT_LOG = 'audit_log',
+	DELETES = 'deletes',
+	DOWNLOADS = 'downloads',
+	GPUS = 'gpus',
+	/** Router settings and per-model settings, their resets and reverts */
+	SETTINGS = 'settings',
+	/** Failed model starts seen on the event feed */
+	STARTS = 'starts',
+	UPLOADS = 'uploads'
+}
+
+/** Groups of results offered by the result filter of the Activity tab. */
+export enum AdminAuditResultGroup {
+	ALL = 'all',
+	OK = 'ok',
+	/** error, failed, rejected */
+	PROBLEMS = 'problems',
+	REFUSED = 'refused'
 }

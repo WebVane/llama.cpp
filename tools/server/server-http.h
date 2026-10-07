@@ -55,6 +55,7 @@ struct server_http_req {
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
     const std::function<bool()> & should_stop;
     std::string remote_addr = ""; // provision-admin: address of the TCP peer (httplib's req.remote_addr), "" = none (Unix socket)
+    std::vector<std::string> forwarded_for = {}; // provision-admin: every X-Forwarded-For line in order (headers keeps one per spelling)
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);

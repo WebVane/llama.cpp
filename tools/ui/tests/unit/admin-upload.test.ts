@@ -17,6 +17,7 @@ import {
 	describeSendState,
 	describeUploadBlock,
 	describeUploadRejection,
+	describeUploadSlotWait,
 	describeUploadUnavailable,
 	describeUploadWarning,
 	formatDuration,
@@ -28,6 +29,7 @@ import {
 	parseShardName,
 	proposeModelName,
 	suggestProjectorGroup,
+	uploadNameLimit,
 	validateModelName
 } from '$lib/utils/admin-upload';
 import { describe, expect, it } from 'vitest';
@@ -403,6 +405,43 @@ describe('texts', () => {
 		expect(
 			describeUploadBlock(AdminUploadBlock.CHECK_FAILED, { message: 'the helper timed out' }).text
 		).toMatch(/^The helper timed out\. The data is kept/);
+	});
+
+	it('words a check that waits for a shorter name, or a file refused when the checks ran again', () => {
+		// Windows, split model: the server names the longest name that fits
+		const tooLong = { code: 'path_too_long', max_name_length: 42, message: 'rename it' };
+
+		expect(uploadNameLimit(tooLong)).toBe(42);
+		expect(uploadNameLimit({ ...tooLong, max_name_length: 0 })).toBe(0);
+		expect(uploadNameLimit({ ...tooLong, max_name_length: 'x' })).toBeNull();
+		expect(uploadNameLimit({ code: 'check_failed', max_name_length: 42 })).toBeNull();
+		expect(uploadNameLimit(null)).toBeNull();
+
+		const rename = describeUploadBlock(AdminUploadBlock.CHECK_FAILED, tooLong);
+
+		expect(rename.title).toBe('The name is too long for this server');
+		expect(rename.text).toMatch(/at most 42 characters/);
+		expect(rename.text).toMatch(/Nothing is uploaded again/);
+		expect(
+			describeUploadBlock(AdminUploadBlock.CHECK_FAILED, { ...tooLong, max_name_length: 0 }).text
+		).toMatch(/cancel the upload, or move the models directory/);
+
+		// after a restart the arranged files are checked again: Retry or cancel, never "drop"
+		const refused = describeUploadBlock(AdminUploadBlock.CHECK_FAILED, {
+			code: 'not_gguf',
+			file: 1,
+			message: 'file 1 (mmproj.gguf): not a GGUF file'
+		});
+
+		expect(refused.title).toBe('A file was refused when the checks ran again');
+		expect(refused.text).toMatch(/^File 1 \(mmproj\.gguf\): not a GGUF file\. /);
+		expect(refused.text).toMatch(/Retry checks the files again, otherwise cancel/);
+		expect(refused.text).not.toMatch(/[Dd]rop/);
+
+		expect(describeUploadSlotWait(4)).toBe(
+			'the server already has 4 uploads open; this one starts when one of them is published or cancelled.'
+		);
+		expect(describeUploadSlotWait(null)).toMatch(/its maximum of uploads open/);
 	});
 
 	it('words the warnings and the delete refusals', () => {

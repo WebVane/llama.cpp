@@ -640,6 +640,19 @@ class AdminUploadStore {
 		this.schedulePoll();
 	}
 
+	/** The queue waits for a free upload slot: go on when a session of the refusal ended. */
+	private checkSlotWait(): void {
+		if (!this.slotWait || !this.info) return;
+
+		const open = openUploadSessions(this.info.sessions ?? []);
+		const freed =
+			this.slotWait.size > 0
+				? [...this.slotWait].some((id) => !open.some((session) => session.id === id))
+				: open.length < this.info.limits.max_sessions;
+
+		if (freed) this.slotFreed();
+	}
+
 	/** Create the session of a queued job and start sending. */
 	private async createSession(job: AdminUploadJob): Promise<void> {
 		job.phase = AdminUploadJobPhase.CREATING;
@@ -706,25 +719,11 @@ class AdminUploadStore {
 		}
 	}
 
-	/** The queue waits for a free upload slot: go on when a session of the refusal ended. */
-	private checkSlotWait(): void {
-		if (!this.slotWait || !this.info) return;
-
-		const open = openUploadSessions(this.info.sessions ?? []);
-		const freed =
-			this.slotWait.size > 0
-				? [...this.slotWait].some((id) => !open.some((session) => session.id === id))
-				: open.length < this.info.limits.max_sessions;
-
-		if (freed) this.slotFreed();
-	}
-
-	/** An upload session of the server ended: a job waiting for a free slot may start. */
-	private slotFreed(): void {
-		if (!this.slotWait) return;
-
-		this.slotWait = null;
-		void this.pump();
+	/** A queued job waits because the server has its maximum of open uploads. */
+	private isWaitingForSlot(): boolean {
+		return (
+			this.slotWait !== null && this.jobs.some((job) => job.phase === AdminUploadJobPhase.QUEUED)
+		);
 	}
 
 	private job(key: string): AdminUploadJob | undefined {
@@ -965,13 +964,6 @@ class AdminUploadStore {
 		this.updateUnloadGuard();
 	}
 
-	/** A queued job waits because the server has its maximum of open uploads. */
-	private isWaitingForSlot(): boolean {
-		return (
-			this.slotWait !== null && this.jobs.some((job) => job.phase === AdminUploadJobPhase.QUEUED)
-		);
-	}
-
 	/** Read one job's session again. */
 	private async refreshJob(key: string): Promise<void> {
 		const job = this.job(key);
@@ -1062,6 +1054,14 @@ class AdminUploadStore {
 				this.schedulePoll();
 			}
 		}, ADMIN_UPLOAD.POLL_CHECKING_MS);
+	}
+
+	/** An upload session of the server ended: a job waiting for a free slot may start. */
+	private slotFreed(): void {
+		if (!this.slotWait) return;
+
+		this.slotWait = null;
+		void this.pump();
 	}
 
 	/** Start (or restart) the chunk scheduler of a receiving job. */

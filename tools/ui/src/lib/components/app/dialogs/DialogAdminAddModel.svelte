@@ -26,6 +26,7 @@
 		isValidHfModelSpec,
 		normalizeHfModelSpec
 	} from '$lib/utils';
+	import { keepFocusOffDialogClose } from '$lib/utils/admin-dialog-focus';
 	import { toast } from 'svelte-sonner';
 
 	interface Props {
@@ -242,9 +243,10 @@
 				: 'w-[calc(100%-2rem)]! max-w-xl!'
 		]}
 		data-testid="admin-add-model"
+		onOpenAutoFocus={handleOpenAutoFocus}
 		ondragover={handleDragOver}
 		ondrop={handleDrop}
-		onOpenAutoFocus={handleOpenAutoFocus}
+		onfocusin={(event) => keepFocusOffDialogClose(event, content)}
 		tabindex={-1}
 	>
 		<Dialog.Header class="text-left">
